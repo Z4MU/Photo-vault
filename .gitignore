@@ -1,0 +1,28 @@
+# Copias históricas de versiones (ya están en el historial de git)
+Fotos V*/
+
+# Build de PyInstaller
+build/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Editor / SO
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Datos del usuario (por si alguna vez se copian aquí)
+*.db
+*.db-wal
+*.db-shm
