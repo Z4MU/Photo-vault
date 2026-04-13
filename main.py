@@ -13,7 +13,7 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QFileDialog, QDialog, QCheckBox, QFrame, QProgressBar,
     QSizePolicy, QMessageBox, QComboBox, QColorDialog, QSplitter,
-    QGroupBox
+    QGroupBox, QStackedWidget, QTreeWidget, QTreeWidgetItem, QSpinBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QRunnable, QThreadPool, pyqtSlot
 from PyQt6.QtGui import QPixmap, QIcon, QColor, QPainter, QFont, QFontDatabase
@@ -694,6 +694,8 @@ class IndexDialog(QDialog):
 
 
 
+
+
 # ─── Dialog: Des-indexar carpetas ─────────────────────────────────────────────
 
 class DeindexDialog(QDialog):
@@ -823,6 +825,11 @@ class MainWindow(QMainWindow):
         self._loader: ThumbnailLoader = None
         self._current_photos = []
         self._pending_photos: list = []   # cola de widgets por crear
+        self._view_mode = 'gallery'  # 'gallery' or 'folders'
+        self._folder_filter: str = None
+        self._folder_loader: ThumbnailLoader = None
+        self._folder_thumbnails: dict = {}
+        self._folder_photos: list = []
         self._build_timer = QTimer(self)  # timer para agregar widgets poco a poco
         self._build_timer.setInterval(0)  # lo más rápido posible pero sin bloquear
         self._build_timer.timeout.connect(self._add_next_batch)
@@ -854,9 +861,27 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet("font-size:18px; font-weight:bold; color:#4A9EFF; margin-bottom:8px;")
         sb_layout.addWidget(logo)
 
+        # Mode toggle buttons
+        mode_row = QHBoxLayout()
+        self.btn_gallery_mode = QPushButton("🖼  Galería")
+        self.btn_gallery_mode.setCheckable(True)
+        self.btn_gallery_mode.setChecked(True)
+        self.btn_gallery_mode.clicked.connect(self._show_gallery)
+        self.btn_folder_mode = QPushButton("📁  Carpetas")
+        self.btn_folder_mode.setCheckable(True)
+        self.btn_folder_mode.clicked.connect(self._show_explorer)
+        for b in [self.btn_gallery_mode, self.btn_folder_mode]:
+            b.setStyleSheet("""QPushButton{background:#1E1E2E;border:1px solid #3A3A5A;border-radius:6px;padding:5px;}
+                QPushButton:checked{background:#4A9EFF33;border-color:#4A9EFF;color:#4A9EFF;}
+                QPushButton:hover{border-color:#4A9EFF;}""")
+        mode_row.addWidget(self.btn_gallery_mode)
+        mode_row.addWidget(self.btn_folder_mode)
+        sb_layout.addLayout(mode_row)
+
         btn_index = QPushButton("＋ Indexar carpeta")
         btn_index.clicked.connect(self._open_index_dialog)
         sb_layout.addWidget(btn_index)
+
 
         btn_tags = QPushButton("🏷  Gestionar etiquetas")
         btn_tags.clicked.connect(self._open_tag_manager)
@@ -874,7 +899,23 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color:#2D2D3F;")
         sb_layout.addWidget(sep)
 
-        sb_layout.addWidget(QLabel("Filtrar por etiqueta:"))
+        # Fila: label + botones colapsar/expandir
+        tag_header_row = QHBoxLayout()
+        tag_header_row.addWidget(QLabel("Filtrar por etiqueta:"))
+        tag_header_row.addStretch()
+        btn_expand_all = QPushButton("▾")
+        btn_expand_all.setFixedSize(28, 28)
+        btn_expand_all.setToolTip("Expandir todos los grupos")
+        btn_expand_all.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;} QPushButton:hover{color:#4A9EFF;}")
+        btn_expand_all.clicked.connect(self._expand_all_groups)
+        btn_collapse_all = QPushButton("▸")
+        btn_collapse_all.setFixedSize(28, 28)
+        btn_collapse_all.setToolTip("Colapsar todos los grupos")
+        btn_collapse_all.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;} QPushButton:hover{color:#4A9EFF;}")
+        btn_collapse_all.clicked.connect(self._collapse_all_groups)
+        tag_header_row.addWidget(btn_expand_all)
+        tag_header_row.addWidget(btn_collapse_all)
+        sb_layout.addLayout(tag_header_row)
 
         self.tag_scroll = QScrollArea()
         self.tag_scroll.setWidgetResizable(True)
@@ -897,25 +938,25 @@ class MainWindow(QMainWindow):
 
         root.addWidget(sidebar)
 
-        # ── Área principal ────────────────────────────────────────────────
-        main_area = QWidget()
-        main_layout = QVBoxLayout(main_area)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(8)
+        # ── Área principal (stacked: galería | explorador) ───────────────
+        self.stack = QStackedWidget()
 
-        # Barra superior
+        # ── Vista 0: Galería ──────────────────────────────────────────────
+        gallery_page = QWidget()
+        gallery_layout = QVBoxLayout(gallery_page)
+        gallery_layout.setContentsMargins(12, 12, 12, 12)
+        gallery_layout.setSpacing(8)
+
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Buscar por nombre…")
         self.search_edit.textChanged.connect(self._on_search)
         top_bar.addWidget(self.search_edit)
-
         self.count_lbl = QLabel("0 fotos")
         self.count_lbl.setStyleSheet("color:#8888AA;")
         top_bar.addWidget(self.count_lbl)
-        main_layout.addLayout(top_bar)
+        gallery_layout.addLayout(top_bar)
 
-        # Grid de fotos
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.verticalScrollBar().valueChanged.connect(self._on_scroll)
@@ -923,9 +964,8 @@ class MainWindow(QMainWindow):
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(8)
         self.scroll_area.setWidget(self.grid_widget)
-        main_layout.addWidget(self.scroll_area, stretch=1)
+        gallery_layout.addWidget(self.scroll_area, stretch=1)
 
-        # Paginación
         pg_bar = QHBoxLayout()
         self.prev_btn = QPushButton("← Anterior")
         self.prev_btn.clicked.connect(self._prev_page)
@@ -936,9 +976,94 @@ class MainWindow(QMainWindow):
         pg_bar.addWidget(self.prev_btn)
         pg_bar.addWidget(self.page_lbl, stretch=1)
         pg_bar.addWidget(self.next_btn)
-        main_layout.addLayout(pg_bar)
+        gallery_layout.addLayout(pg_bar)
 
-        root.addWidget(main_area, stretch=1)
+        self.stack.addWidget(gallery_page)  # index 0
+
+        # ── Vista 1: Explorador de carpetas ───────────────────────────────
+        explorer_page = QWidget()
+        explorer_layout = QVBoxLayout(explorer_page)
+        explorer_layout.setContentsMargins(0, 0, 0, 0)
+        explorer_layout.setSpacing(0)
+
+        # Barra superior del explorador
+        exp_top = QWidget()
+        exp_top.setStyleSheet("background:#13131F; border-bottom:1px solid #2D2D3F;")
+        exp_top_hl = QHBoxLayout(exp_top)
+        exp_top_hl.setContentsMargins(10, 6, 10, 6)
+        btn_back_gallery = QPushButton("← Volver a galería")
+        btn_back_gallery.setStyleSheet("color:#4A9EFF; border:none; background:transparent; font-size:12px;")
+        btn_back_gallery.clicked.connect(self._show_gallery)
+        exp_top_hl.addWidget(btn_back_gallery)
+        self.exp_path_lbl = QLabel("Selecciona una carpeta")
+        self.exp_path_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
+        exp_top_hl.addWidget(self.exp_path_lbl, stretch=1)
+        self.exp_count_lbl = QLabel("")
+        self.exp_count_lbl.setStyleSheet("color:#4A9EFF; font-size:11px;")
+        exp_top_hl.addWidget(self.exp_count_lbl)
+        explorer_layout.addWidget(exp_top)
+
+        # Splitter árbol | grid
+        exp_splitter = QSplitter(Qt.Orientation.Horizontal)
+        exp_splitter.setStyleSheet("QSplitter::handle { background: #2D2D3F; width: 1px; }")
+
+        # Árbol de carpetas
+        tree_container = QWidget()
+        tree_container.setFixedWidth(250)
+        tree_container.setStyleSheet("background:#13131F;")
+        tree_vbox = QVBoxLayout(tree_container)
+        tree_vbox.setContentsMargins(0, 0, 0, 0)
+        self.folder_tree = QTreeWidget()
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setStyleSheet("""
+            QTreeWidget { background:#13131F; border:none; color:#D0D0E8; font-size:12px; }
+            QTreeWidget::item { padding:4px 6px; }
+            QTreeWidget::item:selected { background:#4A9EFF33; color:#4A9EFF; }
+            QTreeWidget::item:hover { background:#1E1E2E; }
+        """)
+        self.folder_tree.itemClicked.connect(self._on_folder_clicked)
+        tree_vbox.addWidget(self.folder_tree)
+        exp_splitter.addWidget(tree_container)
+
+        # Grid del explorador
+        exp_right = QWidget()
+        exp_right_layout = QVBoxLayout(exp_right)
+        exp_right_layout.setContentsMargins(8, 8, 8, 4)
+        exp_right_layout.setSpacing(6)
+        self.exp_scroll = QScrollArea()
+        self.exp_scroll.setWidgetResizable(True)
+        self.exp_grid_widget = QWidget()
+        self.exp_grid_layout = QGridLayout(self.exp_grid_widget)
+        self.exp_grid_layout.setSpacing(6)
+        self.exp_scroll.setWidget(self.exp_grid_widget)
+        exp_right_layout.addWidget(self.exp_scroll, stretch=1)
+
+        # Paginación explorador
+        exp_pg = QHBoxLayout()
+        self.exp_prev_btn = QPushButton("← Anterior")
+        self.exp_prev_btn.setEnabled(False)
+        self.exp_prev_btn.clicked.connect(self._exp_prev_page)
+        self.exp_next_btn = QPushButton("Siguiente →")
+        self.exp_next_btn.setEnabled(False)
+        self.exp_next_btn.clicked.connect(self._exp_next_page)
+        self.exp_page_lbl = QLabel("")
+        self.exp_page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.exp_page_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
+        exp_pg.addWidget(self.exp_prev_btn)
+        exp_pg.addWidget(self.exp_page_lbl, stretch=1)
+        exp_pg.addWidget(self.exp_next_btn)
+        exp_right_layout.addLayout(exp_pg)
+        exp_splitter.addWidget(exp_right)
+        exp_splitter.setSizes([250, 800])
+        explorer_layout.addWidget(exp_splitter, stretch=1)
+
+        self.stack.addWidget(explorer_page)  # index 1
+        root.addWidget(self.stack, stretch=1)
+
+        # Estado paginación explorador
+        self._exp_offset = 0
+        self._exp_page_size = 80
+        self._exp_total = 0
 
     # ── Etiquetas sidebar ─────────────────────────────────────────────────────
 
@@ -1163,6 +1288,18 @@ class MainWindow(QMainWindow):
         dlg.tags_changed.connect(self._load_photos)
         dlg.exec()
 
+    def _expand_all_groups(self):
+        for i in range(self.tag_vbox.count()):
+            w = self.tag_vbox.itemAt(i).widget()
+            if isinstance(w, QPushButton) and w.isCheckable():
+                w.setChecked(True)
+
+    def _collapse_all_groups(self):
+        for i in range(self.tag_vbox.count()):
+            w = self.tag_vbox.itemAt(i).widget()
+            if isinstance(w, QPushButton) and w.isCheckable():
+                w.setChecked(False)
+
     def _open_index_dialog(self):
         dlg = IndexDialog(self)
         dlg.indexing_done.connect(self._on_index_done)
@@ -1177,6 +1314,144 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self._refresh_tags()
         self._load_photos()
+
+    def _open_folder_browser(self):
+        self._show_explorer()
+
+    def _show_gallery(self):
+        self._view_mode = 'gallery'
+        self.stack.setCurrentIndex(0)
+        self.btn_gallery_mode.setChecked(True)
+        self.btn_folder_mode.setChecked(False)
+
+    def _show_explorer(self):
+        self._view_mode = 'folders'
+        self.stack.setCurrentIndex(1)
+        self.btn_gallery_mode.setChecked(False)
+        self.btn_folder_mode.setChecked(True)
+        self._build_folder_tree()
+
+    def _build_folder_tree(self):
+        self.folder_tree.clear()
+        with db.get_connection() as conn:
+            rows = conn.execute("SELECT DISTINCT path FROM photos ORDER BY path").fetchall()
+        tree = {}
+        for row in rows:
+            parts = Path(row[0]).parent.parts
+            node = tree
+            for part in parts:
+                node = node.setdefault(part, {})
+
+        def add_items(parent, subtree, full_path=""):
+            for name, children in sorted(subtree.items()):
+                if full_path == "" and name.endswith(":"):
+                    fp = name + "\\"
+                elif full_path == "":
+                    fp = name
+                else:
+                    fp = str(Path(full_path) / name)
+                item = QTreeWidgetItem([f"📁 {name}"])
+                item.setData(0, Qt.ItemDataRole.UserRole, fp)
+                if hasattr(parent, 'addChild'):
+                    parent.addChild(item)
+                else:
+                    self.folder_tree.addTopLevelItem(item)
+                add_items(item, children, fp)
+
+        add_items(self.folder_tree, tree)
+        self.folder_tree.expandToDepth(2)
+
+    def _on_folder_clicked(self, item, col):
+        folder = item.data(0, Qt.ItemDataRole.UserRole)
+        if folder:
+            self._folder_filter = folder
+            self.exp_path_lbl.setText(folder)
+            self._exp_offset = 0
+            self._exp_load_photos()
+
+    def _exp_load_photos(self):
+        if not self._folder_filter:
+            return
+        # Stop previous loader safely
+        if self._folder_loader is not None:
+            try:
+                self._folder_loader.stop()
+                self._folder_loader.wait(1000)
+            except RuntimeError:
+                pass
+            self._folder_loader = None
+
+        # Clear grid
+        for i in reversed(range(self.exp_grid_layout.count())):
+            w = self.exp_grid_layout.itemAt(i).widget()
+            if w:
+                w.deleteLater()
+        self._folder_thumbnails.clear()
+
+        folder_filter = self._folder_filter.rstrip("/\\")
+        with db.get_connection() as conn:
+            self._exp_total = conn.execute(
+                "SELECT COUNT(*) FROM photos WHERE path LIKE ?",
+                (folder_filter + "%",)
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT id, path, filename, media_type, duration FROM photos "
+                "WHERE path LIKE ? ORDER BY path, filename LIMIT ? OFFSET ?",
+                (folder_filter + "%", self._exp_page_size, self._exp_offset)
+            ).fetchall()
+
+        self._folder_photos = [dict(r) for r in rows]
+        self.exp_count_lbl.setText(f"{self._exp_total:,} archivos")
+        self._exp_update_pagination()
+
+        cols = max(1, (self.exp_scroll.width() - 30) // 160)
+        for idx, photo in enumerate(self._folder_photos):
+            thumb = PhotoThumbnail(
+                photo["id"], photo["filename"],
+                is_video=(photo.get("media_type") == "video"),
+                duration=photo.get("duration")
+            )
+            thumb.setFixedSize(150, 170)
+            thumb.clicked.connect(self._exp_open_photo)
+            self.exp_grid_layout.addWidget(thumb, idx // cols, idx % cols)
+            self._folder_thumbnails[photo["id"]] = thumb
+
+        self._folder_loader = ThumbnailLoader(self._folder_photos)
+        self._folder_loader.loaded.connect(self._exp_on_thumb_loaded)
+        self._folder_loader.finished.connect(self._exp_on_loader_finished)
+        self._active_loaders.append(self._folder_loader)
+        self._folder_loader.start()
+
+    def _exp_on_loader_finished(self):
+        loader = self.sender()
+        if loader in self._active_loaders:
+            self._active_loaders.remove(loader)
+        self._folder_loader = None
+
+    def _exp_on_thumb_loaded(self, photo_id, pix):
+        if photo_id in self._folder_thumbnails:
+            self._folder_thumbnails[photo_id].set_pixmap(pix)
+
+    def _exp_open_photo(self, photo_id):
+        photo = next((p for p in self._folder_photos if p["id"] == photo_id), None)
+        if photo:
+            dlg = PhotoDetailDialog(photo_id, photo["path"], photo.get("media_type", "image"), self)
+            dlg.exec()
+
+    def _exp_update_pagination(self):
+        page = self._exp_offset // self._exp_page_size + 1
+        total_pages = max(1, (self._exp_total + self._exp_page_size - 1) // self._exp_page_size)
+        self.exp_page_lbl.setText(f"Página {page} / {total_pages}  ({self._exp_total:,} archivos)")
+        self.exp_prev_btn.setEnabled(self._exp_offset > 0)
+        self.exp_next_btn.setEnabled(self._exp_offset + self._exp_page_size < self._exp_total)
+
+    def _exp_prev_page(self):
+        self._exp_offset = max(0, self._exp_offset - self._exp_page_size)
+        self._exp_load_photos()
+
+    def _exp_next_page(self):
+        self._exp_offset += self._exp_page_size
+        self._exp_load_photos()
 
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self._page_size, self)
