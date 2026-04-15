@@ -419,10 +419,13 @@ class CategoryManagerDialog(QDialog):
             w = self.vbox.itemAt(i).widget()
             if w: w.deleteLater()
 
-        categories = db.get_all_categories()
+        query = self.cat_search.text().strip().lower() if hasattr(self, "cat_search") else ""
+        categories = [c for c in db.get_all_categories() if query in c.lower()] if query else db.get_all_categories()
+
         for cat in categories:
             tags = db.get_tags_by_category(cat)
             count = len(tags)
+            is_hidden = db.is_category_hidden(cat)
 
             row = QWidget()
             row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
@@ -446,12 +449,12 @@ class CategoryManagerDialog(QDialog):
             preview_hl = QHBoxLayout(preview)
             preview_hl.setContentsMargins(0,0,0,0)
             preview_hl.setSpacing(2)
-            for tag in tags[:6]:
+            for tag in tags[:5]:
                 dot = QLabel("●")
                 dot.setStyleSheet(f"color:{tag['color']}; font-size:10px;")
                 preview_hl.addWidget(dot)
-            if count > 6:
-                preview_hl.addWidget(QLabel(f"+{count-6}"))
+            if count > 5:
+                preview_hl.addWidget(QLabel(f"+{count-5}"))
             hl.addWidget(preview)
 
             # Botón renombrar
@@ -461,6 +464,14 @@ class CategoryManagerDialog(QDialog):
             btn_rename.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF; border-radius:4px;")
             btn_rename.clicked.connect(lambda _, old=cat, edit=name_edit: self._rename(old, edit.text()))
             hl.addWidget(btn_rename)
+
+            # Botón ocultar/mostrar del sidebar
+            btn_hide = QPushButton("🚫" if is_hidden else "👁")
+            btn_hide.setFixedSize(28, 28)
+            btn_hide.setToolTip("Mostrar en sidebar" if is_hidden else "Ocultar del sidebar")
+            btn_hide.setStyleSheet("QPushButton{border:1px solid #3A3A5A; border-radius:4px; font-size:12px;} QPushButton:hover{border-color:#4A9EFF;}")
+            btn_hide.clicked.connect(lambda _, c=cat, h=is_hidden: self._toggle_hide(c, h))
+            hl.addWidget(btn_hide)
 
             # Botón eliminar
             btn_del = QPushButton("✕")
@@ -473,6 +484,10 @@ class CategoryManagerDialog(QDialog):
             self.vbox.addWidget(row)
 
         self.vbox.addStretch()
+
+    def _toggle_hide(self, cat_name: str, currently_hidden: bool):
+        db.set_category_hidden(cat_name, not currently_hidden)
+        self._refresh()
 
     def _create_category(self):
         name = self.new_cat_edit.text().strip().lower()
@@ -542,6 +557,12 @@ class TagManagerDialog(QDialog):
         btn_cats.clicked.connect(self._open_category_manager)
         layout.addWidget(btn_cats)
 
+        # Buscador de etiquetas
+        self.tag_search = QLineEdit()
+        self.tag_search.setPlaceholderText("🔍 Buscar etiqueta…")
+        self.tag_search.textChanged.connect(self._refresh)
+        layout.addWidget(self.tag_search)
+
         # Tabla de etiquetas
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -575,18 +596,44 @@ class TagManagerDialog(QDialog):
             if w:
                 w.deleteLater()
 
-        for tag in db.get_all_tags():
+        query = self.tag_search.text().strip().lower() if hasattr(self, "tag_search") else ""
+        all_tags = db.get_all_tags()
+        if query:
+            all_tags = [t for t in all_tags if query in t["name"].lower() or query in (t["category"] or "").lower()]
+
+        for tag in all_tags:
             row = QWidget()
             hl  = QHBoxLayout(row)
             hl.setContentsMargins(4, 2, 4, 2)
+            hl.setSpacing(4)
 
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color:{tag['color']}; font-size:16px;")
+            # Color dot (clickable to edit color)
+            dot = QPushButton("●")
+            dot.setFixedSize(28, 28)
+            dot.setStyleSheet(f"QPushButton{{color:{tag['color']}; font-size:16px; background:transparent; border:none;}} QPushButton:hover{{background:#2D2D3F; border-radius:4px;}}")
+            dot.setToolTip("Cambiar color")
+            dot.clicked.connect(lambda _, tid=tag["id"], cur=tag["color"]: self._edit_color(tid, cur))
             hl.addWidget(dot)
 
-            lbl = QLabel(f"<b>{tag['name']}</b>  <span style='color:#666;'>[{tag['category']}]</span>")
-            lbl.setTextFormat(Qt.TextFormat.RichText)
-            hl.addWidget(lbl, stretch=1)
+            # Name (editable inline)
+            name_edit = QLineEdit(tag["name"])
+            name_edit.setStyleSheet("background:#13131F; border:1px solid #2D2D3F; border-radius:4px; padding:2px 5px; font-size:12px;")
+            name_edit.setFixedWidth(110)
+            hl.addWidget(name_edit)
+
+            cat_lbl = QLabel(f"[{tag['category']}]")
+            cat_lbl.setStyleSheet("color:#555; font-size:10px;")
+            hl.addWidget(cat_lbl)
+
+            hl.addStretch()
+
+            # Rename button
+            btn_rename = QPushButton("✎")
+            btn_rename.setFixedSize(26, 26)
+            btn_rename.setToolTip("Renombrar etiqueta")
+            btn_rename.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF; border-radius:4px; font-size:12px;")
+            btn_rename.clicked.connect(lambda _, tid=tag["id"], edit=name_edit: self._rename_tag(tid, edit.text()))
+            hl.addWidget(btn_rename)
 
             chk_hide_photos = QCheckBox("Ocultar fotos")
             chk_hide_photos.setChecked(bool(tag["hidden"]))
@@ -595,16 +642,16 @@ class TagManagerDialog(QDialog):
                 db.set_tag_hidden(tid, bool(state)))
             hl.addWidget(chk_hide_photos)
 
-            chk_hide_sidebar = QCheckBox("Ocultar del sidebar")
+            chk_hide_sidebar = QCheckBox("Sidebar")
             chk_hide_sidebar.setChecked(bool(tag["sidebar_hidden"]))
-            chk_hide_sidebar.setToolTip("La etiqueta no aparece en el panel de filtros")
+            chk_hide_sidebar.setToolTip("Ocultar del panel de filtros")
             chk_hide_sidebar.stateChanged.connect(lambda state, tid=tag["id"]:
                 db.set_tag_sidebar_hidden(tid, bool(state)))
             hl.addWidget(chk_hide_sidebar)
 
-            btn_del = QPushButton("Eliminar")
-            btn_del.setFixedWidth(70)
-            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A;")
+            btn_del = QPushButton("✕")
+            btn_del.setFixedSize(26, 26)
+            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A; border-radius:4px;")
             btn_del.clicked.connect(lambda _, tid=tag["id"]: self._delete(tid))
             hl.addWidget(btn_del)
 
@@ -612,6 +659,25 @@ class TagManagerDialog(QDialog):
             self.grid.addWidget(row)
 
         self.grid.addStretch()
+
+    def _rename_tag(self, tag_id: int, new_name: str):
+        new_name = new_name.strip().lower()
+        if not new_name:
+            return
+        with db.get_connection() as conn:
+            try:
+                conn.execute("UPDATE tags SET name = ? WHERE id = ?", (new_name, tag_id))
+            except Exception:
+                QMessageBox.warning(self, "Error", f"Ya existe una etiqueta con el nombre '{new_name}'.")
+                return
+        self._refresh()
+
+    def _edit_color(self, tag_id: int, current_color: str):
+        c = QColorDialog.getColor(QColor(current_color), self)
+        if c.isValid():
+            with db.get_connection() as conn:
+                conn.execute("UPDATE tags SET color = ? WHERE id = ?", (c.name(), tag_id))
+            self._refresh()
 
     def _delete(self, tag_id: int):
         db.delete_tag(tag_id)
@@ -1013,6 +1079,30 @@ class MainWindow(QMainWindow):
         tree_container.setStyleSheet("background:#13131F;")
         tree_vbox = QVBoxLayout(tree_container)
         tree_vbox.setContentsMargins(0, 0, 0, 0)
+        tree_vbox.setSpacing(0)
+
+        # Botones colapsar/expandir árbol
+        tree_btn_row = QWidget()
+        tree_btn_row.setStyleSheet("background:#0D0D1A; border-bottom:1px solid #2D2D3F;")
+        tree_btn_hl = QHBoxLayout(tree_btn_row)
+        tree_btn_hl.setContentsMargins(6, 4, 6, 4)
+        tree_btn_hl.setSpacing(4)
+        tree_btn_hl.addWidget(QLabel("Carpetas"))
+        tree_btn_hl.addStretch()
+        btn_tree_expand = QPushButton("▾")
+        btn_tree_expand.setFixedSize(26, 26)
+        btn_tree_expand.setToolTip("Expandir todo")
+        btn_tree_expand.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;padding:0;} QPushButton:hover{color:#4A9EFF;}")
+        btn_tree_expand.clicked.connect(lambda: self.folder_tree.expandAll())
+        btn_tree_collapse = QPushButton("▸")
+        btn_tree_collapse.setFixedSize(26, 26)
+        btn_tree_collapse.setToolTip("Colapsar todo")
+        btn_tree_collapse.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;padding:0;} QPushButton:hover{color:#4A9EFF;}")
+        btn_tree_collapse.clicked.connect(lambda: self.folder_tree.collapseAll())
+        tree_btn_hl.addWidget(btn_tree_expand)
+        tree_btn_hl.addWidget(btn_tree_collapse)
+        tree_vbox.addWidget(tree_btn_row)
+
         self.folder_tree = QTreeWidget()
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.setStyleSheet("""
@@ -1077,12 +1167,15 @@ class MainWindow(QMainWindow):
 
         # Agrupar por categoría
         from collections import OrderedDict
+        hidden_cats = db.get_hidden_categories()
         groups = OrderedDict()
         for tag in all_tags:
             cat = tag["category"] or "general"
             groups.setdefault(cat, []).append(tag)
 
         for category, tags in groups.items():
+            if category in hidden_cats:
+                continue
             # ── Encabezado de grupo (colapsable) ──────────────────────────
             header = QPushButton(f"▾  {category.upper()}")
             header.setCheckable(True)

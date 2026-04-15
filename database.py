@@ -53,7 +53,8 @@ def init_db():
             );
 
             CREATE TABLE IF NOT EXISTS categories (
-                name  TEXT PRIMARY KEY NOT NULL COLLATE NOCASE
+                name    TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+                hidden  INTEGER DEFAULT 0
             );
 
             CREATE INDEX IF NOT EXISTS idx_photos_year       ON photos(year);
@@ -77,6 +78,12 @@ def init_db():
             except Exception:
                 pass
 
+        # Migración: agregar hidden a categories si no existe
+        try:
+            conn.execute("ALTER TABLE categories ADD COLUMN hidden INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         # Poblar categories desde tags existentes (migración base de datos vieja)
         try:
             conn.execute(
@@ -86,67 +93,7 @@ def init_db():
         except Exception:
             pass
 
-        # ── Etiquetas y categorías predefinidas ───────────────────────────
-        conn.executescript("""
-            INSERT OR IGNORE INTO tags (name, category, color) VALUES
-                ('sfw', 'contenido', '#4AFF9E'),
-                ('nsfw', 'contenido', '#FF4A4A'),
-                ('gore', 'contenido', '#8B0000'),
-                ('ecchi', 'contenido', '#FF7A9E'),
-                ('foto', 'tipo', '#4AFFC3'),
-                ('video', 'tipo', '#FF7A4A'),
-                ('gif', 'tipo', '#4A9EFF'),
-                ('screenshot', 'tipo', '#4AFF9E'),
-                ('arte', 'tipo', '#FF9E4A'),
-                ('meme', 'tipo', '#FFD700'),
-                ('cosplay', 'tipo', '#FF4ACD'),
-                ('anime', 'origen', '#FF4ACD'),
-                ('caricatura', 'origen', '#4AFFD5'),
-                ('comic', 'origen', '#FF6A4A'),
-                ('videojuego', 'origen', '#4A9EFF'),
-                ('pelicula', 'origen', '#9E4AFF'),
-                ('serie', 'origen', '#4AFFF0'),
-                ('vida_real', 'origen', '#A4A4A4'),
-                ('dc', 'franquicia', '#4A6AFF'),
-                ('marvel', 'franquicia', '#FF4A4A'),
-                ('indie', 'franquicia', '#AAAAAA'),
-                ('familia', 'tema', '#FFD1DC'),
-                ('amigos', 'tema', '#FFE4A1'),
-                ('pareja', 'tema', '#FF9ECF'),
-                ('mascota', 'tema', '#C1FF9E'),
-                ('comida', 'tema', '#FFA54A'),
-                ('ropa', 'tema', '#A14AFF'),
-                ('tecnologia', 'tema', '#4A9EFF'),
-                ('trabajo', 'tema', '#8AFFC1'),
-                ('yo', 'persona', '#FFFFFF'),
-                ('novia', 'persona', '#FF69B4'),
-                ('amigo', 'persona', '#87CEEB'),
-                ('aesthetic', 'estilo', '#FFB6C1'),
-                ('dibujo', 'estilo', '#FF9E4A'),
-                ('render_3d', 'estilo', '#4A9EFF'),
-                ('realista', 'estilo', '#A4A4A4'),
-                ('anime_style', 'estilo', '#FF4ACD'),
-                ('blender', 'tecnica', '#FF9E4A'),
-                ('vrchat', 'tecnica', '#4AFFD5'),
-                ('pc', 'tecnica', '#4A9EFF'),
-                ('programacion', 'tecnica', '#00FF7F'),
-                ('ciberseguridad', 'tecnica', '#00CED1'),
-                ('feliz', 'emocion', '#FFFF7A'),
-                ('triste', 'emocion', '#7A7AFF'),
-                ('terror', 'emocion', '#8B0000'),
-                ('epico', 'emocion', '#FF8C00'),
-                ('relajante', 'emocion', '#98FB98'),
-                ('pfp', 'uso', '#FF69B4'),
-                ('wallpaper', 'uso', '#1E90FF'),
-                ('referencia', 'uso', '#32CD32'),
-                ('inspiracion', 'uso', '#FFD700'),
-                ('archivo', 'uso', '#A9A9A9');
-
-            INSERT OR IGNORE INTO categories (name) VALUES
-                ('contenido'),('tipo'),('origen'),('franquicia'),
-                ('tema'),('persona'),('estilo'),('tecnica'),
-                ('emocion'),('uso'),('general');
-        """)
+        # Las etiquetas y categorías se gestionan exclusivamente desde la app.
 
 
 def upsert_photo(path: str, filename: str, year: int, month: int,
@@ -367,6 +314,23 @@ def delete_category(name: str, move_to: str = "general"):
         conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (move_to,))
         conn.execute("UPDATE tags SET category = ? WHERE category = ?", (move_to, name))
         conn.execute("DELETE FROM categories WHERE name = ?", (name,))
+
+
+def is_category_hidden(name: str) -> bool:
+    with get_connection() as conn:
+        row = conn.execute("SELECT hidden FROM categories WHERE name = ?", (name,)).fetchone()
+        return bool(row["hidden"]) if row else False
+
+
+def set_category_hidden(name: str, hidden: bool):
+    with get_connection() as conn:
+        conn.execute("UPDATE categories SET hidden = ? WHERE name = ?", (int(hidden), name))
+
+
+def get_hidden_categories() -> set[str]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT name FROM categories WHERE hidden = 1").fetchall()
+    return {r[0] for r in rows}
 
 
 def get_tags_by_category(category: str):
