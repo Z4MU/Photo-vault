@@ -94,6 +94,14 @@ def init_db():
                 name  TEXT PRIMARY KEY NOT NULL COLLATE NOCASE
             );
 
+            -- Tabla de configuración interna de la app
+            -- Usada para registrar acciones que solo deben ocurrir una vez
+            -- (ej: seed inicial de etiquetas).
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key   TEXT PRIMARY KEY NOT NULL,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_photos_year       ON photos(year);
             CREATE INDEX IF NOT EXISTS idx_photos_month      ON photos(month);
             CREATE INDEX IF NOT EXISTS idx_photo_tags_photo  ON photo_tags(photo_id);
@@ -119,6 +127,28 @@ def init_db():
             except Exception:
                 pass
 
+        # Migración: marcar DBs existentes como ya sembradas
+        # (tienen las etiquetas de versiones anteriores; no re-sembrar)
+        try:
+            has_settings = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='app_settings'"
+            ).fetchone()
+            if has_settings:
+                already = conn.execute(
+                    "SELECT value FROM app_settings WHERE key='seeded'"
+                ).fetchone()
+                if not already:
+                    # DB vieja con etiquetas pero sin registro de seed
+                    # La marcamos como sembrada para no volver a insertar
+                    tag_count = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+                    if tag_count > 0:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('seeded', '1')"
+                        )
+                        conn.commit()
+        except Exception:
+            pass
+
         # Crear índice md5 aquí, después de asegurar que la columna existe
         try:
             conn.execute(
@@ -136,66 +166,95 @@ def init_db():
         except Exception:
             pass
 
-        conn.executescript("""
-            INSERT OR IGNORE INTO tags (name, category, color) VALUES
-                ('sfw', 'contenido', '#4AFF9E'),
-                ('nsfw', 'contenido', '#FF4A4A'),
-                ('gore', 'contenido', '#8B0000'),
-                ('ecchi', 'contenido', '#FF7A9E'),
-                ('foto', 'tipo', '#4AFFC3'),
-                ('video', 'tipo', '#FF7A4A'),
-                ('gif', 'tipo', '#4A9EFF'),
-                ('screenshot', 'tipo', '#4AFF9E'),
-                ('arte', 'tipo', '#FF9E4A'),
-                ('meme', 'tipo', '#FFD700'),
-                ('cosplay', 'tipo', '#FF4ACD'),
-                ('anime', 'origen', '#FF4ACD'),
-                ('caricatura', 'origen', '#4AFFD5'),
-                ('comic', 'origen', '#FF6A4A'),
-                ('videojuego', 'origen', '#4A9EFF'),
-                ('pelicula', 'origen', '#9E4AFF'),
-                ('serie', 'origen', '#4AFFF0'),
-                ('vida_real', 'origen', '#A4A4A4'),
-                ('dc', 'franquicia', '#4A6AFF'),
-                ('marvel', 'franquicia', '#FF4A4A'),
-                ('indie', 'franquicia', '#AAAAAA'),
-                ('familia', 'tema', '#FFD1DC'),
-                ('amigos', 'tema', '#FFE4A1'),
-                ('pareja', 'tema', '#FF9ECF'),
-                ('mascota', 'tema', '#C1FF9E'),
-                ('comida', 'tema', '#FFA54A'),
-                ('ropa', 'tema', '#A14AFF'),
-                ('tecnologia', 'tema', '#4A9EFF'),
-                ('trabajo', 'tema', '#8AFFC1'),
-                ('yo', 'persona', '#FFFFFF'),
-                ('novia', 'persona', '#FF69B4'),
-                ('amigo', 'persona', '#87CEEB'),
-                ('aesthetic', 'estilo', '#FFB6C1'),
-                ('dibujo', 'estilo', '#FF9E4A'),
-                ('render_3d', 'estilo', '#4A9EFF'),
-                ('realista', 'estilo', '#A4A4A4'),
-                ('anime_style', 'estilo', '#FF4ACD'),
-                ('blender', 'tecnica', '#FF9E4A'),
-                ('vrchat', 'tecnica', '#4AFFD5'),
-                ('pc', 'tecnica', '#4A9EFF'),
-                ('programacion', 'tecnica', '#00FF7F'),
-                ('ciberseguridad', 'tecnica', '#00CED1'),
-                ('feliz', 'emocion', '#FFFF7A'),
-                ('triste', 'emocion', '#7A7AFF'),
-                ('terror', 'emocion', '#8B0000'),
-                ('epico', 'emocion', '#FF8C00'),
-                ('relajante', 'emocion', '#98FB98'),
-                ('pfp', 'uso', '#FF69B4'),
-                ('wallpaper', 'uso', '#1E90FF'),
-                ('referencia', 'uso', '#32CD32'),
-                ('inspiracion', 'uso', '#FFD700'),
-                ('archivo', 'uso', '#A9A9A9');
+        # ── Seed de datos iniciales ────────────────────────────────────────
+        # Solo se ejecuta UNA VEZ en la vida de la base de datos.
+        # Si el usuario borra o modifica etiquetas/categorías, esos cambios
+        # se respetan en reinicios posteriores.
+        _seed_initial_data(conn)
 
-            INSERT OR IGNORE INTO categories (name) VALUES
-                ('contenido'),('tipo'),('origen'),('franquicia'),
-                ('tema'),('persona'),('estilo'),('tecnica'),
-                ('emocion'),('uso'),('general');
-        """)
+
+# ── Seed inicial ─────────────────────────────────────────────────────────────
+
+def _seed_initial_data(conn):
+    """
+    Inserta etiquetas y categorías predefinidas la primera vez que se crea
+    la base de datos. En arranques posteriores no hace nada, por lo que
+    los cambios del usuario (borrar/renombrar) se respetan completamente.
+    """
+    # Verificar si el seed ya corrió
+    row = conn.execute(
+        "SELECT value FROM app_settings WHERE key = 'seeded'"
+    ).fetchone()
+    if row:
+        return   # Ya se sembró — respetar el estado actual del usuario
+
+    conn.executescript("""
+        INSERT OR IGNORE INTO tags (name, category, color) VALUES
+            ('sfw', 'contenido', '#4AFF9E'),
+            ('nsfw', 'contenido', '#FF4A4A'),
+            ('gore', 'contenido', '#8B0000'),
+            ('ecchi', 'contenido', '#FF7A9E'),
+            ('foto', 'tipo', '#4AFFC3'),
+            ('video', 'tipo', '#FF7A4A'),
+            ('gif', 'tipo', '#4A9EFF'),
+            ('screenshot', 'tipo', '#4AFF9E'),
+            ('arte', 'tipo', '#FF9E4A'),
+            ('meme', 'tipo', '#FFD700'),
+            ('cosplay', 'tipo', '#FF4ACD'),
+            ('anime', 'origen', '#FF4ACD'),
+            ('caricatura', 'origen', '#4AFFD5'),
+            ('comic', 'origen', '#FF6A4A'),
+            ('videojuego', 'origen', '#4A9EFF'),
+            ('pelicula', 'origen', '#9E4AFF'),
+            ('serie', 'origen', '#4AFFF0'),
+            ('vida_real', 'origen', '#A4A4A4'),
+            ('dc', 'franquicia', '#4A6AFF'),
+            ('marvel', 'franquicia', '#FF4A4A'),
+            ('indie', 'franquicia', '#AAAAAA'),
+            ('familia', 'tema', '#FFD1DC'),
+            ('amigos', 'tema', '#FFE4A1'),
+            ('pareja', 'tema', '#FF9ECF'),
+            ('mascota', 'tema', '#C1FF9E'),
+            ('comida', 'tema', '#FFA54A'),
+            ('ropa', 'tema', '#A14AFF'),
+            ('tecnologia', 'tema', '#4A9EFF'),
+            ('trabajo', 'tema', '#8AFFC1'),
+            ('yo', 'persona', '#FFFFFF'),
+            ('novia', 'persona', '#FF69B4'),
+            ('amigo', 'persona', '#87CEEB'),
+            ('aesthetic', 'estilo', '#FFB6C1'),
+            ('dibujo', 'estilo', '#FF9E4A'),
+            ('render_3d', 'estilo', '#4A9EFF'),
+            ('realista', 'estilo', '#A4A4A4'),
+            ('anime_style', 'estilo', '#FF4ACD'),
+            ('blender', 'tecnica', '#FF9E4A'),
+            ('vrchat', 'tecnica', '#4AFFD5'),
+            ('pc', 'tecnica', '#4A9EFF'),
+            ('programacion', 'tecnica', '#00FF7F'),
+            ('ciberseguridad', 'tecnica', '#00CED1'),
+            ('feliz', 'emocion', '#FFFF7A'),
+            ('triste', 'emocion', '#7A7AFF'),
+            ('terror', 'emocion', '#8B0000'),
+            ('epico', 'emocion', '#FF8C00'),
+            ('relajante', 'emocion', '#98FB98'),
+            ('pfp', 'uso', '#FF69B4'),
+            ('wallpaper', 'uso', '#1E90FF'),
+            ('referencia', 'uso', '#32CD32'),
+            ('inspiracion', 'uso', '#FFD700'),
+            ('archivo', 'uso', '#A9A9A9');
+
+        INSERT OR IGNORE INTO categories (name) VALUES
+            ('contenido'),('tipo'),('origen'),('franquicia'),
+            ('tema'),('persona'),('estilo'),('tecnica'),
+            ('emocion'),('uso'),('general');
+    """)
+
+    # Marcar como completado — nunca más volverá a correr
+    conn.execute(
+        "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+        ('seeded', '1')
+    )
+    conn.commit()
 
 
 # ── Fotos ─────────────────────────────────────────────────────────────────────
