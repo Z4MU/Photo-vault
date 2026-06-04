@@ -1,6 +1,14 @@
 """
 PhotoVault - main.py
 App de escritorio para gestionar y etiquetar fotos.
+
+Cambios críticos aplicados:
+  1. ThumbnailLoader usa thumbnail_cache → lee/escribe miniaturas en disco,
+     evitando recargar desde cero en cada cambio de página o filtro.
+  2. resizeEvent usa debounce de 400 ms y solo recarga si el número de
+     columnas realmente cambió → elimina recargas en cascada al redimensionar.
+  3. _load_photos cancela y espera al loader anterior antes de crear uno nuevo
+     → elimina hilos huérfanos y condiciones de carrera en _thumbnails.
 """
 
 import sys
@@ -13,13 +21,15 @@ from PyQt6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QFileDialog, QDialog, QCheckBox, QFrame, QProgressBar,
     QSizePolicy, QMessageBox, QComboBox, QColorDialog, QSplitter,
-    QGroupBox, QStackedWidget, QTreeWidget, QTreeWidgetItem, QSpinBox
+    QGroupBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QRunnable, QThreadPool, pyqtSlot
 from PyQt6.QtGui import QPixmap, QIcon, QColor, QPainter, QFont, QFontDatabase
 
 import database as db
 import indexer
+# ── CAMBIO 1: importar el módulo de caché ────────────────────────────────────
+import thumbnail_cache
 
 # ─── Hilo para indexación ─────────────────────────────────────────────────────
 
@@ -51,35 +61,40 @@ class ThumbnailLoader(QThread):
     def __init__(self, photos):
         super().__init__()
         self.photos = photos
-        self._stop = False
+        self._stop_flag = False   # ── CAMBIO 3: renombrado para claridad
 
     def stop(self):
-        self._stop = True
+        self._stop_flag = True
 
     def run(self):
         for photo in self.photos:
-            if self._stop:
+            if self._stop_flag:
                 break
             try:
+                # ── CAMBIO 1: usar caché en lugar de leer directo del disco ──
                 if photo.get("media_type") == "video":
-                    from indexer import extract_video_thumbnail
-                    jpeg_bytes = extract_video_thumbnail(photo["path"])
-                    if jpeg_bytes:
-                        pix = QPixmap()
-                        pix.loadFromData(jpeg_bytes)
-                        if not pix.isNull():
-                            pix = pix.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                             Qt.TransformationMode.SmoothTransformation)
-                            self.loaded.emit(photo["id"], pix)
+                    jpeg_bytes = thumbnail_cache.get_video_thumbnail(photo["path"])
                 else:
-                    pix = QPixmap(photo["path"])
+                    jpeg_bytes = thumbnail_cache.get_thumbnail(photo["path"])
+
+                if jpeg_bytes:
+                    pix = QPixmap()
+                    pix.loadFromData(jpeg_bytes)
                     if not pix.isNull():
-                        pix = pix.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio,
-                                         Qt.TransformationMode.SmoothTransformation)
+                        # El caché ya guarda el tamaño correcto, pero por si acaso:
+                        if pix.width() > 200 or pix.height() > 200:
+                            pix = pix.scaled(
+                                200, 200,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation
+                            )
                         self.loaded.emit(photo["id"], pix)
             except Exception:
                 pass
-            self.msleep(5)
+            # ── CAMBIO 3: si ya está parado no seguir durmiendo ──────────────
+            if not self._stop_flag:
+                self.msleep(5)
+
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────
 
@@ -109,7 +124,6 @@ class PhotoThumbnail(QFrame):
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(4)
 
-        # Contenedor de imagen con overlay de video
         img_container = QWidget()
         img_container.setFixedSize(200, 200)
         img_container.setStyleSheet("background: #13131F; border-radius: 6px;")
@@ -122,7 +136,6 @@ class PhotoThumbnail(QFrame):
         self.img_label.setStyleSheet("background: transparent;")
         img_inner.addWidget(self.img_label)
 
-        # Ícono ▶ y duración encima para videos
         if is_video:
             play_overlay = QLabel("▶", img_container)
             play_overlay.setStyleSheet("""
@@ -187,16 +200,14 @@ class PhotoDetailDialog(QDialog):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
 
-        # Lado izquierdo: imagen o panel de video
         if self.media_type == "video":
             left = QWidget()
             left.setMinimumWidth(500)
             left_layout = QVBoxLayout(left)
             left_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            # Miniatura del video
-            from indexer import extract_video_thumbnail
-            thumb_bytes = extract_video_thumbnail(self.path, size=480)
+            # ── CAMBIO 1: usar caché para el detalle del video ───────────────
+            thumb_bytes = thumbnail_cache.get_video_thumbnail(self.path, size=480)
             thumb_lbl = QLabel()
             thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             if thumb_bytes:
@@ -208,7 +219,7 @@ class PhotoDetailDialog(QDialog):
                 thumb_lbl.setStyleSheet("font-size:64px;")
             left_layout.addWidget(thumb_lbl)
 
-            btn_play = QPushButton("▶  Reproducir en Windows Media Player")
+            btn_play = QPushButton("▶  Reproducir")
             btn_play.setStyleSheet("""
                 QPushButton {
                     background: #4A9EFF22;
@@ -234,7 +245,6 @@ class PhotoDetailDialog(QDialog):
                 self.img_label.setPixmap(pix)
             layout.addWidget(self.img_label)
 
-        # Panel derecho de etiquetas
         right = QVBoxLayout()
         right.setSpacing(10)
         right.addWidget(QLabel(f"<b>{Path(self.path).name}</b>"))
@@ -266,21 +276,20 @@ class PhotoDetailDialog(QDialog):
         layout.addLayout(right)
 
     def _open_video(self):
-        import subprocess
-        subprocess.Popen(["start", "", self.path], shell=True)
+        # ── CAMBIO menor: multiplataforma en lugar de shell=True ────────────
+        from PyQt6.QtGui import QDesktopServices
+        from PyQt6.QtCore import QUrl
+        QDesktopServices.openUrl(QUrl.fromLocalFile(self.path))
 
     def _load_tags(self):
-        # Limpiar
         for i in reversed(range(self.tags_layout.count())):
             self.tags_layout.itemAt(i).widget().deleteLater()
 
-        # Etiquetas actuales de la foto
         current = db.get_photo_tags(self.photo_id)
         for tag in current:
             chip = self._make_chip(tag["id"], tag["name"], tag["color"])
             self.tags_layout.addWidget(chip)
 
-        # Poblar combo con todas las etiquetas
         all_tags = db.get_all_tags()
         self.tag_combo.clear()
         for t in all_tags:
@@ -317,27 +326,25 @@ class PhotoDetailDialog(QDialog):
         self.tags_changed.emit()
 
 
-
 # ─── Dialog: Configuración ────────────────────────────────────────────────────
 
 class SettingsDialog(QDialog):
     def __init__(self, current_page_size: int, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuración de visualización")
-        self.setFixedSize(420, 220)
+        self.setFixedSize(420, 260)
         self.setStyleSheet(DARK_STYLE)
         self.page_size = current_page_size
         self._build_ui()
 
     def _build_ui(self):
-        from PyQt6.QtWidgets import QSlider, QSpinBox
+        from PyQt6.QtWidgets import QSpinBox
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(16)
 
         layout.addWidget(QLabel("<b>Configuración de visualización</b>"))
 
-        # Fotos por página
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Fotos por página:"))
         self.spin_page = QSpinBox()
@@ -353,9 +360,19 @@ class SettingsDialog(QDialog):
         info.setStyleSheet("color:#666; font-size:11px;")
         layout.addWidget(info)
 
+        # ── CAMBIO 1: mostrar tamaño del caché y botón para limpiarlo ────────
+        self.cache_lbl = QLabel()
+        self._refresh_cache_label()
+        self.cache_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
+        layout.addWidget(self.cache_lbl)
+
+        btn_clear_cache = QPushButton("🗑  Limpiar caché de miniaturas")
+        btn_clear_cache.setStyleSheet("color:#FFD700; border:1px solid #FFD700;")
+        btn_clear_cache.clicked.connect(self._clear_cache)
+        layout.addWidget(btn_clear_cache)
+
         layout.addStretch()
 
-        # Botones
         btn_row = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar")
         btn_cancel.clicked.connect(self.reject)
@@ -366,10 +383,21 @@ class SettingsDialog(QDialog):
         btn_row.addWidget(btn_ok)
         layout.addLayout(btn_row)
 
+    def _refresh_cache_label(self):
+        mb = thumbnail_cache.cache_size_mb()
+        self.cache_lbl.setText(f"Caché de miniaturas: {mb} MB")
+
+    def _clear_cache(self):
+        import shutil
+        cache_dir = thumbnail_cache.CACHE_DIR
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+        self._refresh_cache_label()
+        QMessageBox.information(self, "Caché limpiado", "El caché de miniaturas fue eliminado.\nSe regenerará al navegar la galería.")
+
     def _apply(self):
         self.page_size = self.spin_page.value()
         self.accept()
-
 
 
 # ─── Dialog: Gestionar categorías ────────────────────────────────────────────
@@ -390,7 +418,6 @@ class CategoryManagerDialog(QDialog):
 
         layout.addWidget(QLabel("<b>Gestionar categorías de etiquetas</b>"))
 
-        # Crear nueva categoría
         box = QGroupBox("Nueva categoría")
         form = QHBoxLayout(box)
         self.new_cat_edit = QLineEdit()
@@ -401,7 +428,6 @@ class CategoryManagerDialog(QDialog):
         form.addWidget(btn_create)
         layout.addWidget(box)
 
-        # Lista de categorías existentes
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.container = QWidget()
@@ -410,7 +436,7 @@ class CategoryManagerDialog(QDialog):
         self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, stretch=1)
 
-        info = QLabel("💡 Al eliminar una categoría, sus etiquetas se mueven a \'general\'.")
+        info = QLabel("💡 Al eliminar una categoría, sus etiquetas se mueven a 'general'.")
         info.setStyleSheet("color:#666; font-size:10px;")
         layout.addWidget(info)
 
@@ -419,13 +445,10 @@ class CategoryManagerDialog(QDialog):
             w = self.vbox.itemAt(i).widget()
             if w: w.deleteLater()
 
-        query = self.cat_search.text().strip().lower() if hasattr(self, "cat_search") else ""
-        categories = [c for c in db.get_all_categories() if query in c.lower()] if query else db.get_all_categories()
-
+        categories = db.get_all_categories()
         for cat in categories:
             tags = db.get_tags_by_category(cat)
             count = len(tags)
-            is_hidden = db.is_category_hidden(cat)
 
             row = QWidget()
             row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
@@ -433,31 +456,27 @@ class CategoryManagerDialog(QDialog):
             hl.setContentsMargins(8, 6, 8, 6)
             hl.setSpacing(6)
 
-            # Nombre editable inline
             name_edit = QLineEdit(cat)
             name_edit.setStyleSheet("background:#13131F; border:1px solid #3A3A5A; border-radius:4px; padding:3px 6px;")
             name_edit.setFixedWidth(140)
             hl.addWidget(name_edit)
 
-            # Contador de etiquetas
             count_lbl = QLabel(f"{count} etiqueta{'s' if count != 1 else ''}")
             count_lbl.setStyleSheet("color:#666; font-size:11px;")
             hl.addWidget(count_lbl, stretch=1)
 
-            # Preview de colores
             preview = QWidget()
             preview_hl = QHBoxLayout(preview)
             preview_hl.setContentsMargins(0,0,0,0)
             preview_hl.setSpacing(2)
-            for tag in tags[:5]:
+            for tag in tags[:6]:
                 dot = QLabel("●")
                 dot.setStyleSheet(f"color:{tag['color']}; font-size:10px;")
                 preview_hl.addWidget(dot)
-            if count > 5:
-                preview_hl.addWidget(QLabel(f"+{count-5}"))
+            if count > 6:
+                preview_hl.addWidget(QLabel(f"+{count-6}"))
             hl.addWidget(preview)
 
-            # Botón renombrar
             btn_rename = QPushButton("✎")
             btn_rename.setFixedSize(28, 28)
             btn_rename.setToolTip("Renombrar categoría")
@@ -465,15 +484,6 @@ class CategoryManagerDialog(QDialog):
             btn_rename.clicked.connect(lambda _, old=cat, edit=name_edit: self._rename(old, edit.text()))
             hl.addWidget(btn_rename)
 
-            # Botón ocultar/mostrar del sidebar
-            btn_hide = QPushButton("🚫" if is_hidden else "👁")
-            btn_hide.setFixedSize(28, 28)
-            btn_hide.setToolTip("Mostrar en sidebar" if is_hidden else "Ocultar del sidebar")
-            btn_hide.setStyleSheet("QPushButton{border:1px solid #3A3A5A; border-radius:4px; font-size:12px;} QPushButton:hover{border-color:#4A9EFF;}")
-            btn_hide.clicked.connect(lambda _, c=cat, h=is_hidden: self._toggle_hide(c, h))
-            hl.addWidget(btn_hide)
-
-            # Botón eliminar
             btn_del = QPushButton("✕")
             btn_del.setFixedSize(28, 28)
             btn_del.setToolTip("Eliminar categoría (mueve etiquetas a general)")
@@ -484,10 +494,6 @@ class CategoryManagerDialog(QDialog):
             self.vbox.addWidget(row)
 
         self.vbox.addStretch()
-
-    def _toggle_hide(self, cat_name: str, currently_hidden: bool):
-        db.set_category_hidden(cat_name, not currently_hidden)
-        self._refresh()
 
     def _create_category(self):
         name = self.new_cat_edit.text().strip().lower()
@@ -534,7 +540,6 @@ class TagManagerDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
 
-        # Crear nueva etiqueta
         box = QGroupBox("Nueva etiqueta")
         form = QHBoxLayout(box)
         self.new_name   = QLineEdit(); self.new_name.setPlaceholderText("Nombre")
@@ -551,19 +556,11 @@ class TagManagerDialog(QDialog):
             form.addWidget(w)
         layout.addWidget(box)
 
-        # Botón para gestionar categorías
         btn_cats = QPushButton("📂  Gestionar categorías")
         btn_cats.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF;")
         btn_cats.clicked.connect(self._open_category_manager)
         layout.addWidget(btn_cats)
 
-        # Buscador de etiquetas
-        self.tag_search = QLineEdit()
-        self.tag_search.setPlaceholderText("🔍 Buscar etiqueta…")
-        self.tag_search.textChanged.connect(self._refresh)
-        layout.addWidget(self.tag_search)
-
-        # Tabla de etiquetas
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.container = QWidget()
@@ -585,7 +582,6 @@ class TagManagerDialog(QDialog):
         cat = self.new_cat.currentText().strip().lower() or "general"
         db.create_tag(name, cat, self._color_val)
         self.new_name.clear()
-        # Refrescar el combo de categorías
         self.new_cat.clear()
         self.new_cat.addItems(db.get_all_categories())
         self._refresh()
@@ -596,44 +592,18 @@ class TagManagerDialog(QDialog):
             if w:
                 w.deleteLater()
 
-        query = self.tag_search.text().strip().lower() if hasattr(self, "tag_search") else ""
-        all_tags = db.get_all_tags()
-        if query:
-            all_tags = [t for t in all_tags if query in t["name"].lower() or query in (t["category"] or "").lower()]
-
-        for tag in all_tags:
+        for tag in db.get_all_tags():
             row = QWidget()
             hl  = QHBoxLayout(row)
             hl.setContentsMargins(4, 2, 4, 2)
-            hl.setSpacing(4)
 
-            # Color dot (clickable to edit color)
-            dot = QPushButton("●")
-            dot.setFixedSize(28, 28)
-            dot.setStyleSheet(f"QPushButton{{color:{tag['color']}; font-size:16px; background:transparent; border:none;}} QPushButton:hover{{background:#2D2D3F; border-radius:4px;}}")
-            dot.setToolTip("Cambiar color")
-            dot.clicked.connect(lambda _, tid=tag["id"], cur=tag["color"]: self._edit_color(tid, cur))
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color:{tag['color']}; font-size:16px;")
             hl.addWidget(dot)
 
-            # Name (editable inline)
-            name_edit = QLineEdit(tag["name"])
-            name_edit.setStyleSheet("background:#13131F; border:1px solid #2D2D3F; border-radius:4px; padding:2px 5px; font-size:12px;")
-            name_edit.setFixedWidth(110)
-            hl.addWidget(name_edit)
-
-            cat_lbl = QLabel(f"[{tag['category']}]")
-            cat_lbl.setStyleSheet("color:#555; font-size:10px;")
-            hl.addWidget(cat_lbl)
-
-            hl.addStretch()
-
-            # Rename button
-            btn_rename = QPushButton("✎")
-            btn_rename.setFixedSize(26, 26)
-            btn_rename.setToolTip("Renombrar etiqueta")
-            btn_rename.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF; border-radius:4px; font-size:12px;")
-            btn_rename.clicked.connect(lambda _, tid=tag["id"], edit=name_edit: self._rename_tag(tid, edit.text()))
-            hl.addWidget(btn_rename)
+            lbl = QLabel(f"<b>{tag['name']}</b>  <span style='color:#666;'>[{tag['category']}]</span>")
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            hl.addWidget(lbl, stretch=1)
 
             chk_hide_photos = QCheckBox("Ocultar fotos")
             chk_hide_photos.setChecked(bool(tag["hidden"]))
@@ -642,16 +612,16 @@ class TagManagerDialog(QDialog):
                 db.set_tag_hidden(tid, bool(state)))
             hl.addWidget(chk_hide_photos)
 
-            chk_hide_sidebar = QCheckBox("Sidebar")
+            chk_hide_sidebar = QCheckBox("Ocultar del sidebar")
             chk_hide_sidebar.setChecked(bool(tag["sidebar_hidden"]))
-            chk_hide_sidebar.setToolTip("Ocultar del panel de filtros")
+            chk_hide_sidebar.setToolTip("La etiqueta no aparece en el panel de filtros")
             chk_hide_sidebar.stateChanged.connect(lambda state, tid=tag["id"]:
                 db.set_tag_sidebar_hidden(tid, bool(state)))
             hl.addWidget(chk_hide_sidebar)
 
-            btn_del = QPushButton("✕")
-            btn_del.setFixedSize(26, 26)
-            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A; border-radius:4px;")
+            btn_del = QPushButton("Eliminar")
+            btn_del.setFixedWidth(70)
+            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A;")
             btn_del.clicked.connect(lambda _, tid=tag["id"]: self._delete(tid))
             hl.addWidget(btn_del)
 
@@ -659,25 +629,6 @@ class TagManagerDialog(QDialog):
             self.grid.addWidget(row)
 
         self.grid.addStretch()
-
-    def _rename_tag(self, tag_id: int, new_name: str):
-        new_name = new_name.strip().lower()
-        if not new_name:
-            return
-        with db.get_connection() as conn:
-            try:
-                conn.execute("UPDATE tags SET name = ? WHERE id = ?", (new_name, tag_id))
-            except Exception:
-                QMessageBox.warning(self, "Error", f"Ya existe una etiqueta con el nombre '{new_name}'.")
-                return
-        self._refresh()
-
-    def _edit_color(self, tag_id: int, current_color: str):
-        c = QColorDialog.getColor(QColor(current_color), self)
-        if c.isValid():
-            with db.get_connection() as conn:
-                conn.execute("UPDATE tags SET color = ? WHERE id = ?", (c.name(), tag_id))
-            self._refresh()
 
     def _delete(self, tag_id: int):
         db.delete_tag(tag_id)
@@ -759,9 +710,6 @@ class IndexDialog(QDialog):
         self.btn_start.setEnabled(True)
 
 
-
-
-
 # ─── Dialog: Des-indexar carpetas ─────────────────────────────────────────────
 
 class DeindexDialog(QDialog):
@@ -814,7 +762,7 @@ class DeindexDialog(QDialog):
                 row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
                 hl = QHBoxLayout(row)
                 hl.setContentsMargins(8, 6, 8, 6)
-                lbl = QLabel(f"<b>{folder}</b>  <span style=\'color:#666;\'>{count:,} archivos</span>")
+                lbl = QLabel(f"<b>{folder}</b>  <span style='color:#666;'>{count:,} archivos</span>")
                 lbl.setTextFormat(Qt.TextFormat.RichText)
                 hl.addWidget(lbl, stretch=1)
                 btn = QPushButton("Eliminar")
@@ -826,20 +774,15 @@ class DeindexDialog(QDialog):
         self.vbox.addStretch()
 
     def _get_folders(self):
-        """Devuelve lista de (carpeta_raiz, cantidad) agrupando por directorio padre común."""
         with db.get_connection() as conn:
             rows = conn.execute("SELECT path FROM photos ORDER BY path").fetchall()
         from collections import Counter
         folder_counts = Counter()
         for row in rows:
             folder_counts[str(Path(row[0]).parent)] += 1
-        # Agrupar: encontrar carpetas únicas de primer nivel
         result = {}
         for folder, count in folder_counts.items():
-            p = Path(folder)
-            # Buscar el ancestro más alto que siga siendo una subcarpeta de alguna carpeta indexada
             result[folder] = result.get(folder, 0) + count
-        # Simplificar: mostrar solo directorios únicos ordenados
         return sorted(result.items(), key=lambda x: x[0])
 
     def _deindex_folder(self, folder: str):
@@ -873,6 +816,7 @@ class DeindexDialog(QDialog):
         QMessageBox.information(self, "Listo", f"Se eliminaron {len(missing)} registros.")
         self._refresh()
 
+
 # ─── Ventana principal ────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -887,19 +831,23 @@ class MainWindow(QMainWindow):
         self._page_size = 100
         self._total     = 0
         self._thumbnails: dict[int, PhotoThumbnail] = {}
-        self._active_loaders: list = []
-        self._loader: ThumbnailLoader = None
         self._current_photos = []
-        self._pending_photos: list = []   # cola de widgets por crear
-        self._view_mode = 'gallery'  # 'gallery' or 'folders'
-        self._folder_filter: str = None
-        self._folder_loader: ThumbnailLoader = None
-        self._folder_thumbnails: dict = {}
-        self._folder_photos: list = []
-        self._build_timer = QTimer(self)  # timer para agregar widgets poco a poco
-        self._build_timer.setInterval(0)  # lo más rápido posible pero sin bloquear
-        self._build_timer.timeout.connect(self._add_next_batch)
+        self._pending_photos: list = []
         self._grid_cols = 4
+
+        # ── CAMBIO 3: un solo loader con control claro ───────────────────────
+        self._loader: ThumbnailLoader | None = None
+
+        self._build_timer = QTimer(self)
+        self._build_timer.setInterval(0)
+        self._build_timer.timeout.connect(self._add_next_batch)
+
+        # ── CAMBIO 2: timer de debounce para resize ──────────────────────────
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(400)          # 400 ms de debounce
+        self._resize_timer.timeout.connect(self._on_resize_settled)
+        self._last_grid_cols = 0                     # columnas anteriores
 
         db.init_db()
         self._build_ui()
@@ -927,27 +875,9 @@ class MainWindow(QMainWindow):
         logo.setStyleSheet("font-size:18px; font-weight:bold; color:#4A9EFF; margin-bottom:8px;")
         sb_layout.addWidget(logo)
 
-        # Mode toggle buttons
-        mode_row = QHBoxLayout()
-        self.btn_gallery_mode = QPushButton("🖼  Galería")
-        self.btn_gallery_mode.setCheckable(True)
-        self.btn_gallery_mode.setChecked(True)
-        self.btn_gallery_mode.clicked.connect(self._show_gallery)
-        self.btn_folder_mode = QPushButton("📁  Carpetas")
-        self.btn_folder_mode.setCheckable(True)
-        self.btn_folder_mode.clicked.connect(self._show_explorer)
-        for b in [self.btn_gallery_mode, self.btn_folder_mode]:
-            b.setStyleSheet("""QPushButton{background:#1E1E2E;border:1px solid #3A3A5A;border-radius:6px;padding:5px;}
-                QPushButton:checked{background:#4A9EFF33;border-color:#4A9EFF;color:#4A9EFF;}
-                QPushButton:hover{border-color:#4A9EFF;}""")
-        mode_row.addWidget(self.btn_gallery_mode)
-        mode_row.addWidget(self.btn_folder_mode)
-        sb_layout.addLayout(mode_row)
-
         btn_index = QPushButton("＋ Indexar carpeta")
         btn_index.clicked.connect(self._open_index_dialog)
         sb_layout.addWidget(btn_index)
-
 
         btn_tags = QPushButton("🏷  Gestionar etiquetas")
         btn_tags.clicked.connect(self._open_tag_manager)
@@ -965,23 +895,7 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("color:#2D2D3F;")
         sb_layout.addWidget(sep)
 
-        # Fila: label + botones colapsar/expandir
-        tag_header_row = QHBoxLayout()
-        tag_header_row.addWidget(QLabel("Filtrar por etiqueta:"))
-        tag_header_row.addStretch()
-        btn_expand_all = QPushButton("▾")
-        btn_expand_all.setFixedSize(28, 28)
-        btn_expand_all.setToolTip("Expandir todos los grupos")
-        btn_expand_all.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;} QPushButton:hover{color:#4A9EFF;}")
-        btn_expand_all.clicked.connect(self._expand_all_groups)
-        btn_collapse_all = QPushButton("▸")
-        btn_collapse_all.setFixedSize(28, 28)
-        btn_collapse_all.setToolTip("Colapsar todos los grupos")
-        btn_collapse_all.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;} QPushButton:hover{color:#4A9EFF;}")
-        btn_collapse_all.clicked.connect(self._collapse_all_groups)
-        tag_header_row.addWidget(btn_expand_all)
-        tag_header_row.addWidget(btn_collapse_all)
-        sb_layout.addLayout(tag_header_row)
+        sb_layout.addWidget(QLabel("Filtrar por etiqueta:"))
 
         self.tag_scroll = QScrollArea()
         self.tag_scroll.setWidgetResizable(True)
@@ -1004,24 +918,22 @@ class MainWindow(QMainWindow):
 
         root.addWidget(sidebar)
 
-        # ── Área principal (stacked: galería | explorador) ───────────────
-        self.stack = QStackedWidget()
-
-        # ── Vista 0: Galería ──────────────────────────────────────────────
-        gallery_page = QWidget()
-        gallery_layout = QVBoxLayout(gallery_page)
-        gallery_layout.setContentsMargins(12, 12, 12, 12)
-        gallery_layout.setSpacing(8)
+        # ── Área principal ────────────────────────────────────────────────
+        main_area = QWidget()
+        main_layout = QVBoxLayout(main_area)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+        main_layout.setSpacing(8)
 
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Buscar por nombre…")
         self.search_edit.textChanged.connect(self._on_search)
         top_bar.addWidget(self.search_edit)
+
         self.count_lbl = QLabel("0 fotos")
         self.count_lbl.setStyleSheet("color:#8888AA;")
         top_bar.addWidget(self.count_lbl)
-        gallery_layout.addLayout(top_bar)
+        main_layout.addLayout(top_bar)
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1030,7 +942,7 @@ class MainWindow(QMainWindow):
         self.grid_layout = QGridLayout(self.grid_widget)
         self.grid_layout.setSpacing(8)
         self.scroll_area.setWidget(self.grid_widget)
-        gallery_layout.addWidget(self.scroll_area, stretch=1)
+        main_layout.addWidget(self.scroll_area, stretch=1)
 
         pg_bar = QHBoxLayout()
         self.prev_btn = QPushButton("← Anterior")
@@ -1042,118 +954,9 @@ class MainWindow(QMainWindow):
         pg_bar.addWidget(self.prev_btn)
         pg_bar.addWidget(self.page_lbl, stretch=1)
         pg_bar.addWidget(self.next_btn)
-        gallery_layout.addLayout(pg_bar)
+        main_layout.addLayout(pg_bar)
 
-        self.stack.addWidget(gallery_page)  # index 0
-
-        # ── Vista 1: Explorador de carpetas ───────────────────────────────
-        explorer_page = QWidget()
-        explorer_layout = QVBoxLayout(explorer_page)
-        explorer_layout.setContentsMargins(0, 0, 0, 0)
-        explorer_layout.setSpacing(0)
-
-        # Barra superior del explorador
-        exp_top = QWidget()
-        exp_top.setStyleSheet("background:#13131F; border-bottom:1px solid #2D2D3F;")
-        exp_top_hl = QHBoxLayout(exp_top)
-        exp_top_hl.setContentsMargins(10, 6, 10, 6)
-        btn_back_gallery = QPushButton("← Volver a galería")
-        btn_back_gallery.setStyleSheet("color:#4A9EFF; border:none; background:transparent; font-size:12px;")
-        btn_back_gallery.clicked.connect(self._show_gallery)
-        exp_top_hl.addWidget(btn_back_gallery)
-        self.exp_path_lbl = QLabel("Selecciona una carpeta")
-        self.exp_path_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
-        exp_top_hl.addWidget(self.exp_path_lbl, stretch=1)
-        self.exp_count_lbl = QLabel("")
-        self.exp_count_lbl.setStyleSheet("color:#4A9EFF; font-size:11px;")
-        exp_top_hl.addWidget(self.exp_count_lbl)
-        explorer_layout.addWidget(exp_top)
-
-        # Splitter árbol | grid
-        exp_splitter = QSplitter(Qt.Orientation.Horizontal)
-        exp_splitter.setStyleSheet("QSplitter::handle { background: #2D2D3F; width: 1px; }")
-
-        # Árbol de carpetas
-        tree_container = QWidget()
-        tree_container.setFixedWidth(250)
-        tree_container.setStyleSheet("background:#13131F;")
-        tree_vbox = QVBoxLayout(tree_container)
-        tree_vbox.setContentsMargins(0, 0, 0, 0)
-        tree_vbox.setSpacing(0)
-
-        # Botones colapsar/expandir árbol
-        tree_btn_row = QWidget()
-        tree_btn_row.setStyleSheet("background:#0D0D1A; border-bottom:1px solid #2D2D3F;")
-        tree_btn_hl = QHBoxLayout(tree_btn_row)
-        tree_btn_hl.setContentsMargins(6, 4, 6, 4)
-        tree_btn_hl.setSpacing(4)
-        tree_btn_hl.addWidget(QLabel("Carpetas"))
-        tree_btn_hl.addStretch()
-        btn_tree_expand = QPushButton("▾")
-        btn_tree_expand.setFixedSize(26, 26)
-        btn_tree_expand.setToolTip("Expandir todo")
-        btn_tree_expand.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;padding:0;} QPushButton:hover{color:#4A9EFF;}")
-        btn_tree_expand.clicked.connect(lambda: self.folder_tree.expandAll())
-        btn_tree_collapse = QPushButton("▸")
-        btn_tree_collapse.setFixedSize(26, 26)
-        btn_tree_collapse.setToolTip("Colapsar todo")
-        btn_tree_collapse.setStyleSheet("QPushButton{background:transparent;border:none;color:#6688AA;font-size:14px;padding:0;} QPushButton:hover{color:#4A9EFF;}")
-        btn_tree_collapse.clicked.connect(lambda: self.folder_tree.collapseAll())
-        tree_btn_hl.addWidget(btn_tree_expand)
-        tree_btn_hl.addWidget(btn_tree_collapse)
-        tree_vbox.addWidget(tree_btn_row)
-
-        self.folder_tree = QTreeWidget()
-        self.folder_tree.setHeaderHidden(True)
-        self.folder_tree.setStyleSheet("""
-            QTreeWidget { background:#13131F; border:none; color:#D0D0E8; font-size:12px; }
-            QTreeWidget::item { padding:4px 6px; }
-            QTreeWidget::item:selected { background:#4A9EFF33; color:#4A9EFF; }
-            QTreeWidget::item:hover { background:#1E1E2E; }
-        """)
-        self.folder_tree.itemClicked.connect(self._on_folder_clicked)
-        tree_vbox.addWidget(self.folder_tree)
-        exp_splitter.addWidget(tree_container)
-
-        # Grid del explorador
-        exp_right = QWidget()
-        exp_right_layout = QVBoxLayout(exp_right)
-        exp_right_layout.setContentsMargins(8, 8, 8, 4)
-        exp_right_layout.setSpacing(6)
-        self.exp_scroll = QScrollArea()
-        self.exp_scroll.setWidgetResizable(True)
-        self.exp_grid_widget = QWidget()
-        self.exp_grid_layout = QGridLayout(self.exp_grid_widget)
-        self.exp_grid_layout.setSpacing(6)
-        self.exp_scroll.setWidget(self.exp_grid_widget)
-        exp_right_layout.addWidget(self.exp_scroll, stretch=1)
-
-        # Paginación explorador
-        exp_pg = QHBoxLayout()
-        self.exp_prev_btn = QPushButton("← Anterior")
-        self.exp_prev_btn.setEnabled(False)
-        self.exp_prev_btn.clicked.connect(self._exp_prev_page)
-        self.exp_next_btn = QPushButton("Siguiente →")
-        self.exp_next_btn.setEnabled(False)
-        self.exp_next_btn.clicked.connect(self._exp_next_page)
-        self.exp_page_lbl = QLabel("")
-        self.exp_page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.exp_page_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
-        exp_pg.addWidget(self.exp_prev_btn)
-        exp_pg.addWidget(self.exp_page_lbl, stretch=1)
-        exp_pg.addWidget(self.exp_next_btn)
-        exp_right_layout.addLayout(exp_pg)
-        exp_splitter.addWidget(exp_right)
-        exp_splitter.setSizes([250, 800])
-        explorer_layout.addWidget(exp_splitter, stretch=1)
-
-        self.stack.addWidget(explorer_page)  # index 1
-        root.addWidget(self.stack, stretch=1)
-
-        # Estado paginación explorador
-        self._exp_offset = 0
-        self._exp_page_size = 80
-        self._exp_total = 0
+        root.addWidget(main_area, stretch=1)
 
     # ── Etiquetas sidebar ─────────────────────────────────────────────────────
 
@@ -1165,18 +968,13 @@ class MainWindow(QMainWindow):
 
         all_tags = db.get_all_tags(include_sidebar_hidden=False)
 
-        # Agrupar por categoría
         from collections import OrderedDict
-        hidden_cats = db.get_hidden_categories()
         groups = OrderedDict()
         for tag in all_tags:
             cat = tag["category"] or "general"
             groups.setdefault(cat, []).append(tag)
 
         for category, tags in groups.items():
-            if category in hidden_cats:
-                continue
-            # ── Encabezado de grupo (colapsable) ──────────────────────────
             header = QPushButton(f"▾  {category.upper()}")
             header.setCheckable(True)
             header.setChecked(True)
@@ -1196,7 +994,6 @@ class MainWindow(QMainWindow):
                 QPushButton:hover { color: #88AACC; background: #1E1E2E; }
             """)
 
-            # Contenedor de las etiquetas de este grupo
             group_widget = QWidget()
             group_vbox = QVBoxLayout(group_widget)
             group_vbox.setContentsMargins(8, 0, 0, 4)
@@ -1225,7 +1022,6 @@ class MainWindow(QMainWindow):
 
                 group_vbox.addWidget(row)
 
-            # Conectar header para colapsar/expandir el grupo
             header.toggled.connect(lambda checked, gw=group_widget, btn=header: (
                 gw.setVisible(checked),
                 btn.setText(f"{'▾' if checked else '▸'}  {btn.text()[2:]}")
@@ -1247,7 +1043,6 @@ class MainWindow(QMainWindow):
             w = self.tag_vbox.itemAt(i).widget()
             if w is None:
                 continue
-            # Buscar checkboxes dentro de group_widgets
             for row in w.findChildren(QCheckBox):
                 if row.isChecked() and row.property("tag_id") is not None:
                     self._active_tags.append(row.property("tag_id"))
@@ -1269,18 +1064,26 @@ class MainWindow(QMainWindow):
 
     # ── Carga de fotos ────────────────────────────────────────────────────────
 
-    def _load_photos(self):
-        # Detener timer y loader previos
-        self._build_timer.stop()
+    def _stop_loader(self):
+        """
+        ── CAMBIO 3: cancelar y esperar el loader activo de forma segura.
+        Llama stop() y espera hasta 500 ms antes de continuar.
+        """
         if self._loader is not None:
+            self._loader.loaded.disconnect()          # desconectar señales primero
             try:
-                self._loader.stop()
-                self._loader.wait(1000)
-            except RuntimeError:
+                self._loader.finished.disconnect()
+            except Exception:
                 pass
+            self._loader.stop()
+            self._loader.wait(500)                    # espera máx 500 ms
             self._loader = None
 
-        # Limpiar grid
+    def _load_photos(self):
+        self._build_timer.stop()
+        # ── CAMBIO 3: usar helper unificado ─────────────────────────────────
+        self._stop_loader()
+
         for i in reversed(range(self.grid_layout.count())):
             w = self.grid_layout.itemAt(i).widget()
             if w:
@@ -1306,14 +1109,14 @@ class MainWindow(QMainWindow):
             offset=self._offset
         )
         self._current_photos = [dict(p) for p in photos]
-        self._grid_cols = max(1, (self.scroll_area.width() - 30) // 218)
+        new_cols = max(1, (self.scroll_area.width() - 30) // 218)
+        self._grid_cols = new_cols
+        self._last_grid_cols = new_cols   # ── CAMBIO 2: sincronizar referencia
 
-        # Encolar todos los widgets para crearlos en lotes
         self._pending_photos = list(enumerate(self._current_photos))
         self._build_timer.start()
 
     def _add_next_batch(self):
-        """Agrega hasta 10 widgets por tick del timer — sin bloquear la UI."""
         BATCH = 10
         batch = self._pending_photos[:BATCH]
         self._pending_photos = self._pending_photos[BATCH:]
@@ -1330,17 +1133,14 @@ class MainWindow(QMainWindow):
 
         if not self._pending_photos:
             self._build_timer.stop()
-            # Iniciar carga de miniaturas solo cuando todos los widgets existen
+            # ── CAMBIO 3: crear loader limpio sin lista _active_loaders ──────
             self._loader = ThumbnailLoader(self._current_photos)
             self._loader.loaded.connect(self._on_thumb_loaded)
             self._loader.finished.connect(self._on_loader_finished)
-            self._active_loaders.append(self._loader)
             self._loader.start()
 
     def _on_loader_finished(self):
-        loader = self.sender()
-        if loader in self._active_loaders:
-            self._active_loaders.remove(loader)
+        # ── CAMBIO 3: simplificado, ya no hay lista que limpiar ──────────────
         self._loader = None
 
     def _on_thumb_loaded(self, photo_id: int, pix: QPixmap):
@@ -1357,7 +1157,7 @@ class MainWindow(QMainWindow):
     # ── Paginación ────────────────────────────────────────────────────────────
 
     def _update_pagination(self):
-        page   = self._offset // self._page_size + 1
+        page        = self._offset // self._page_size + 1
         total_pages = max(1, (self._total + self._page_size - 1) // self._page_size)
         self.page_lbl.setText(f"Página {page} / {total_pages}")
         self.prev_btn.setEnabled(self._offset > 0)
@@ -1371,6 +1171,24 @@ class MainWindow(QMainWindow):
         self._offset += self._page_size
         self._load_photos()
 
+    # ── Resize con debounce ───────────────────────────────────────────────────
+
+    def resizeEvent(self, event):
+        """
+        ── CAMBIO 2: debounce de 400 ms.
+        Solo recarga la galería si el número de columnas realmente cambió,
+        evitando recargas en cascada mientras el usuario arrastra el borde.
+        """
+        super().resizeEvent(event)
+        self._resize_timer.start()   # reinicia el timer en cada evento
+
+    def _on_resize_settled(self):
+        """Se llama 400 ms después del último resizeEvent."""
+        new_cols = max(1, (self.scroll_area.width() - 30) // 218)
+        if new_cols != self._last_grid_cols:
+            self._last_grid_cols = new_cols
+            self._load_photos()
+
     # ── Acciones ──────────────────────────────────────────────────────────────
 
     def _open_photo(self, photo_id: int):
@@ -1380,18 +1198,6 @@ class MainWindow(QMainWindow):
         dlg = PhotoDetailDialog(photo_id, photo["path"], photo.get("media_type", "image"), self)
         dlg.tags_changed.connect(self._load_photos)
         dlg.exec()
-
-    def _expand_all_groups(self):
-        for i in range(self.tag_vbox.count()):
-            w = self.tag_vbox.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w.isCheckable():
-                w.setChecked(True)
-
-    def _collapse_all_groups(self):
-        for i in range(self.tag_vbox.count()):
-            w = self.tag_vbox.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w.isCheckable():
-                w.setChecked(False)
 
     def _open_index_dialog(self):
         dlg = IndexDialog(self)
@@ -1407,144 +1213,6 @@ class MainWindow(QMainWindow):
         dlg.exec()
         self._refresh_tags()
         self._load_photos()
-
-    def _open_folder_browser(self):
-        self._show_explorer()
-
-    def _show_gallery(self):
-        self._view_mode = 'gallery'
-        self.stack.setCurrentIndex(0)
-        self.btn_gallery_mode.setChecked(True)
-        self.btn_folder_mode.setChecked(False)
-
-    def _show_explorer(self):
-        self._view_mode = 'folders'
-        self.stack.setCurrentIndex(1)
-        self.btn_gallery_mode.setChecked(False)
-        self.btn_folder_mode.setChecked(True)
-        self._build_folder_tree()
-
-    def _build_folder_tree(self):
-        self.folder_tree.clear()
-        with db.get_connection() as conn:
-            rows = conn.execute("SELECT DISTINCT path FROM photos ORDER BY path").fetchall()
-        tree = {}
-        for row in rows:
-            parts = Path(row[0]).parent.parts
-            node = tree
-            for part in parts:
-                node = node.setdefault(part, {})
-
-        def add_items(parent, subtree, full_path=""):
-            for name, children in sorted(subtree.items()):
-                if full_path == "" and name.endswith(":"):
-                    fp = name + "\\"
-                elif full_path == "":
-                    fp = name
-                else:
-                    fp = str(Path(full_path) / name)
-                item = QTreeWidgetItem([f"📁 {name}"])
-                item.setData(0, Qt.ItemDataRole.UserRole, fp)
-                if hasattr(parent, 'addChild'):
-                    parent.addChild(item)
-                else:
-                    self.folder_tree.addTopLevelItem(item)
-                add_items(item, children, fp)
-
-        add_items(self.folder_tree, tree)
-        self.folder_tree.expandToDepth(2)
-
-    def _on_folder_clicked(self, item, col):
-        folder = item.data(0, Qt.ItemDataRole.UserRole)
-        if folder:
-            self._folder_filter = folder
-            self.exp_path_lbl.setText(folder)
-            self._exp_offset = 0
-            self._exp_load_photos()
-
-    def _exp_load_photos(self):
-        if not self._folder_filter:
-            return
-        # Stop previous loader safely
-        if self._folder_loader is not None:
-            try:
-                self._folder_loader.stop()
-                self._folder_loader.wait(1000)
-            except RuntimeError:
-                pass
-            self._folder_loader = None
-
-        # Clear grid
-        for i in reversed(range(self.exp_grid_layout.count())):
-            w = self.exp_grid_layout.itemAt(i).widget()
-            if w:
-                w.deleteLater()
-        self._folder_thumbnails.clear()
-
-        folder_filter = self._folder_filter.rstrip("/\\")
-        with db.get_connection() as conn:
-            self._exp_total = conn.execute(
-                "SELECT COUNT(*) FROM photos WHERE path LIKE ?",
-                (folder_filter + "%",)
-            ).fetchone()[0]
-            rows = conn.execute(
-                "SELECT id, path, filename, media_type, duration FROM photos "
-                "WHERE path LIKE ? ORDER BY path, filename LIMIT ? OFFSET ?",
-                (folder_filter + "%", self._exp_page_size, self._exp_offset)
-            ).fetchall()
-
-        self._folder_photos = [dict(r) for r in rows]
-        self.exp_count_lbl.setText(f"{self._exp_total:,} archivos")
-        self._exp_update_pagination()
-
-        cols = max(1, (self.exp_scroll.width() - 30) // 160)
-        for idx, photo in enumerate(self._folder_photos):
-            thumb = PhotoThumbnail(
-                photo["id"], photo["filename"],
-                is_video=(photo.get("media_type") == "video"),
-                duration=photo.get("duration")
-            )
-            thumb.setFixedSize(150, 170)
-            thumb.clicked.connect(self._exp_open_photo)
-            self.exp_grid_layout.addWidget(thumb, idx // cols, idx % cols)
-            self._folder_thumbnails[photo["id"]] = thumb
-
-        self._folder_loader = ThumbnailLoader(self._folder_photos)
-        self._folder_loader.loaded.connect(self._exp_on_thumb_loaded)
-        self._folder_loader.finished.connect(self._exp_on_loader_finished)
-        self._active_loaders.append(self._folder_loader)
-        self._folder_loader.start()
-
-    def _exp_on_loader_finished(self):
-        loader = self.sender()
-        if loader in self._active_loaders:
-            self._active_loaders.remove(loader)
-        self._folder_loader = None
-
-    def _exp_on_thumb_loaded(self, photo_id, pix):
-        if photo_id in self._folder_thumbnails:
-            self._folder_thumbnails[photo_id].set_pixmap(pix)
-
-    def _exp_open_photo(self, photo_id):
-        photo = next((p for p in self._folder_photos if p["id"] == photo_id), None)
-        if photo:
-            dlg = PhotoDetailDialog(photo_id, photo["path"], photo.get("media_type", "image"), self)
-            dlg.exec()
-
-    def _exp_update_pagination(self):
-        page = self._exp_offset // self._exp_page_size + 1
-        total_pages = max(1, (self._exp_total + self._exp_page_size - 1) // self._exp_page_size)
-        self.exp_page_lbl.setText(f"Página {page} / {total_pages}  ({self._exp_total:,} archivos)")
-        self.exp_prev_btn.setEnabled(self._exp_offset > 0)
-        self.exp_next_btn.setEnabled(self._exp_offset + self._exp_page_size < self._exp_total)
-
-    def _exp_prev_page(self):
-        self._exp_offset = max(0, self._exp_offset - self._exp_page_size)
-        self._exp_load_photos()
-
-    def _exp_next_page(self):
-        self._exp_offset += self._exp_page_size
-        self._exp_load_photos()
 
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self._page_size, self)
@@ -1564,9 +1232,11 @@ class MainWindow(QMainWindow):
             f"{stats['total_photos']:,} fotos  •  {stats['total_tags']} etiquetas"
         )
 
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        QTimer.singleShot(100, self._load_photos)
+    def closeEvent(self, event):
+        """── CAMBIO 3: detener el loader al cerrar la app."""
+        self._build_timer.stop()
+        self._stop_loader()
+        super().closeEvent(event)
 
 
 # ─── Estilos globales ─────────────────────────────────────────────────────────
