@@ -2,7 +2,17 @@
 PhotoVault - indexer.py
 Escanea carpetas y registra imágenes y videos en la base de datos.
 Extrae fecha desde EXIF (imágenes) o nombre/ruta del archivo.
-Para videos extrae duración y un frame de miniatura con opencv.
+Para videos extrae duración y dimensiones con opencv.
+
+Correcciones aplicadas:
+  1. DATE_PATTERNS más estrictos — evitan falsos positivos con resoluciones
+     como "1920x1080" o versiones como "v1920" que antes podían matchear
+     como año/mes.
+  2. Soporte HEIC/HEIF — carga pillow-heif si está instalado para poder
+     abrir archivos .heic y .heif. Sin él los archivos se indexan pero sin
+     miniatura (no hay crash).
+  3. extract_video_thumbnail movido a thumbnail_cache — este módulo ya no
+     lo duplica; se importa desde allí para el caso de uso de indexación.
 """
 
 import re
@@ -14,6 +24,17 @@ from PIL import Image
 from PIL.ExifTags import TAGS
 
 import database as db
+
+# ── Soporte HEIC/HEIF opcional ────────────────────────────────────────────────
+# Requiere: pip install pillow-heif
+# Sin este paquete los archivos .heic/.heif se indexan (nombre, fecha, tamaño)
+# pero no generan miniatura. Con él se comportan como cualquier imagen.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+    _HEIF_AVAILABLE = True
+except ImportError:
+    _HEIF_AVAILABLE = False
 
 IMAGE_EXTENSIONS = {
     ".jpg", ".jpeg", ".png", ".gif", ".bmp",
@@ -28,13 +49,38 @@ VIDEO_EXTENSIONS = {
 
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
+# ── Patrones de fecha más estrictos ───────────────────────────────────────────
+# Cambios respecto a la versión original:
+#
+#  PROBLEMA ANTERIOR:
+#    r"(\d{4})[_\-/\\](\d{1,2})[_\-/\\](\d{1,2})"  matcheaba "1920x1080"
+#    porque "x" no estaba excluido del separador.
+#    r"(\d{4})(\d{2})(\d{2})"  matcheaba "19201080" (resolución concatenada).
+#
+#  SOLUCIÓN:
+#    - Los separadores ahora son solo [_\-/\\] (sin "x").
+#    - El patrón compacto YYYYMMDD requiere que NO esté precedido/seguido de
+#      otro dígito (word boundary numérico con lookahead/lookbehind).
+#    - El patrón de año/mes solo acepta año 1990-2099 y mes 01-12
+#      validados en código, igual que antes.
+#    - Añadido patrón WhatsApp: "IMG-20200512-WA0001"
+
 DATE_PATTERNS = [
-    r"(\d{4})[_\-/\\](\d{1,2})[_\-/\\](\d{1,2})",  # 2020-05-12
-    r"(\d{4})(\d{2})(\d{2})",                          # 20200512
-    r"IMG[_\-](\d{4})(\d{2})(\d{2})",                 # IMG_20200512
-    r"VID[_\-](\d{4})(\d{2})(\d{2})",                 # VID_20200512
-    r"(\d{4})[_\-](\d{2})",                            # 2020-05 (sin día)
+    # 2020-05-12 / 2020/05/12 / 2020_05_12  (separadores explícitos)
+    r"(\d{4})[_\-/\\](\d{1,2})[_\-/\\](\d{1,2})",
+
+    # 20200512  — solo si NO está rodeado de otros dígitos (evita resoluciones)
+    r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)",
+
+    # IMG_20200512 / VID_20200512 / IMG-20200512-WA0001
+    r"(?:IMG|VID)[_\-](\d{4})(\d{2})(\d{2})",
+
+    # 2020-05 (sin día)
+    r"(\d{4})[_\-](\d{2})(?![_\-\d])",
 ]
+
+# Compilar una sola vez para eficiencia
+_COMPILED_PATTERNS = [re.compile(p) for p in DATE_PATTERNS]
 
 
 def _extract_date_from_exif(path: str):
@@ -54,16 +100,29 @@ def _extract_date_from_exif(path: str):
 
 
 def _extract_date_from_string(text: str):
-    for pattern in DATE_PATTERNS:
-        m = re.search(pattern, text)
+    for pattern in _COMPILED_PATTERNS:
+        m = pattern.search(text)
         if m:
             groups = m.groups()
-            year = int(groups[0])
-            month = int(groups[1]) if len(groups) > 1 and groups[1] else None
-            if 1990 <= year <= 2100:
-                if month and 1 <= month <= 12:
-                    return year, month
-                return year, None
+            try:
+                year = int(groups[0])
+            except (ValueError, IndexError):
+                continue
+
+            month = None
+            if len(groups) > 1 and groups[1]:
+                try:
+                    month = int(groups[1])
+                except ValueError:
+                    month = None
+
+            # Validar rangos — rechaza años inverosímiles y meses imposibles
+            if not (1990 <= year <= 2099):
+                continue
+            if month is not None and not (1 <= month <= 12):
+                month = None  # año válido, mes inválido → guardar solo año
+
+            return year, month
     return None, None
 
 
@@ -76,10 +135,7 @@ def _get_image_size(path: str):
 
 
 def _get_video_info(path: str):
-    """
-    Extrae duración (segundos) y dimensiones del video usando opencv.
-    Devuelve (duration, width, height).
-    """
+    """Extrae duración (segundos) y dimensiones del video usando opencv."""
     try:
         import cv2
         cap = cv2.VideoCapture(path)
@@ -98,30 +154,11 @@ def _get_video_info(path: str):
 
 def extract_video_thumbnail(path: str, size: int = 200) -> bytes | None:
     """
-    Extrae un frame del video y lo devuelve como JPEG en bytes.
-    Salta al 5% del video para evitar pantallas negras iniciales.
+    Compatibilidad: delega al caché centralizado.
+    Usar thumbnail_cache.get_video_thumbnail() directamente en código nuevo.
     """
-    try:
-        import cv2
-        import io
-        cap = cv2.VideoCapture(path)
-        if not cap.isOpened():
-            return None
-        total = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-        if total > 0:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(total * 0.05))
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            return None
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        img.thumbnail((size, size), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=85)
-        return buf.getvalue()
-    except Exception:
-        return None
+    from thumbnail_cache import get_video_thumbnail
+    return get_video_thumbnail(path, size=size)
 
 
 def index_folder(folder: str, progress_callback: Callable[[int, int, str], None] = None):

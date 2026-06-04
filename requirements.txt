@@ -1,3 +1,13 @@
+# ── Dependencias requeridas ───────────────────────────────────────────────────
 PyQt6>=6.6.0
+PyQt6-Qt6>=6.6.0        # Incluye QSvgWidget (usado en StatsDialog)
 Pillow>=10.0.0
 opencv-python>=4.8.0
+
+# ── Dependencias opcionales ───────────────────────────────────────────────────
+# Descomenta la siguiente línea para habilitar soporte de archivos HEIC/HEIF
+# (fotos de iPhone y algunos dispositivos Android modernos).
+# Sin este paquete los archivos .heic/.heif se indexan correctamente
+# pero no generan miniatura.
+#
+# pillow-heif>=0.13.0
