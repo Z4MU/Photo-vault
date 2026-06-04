@@ -1,12 +1,42 @@
 """
 PhotoVault - models.py
 Dataclasses que representan las entidades del dominio.
-La UI y los servicios usan estos tipos en lugar de sqlite3.Row o dicts crudos.
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
+from enum import Enum
 
+
+# ── Ordenamiento ──────────────────────────────────────────────────────────────
+
+class SortField(Enum):
+    DATE      = "fecha"
+    FILENAME  = "nombre"
+    FILESIZE  = "tamaño"
+    ADDED_AT  = "agregado"
+
+class SortOrder(Enum):
+    ASC  = "asc"
+    DESC = "desc"
+
+# Mapa a SQL — usamos un allowlist fijo para evitar inyección
+_SORT_SQL: dict[tuple, str] = {
+    (SortField.DATE,     SortOrder.DESC): "p.year DESC, p.month DESC, p.filename",
+    (SortField.DATE,     SortOrder.ASC):  "p.year ASC,  p.month ASC,  p.filename",
+    (SortField.FILENAME, SortOrder.ASC):  "p.filename ASC",
+    (SortField.FILENAME, SortOrder.DESC): "p.filename DESC",
+    (SortField.FILESIZE, SortOrder.DESC): "p.filesize DESC",
+    (SortField.FILESIZE, SortOrder.ASC):  "p.filesize ASC",
+    (SortField.ADDED_AT, SortOrder.DESC): "p.added_at DESC",
+    (SortField.ADDED_AT, SortOrder.ASC):  "p.added_at ASC",
+}
+
+def sort_to_sql(field: SortField, order: SortOrder) -> str:
+    return _SORT_SQL.get((field, order), "p.year DESC, p.month DESC, p.filename")
+
+
+# ── Entidades ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Photo:
@@ -15,8 +45,8 @@ class Photo:
     filename:   str
     year:       Optional[int]
     month:      Optional[int]
-    media_type: str = "image"          # "image" | "video"
-    duration:   Optional[float] = None # segundos, solo para videos
+    media_type: str           = "image"
+    duration:   Optional[float] = None
     filesize:   Optional[int]   = None
     width:      Optional[int]   = None
     height:     Optional[int]   = None
@@ -28,7 +58,6 @@ class Photo:
 
     @property
     def duration_str(self) -> str:
-        """Devuelve la duración formateada como M:SS, o '' si no aplica."""
         if not self.duration:
             return ""
         mins = int(self.duration) // 60
@@ -36,8 +65,8 @@ class Photo:
         return f"{mins}:{secs:02d}"
 
     @property
-    def short_name(self, max_len: int = 22) -> str:
-        """Nombre truncado para mostrar en miniaturas."""
+    def short_name(self) -> str:
+        max_len = 22
         return self.filename[:max_len] + "…" if len(self.filename) > max_len else self.filename
 
 
@@ -47,17 +76,18 @@ class Tag:
     name:           str
     category:       str  = "general"
     color:          str  = "#4A9EFF"
-    hidden:         bool = False   # oculta las fotos que la tienen
-    sidebar_hidden: bool = False   # no aparece en el panel de filtros
+    hidden:         bool = False
+    sidebar_hidden: bool = False
 
 
 @dataclass
 class GalleryPage:
-    """Resultado de una consulta paginada a la galería."""
-    photos:  list[Photo]
-    total:   int
-    offset:  int
-    limit:   int
+    photos:     list[Photo]
+    total:      int
+    offset:     int
+    limit:      int
+    sort_field: SortField = SortField.DATE
+    sort_order: SortOrder = SortOrder.DESC
 
     @property
     def page_number(self) -> int:
@@ -78,6 +108,28 @@ class GalleryPage:
 
 @dataclass
 class Stats:
-    total_photos: int
-    total_tags:   int
-    years:        list[tuple[int, int]]  # [(year, count), ...]
+    total_photos:  int
+    total_tags:    int
+    years:         list[tuple[int, int]]   # [(year, count), ...]
+    by_month:      list[tuple[int, int, int]]  # [(year, month, count), ...]
+    by_type:       dict[str, int]          # {"image": N, "video": M}
+    top_tags:      list[tuple[str, int]]   # [(tag_name, count), ...]  top 10
+
+
+@dataclass
+class DuplicateGroup:
+    """Un grupo de fotos que comparten el mismo hash MD5."""
+    md5:    str
+    photos: list[Photo]
+
+    @property
+    def size(self) -> int:
+        return len(self.photos)
+
+    @property
+    def wasted_bytes(self) -> int:
+        """Espacio que se liberaría conservando solo una copia."""
+        if not self.photos:
+            return 0
+        sizes = [p.filesize or 0 for p in self.photos]
+        return sum(sizes) - max(sizes)

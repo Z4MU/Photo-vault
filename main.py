@@ -1,14 +1,13 @@
 """
 PhotoVault - main.py
-App de escritorio para gestionar y etiquetar fotos.
 
-Cambios de arquitectura aplicados:
-  - La UI importa `services` en lugar de `database` directamente.
-  - Se usan modelos tipados (Photo, Tag, GalleryPage) en lugar de dicts/Row.
-  - La lógica de "obtener fotos ocultas + filtrar + paginar" vive en services,
-    no en la ventana principal.
-  - ThumbnailLoader recibe Photo en lugar de dict.
-  - closeEvent cierra la conexión DB del hilo principal correctamente.
+Features nuevos en esta versión:
+  1. Purgar huérfanos del caché  → botón en SettingsDialog
+  2. Exportar/importar tags JSON → TagManagerDialog
+  3. Ordenamiento configurable   → ComboBox en barra superior
+  4. Estadísticas visuales       → StatsDialog con gráficos SVG
+  5. Etiquetado múltiple en lote → selección con Ctrl/Shift + BulkTagDialog
+  6. Vista de duplicados         → DuplicatesDialog con hash MD5
 """
 
 import sys
@@ -18,18 +17,18 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QLineEdit, QScrollArea, QGridLayout,
     QFileDialog, QDialog, QCheckBox, QFrame, QProgressBar,
-    QSizePolicy, QMessageBox, QComboBox, QColorDialog, QSplitter,
-    QGroupBox
+    QMessageBox, QComboBox, QColorDialog, QGroupBox, QSplitter,
+    QSizePolicy, QSpinBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from PyQt6.QtGui import QPixmap, QColor, QDesktopServices
-from PyQt6.QtCore import QUrl
+from PyQt6.QtSvgWidgets import QSvgWidget
 
 import database as db
 import services
 import indexer
 import thumbnail_cache
-from models import Photo, Tag, GalleryPage
+from models import Photo, Tag, GalleryPage, SortField, SortOrder, DuplicateGroup
 
 
 # ─── Hilo para indexación ─────────────────────────────────────────────────────
@@ -47,23 +46,23 @@ class IndexWorker(QThread):
         try:
             added, skipped, errors = indexer.index_folder(
                 self.folder,
-                progress_callback=lambda cur, total, path: self.progress.emit(cur, total, path)
+                progress_callback=lambda c, t, p: self.progress.emit(c, t, p),
             )
             self.finished.emit(added, skipped, errors)
         except Exception as e:
             self.error.emit(str(e))
         finally:
-            db.close_connection()   # liberar conexión del hilo worker
+            db.close_connection()
 
 
-# ─── Hilo para cargar miniaturas ─────────────────────────────────────────────
+# ─── Hilo para cargar miniaturas ──────────────────────────────────────────────
 
 class ThumbnailLoader(QThread):
     loaded = pyqtSignal(int, QPixmap)
 
     def __init__(self, photos: list[Photo]):
         super().__init__()
-        self.photos = photos
+        self.photos     = photos
         self._stop_flag = False
 
     def stop(self):
@@ -74,43 +73,58 @@ class ThumbnailLoader(QThread):
             if self._stop_flag:
                 break
             try:
-                if photo.is_video:
-                    jpeg_bytes = thumbnail_cache.get_video_thumbnail(photo.path)
-                else:
-                    jpeg_bytes = thumbnail_cache.get_thumbnail(photo.path)
-
-                if jpeg_bytes:
+                jpeg = (thumbnail_cache.get_video_thumbnail(photo.path)
+                        if photo.is_video
+                        else thumbnail_cache.get_thumbnail(photo.path))
+                if jpeg:
                     pix = QPixmap()
-                    pix.loadFromData(jpeg_bytes)
+                    pix.loadFromData(jpeg)
                     if not pix.isNull():
                         if pix.width() > 200 or pix.height() > 200:
-                            pix = pix.scaled(
-                                200, 200,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation,
-                            )
+                            pix = pix.scaled(200, 200,
+                                             Qt.AspectRatioMode.KeepAspectRatio,
+                                             Qt.TransformationMode.SmoothTransformation)
                         self.loaded.emit(photo.id, pix)
             except Exception:
                 pass
             if not self._stop_flag:
                 self.msleep(5)
-        db.close_connection()   # liberar conexión del hilo loader
+        db.close_connection()
+
+
+# ─── Hilo para calcular MD5s ──────────────────────────────────────────────────
+
+class MD5Worker(QThread):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(int)
+    error    = pyqtSignal(str)
+
+    def run(self):
+        try:
+            n = services.compute_missing_md5s(
+                progress_callback=lambda c, t: self.progress.emit(c, t)
+            )
+            self.finished.emit(n)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            db.close_connection()
 
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────
 
 class PhotoThumbnail(QFrame):
-    clicked = pyqtSignal(int)
+    clicked  = pyqtSignal(int)
+    selected = pyqtSignal(int, bool)   # photo_id, is_selected
 
-    def __init__(self, photo: Photo, parent=None):
+    def __init__(self, photo: Photo, selectable: bool = False, parent=None):
         super().__init__(parent)
-        self.photo_id = photo.id
+        self.photo_id   = photo.id
+        self.selectable = selectable
+        self._selected  = False
         self.setFixedSize(210, 230)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setStyleSheet("""
-            QFrame { background:#1E1E2E; border-radius:8px; border:1px solid #2D2D3F; }
-            QFrame:hover { border:1px solid #4A9EFF; background:#252538; }
-        """)
+        self._update_style()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
@@ -129,39 +143,76 @@ class PhotoThumbnail(QFrame):
         img_inner.addWidget(self.img_label)
 
         if photo.is_video:
-            play_overlay = QLabel("▶", img_container)
-            play_overlay.setStyleSheet("""
-                color:white; font-size:28px;
-                background:rgba(0,0,0,0.55);
-                border-radius:20px; padding:4px 8px;
-            """)
-            play_overlay.adjustSize()
-            play_overlay.move(
-                (200 - play_overlay.width()) // 2,
-                (200 - play_overlay.height()) // 2,
+            play = QLabel("▶", img_container)
+            play.setStyleSheet(
+                "color:white;font-size:28px;background:rgba(0,0,0,0.55);"
+                "border-radius:20px;padding:4px 8px;"
             )
+            play.adjustSize()
+            play.move((200 - play.width()) // 2, (200 - play.height()) // 2)
             if photo.duration_str:
-                dur_lbl = QLabel(photo.duration_str, img_container)
-                dur_lbl.setStyleSheet("""
-                    color:white; font-size:10px;
-                    background:rgba(0,0,0,0.7);
-                    border-radius:3px; padding:1px 5px;
-                """)
-                dur_lbl.adjustSize()
-                dur_lbl.move(200 - dur_lbl.width() - 6, 200 - dur_lbl.height() - 6)
+                dur = QLabel(photo.duration_str, img_container)
+                dur.setStyleSheet(
+                    "color:white;font-size:10px;background:rgba(0,0,0,0.7);"
+                    "border-radius:3px;padding:1px 5px;"
+                )
+                dur.adjustSize()
+                dur.move(200 - dur.width() - 6, 200 - dur.height() - 6)
+
+        # Checkbox de selección (visible solo en modo seleccionable)
+        if selectable:
+            self.chk = QCheckBox(img_container)
+            self.chk.setStyleSheet("""
+                QCheckBox::indicator { width:18px; height:18px; border-radius:4px; }
+                QCheckBox::indicator:unchecked {
+                    background:rgba(0,0,0,0.5); border:2px solid #888;
+                }
+                QCheckBox::indicator:checked {
+                    background:#4A9EFF; border:2px solid #4A9EFF;
+                }
+            """)
+            self.chk.move(6, 6)
+            self.chk.stateChanged.connect(
+                lambda s: self.selected.emit(self.photo_id, bool(s))
+            )
 
         layout.addWidget(img_container)
-
         name_label = QLabel(photo.short_name)
-        name_label.setStyleSheet("color:#8888AA; font-size:10px;")
+        name_label.setStyleSheet("color:#8888AA;font-size:10px;")
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(name_label)
+
+    def _update_style(self):
+        if self._selected:
+            self.setStyleSheet("""
+                QFrame { background:#1E2E4E; border-radius:8px;
+                         border:2px solid #4A9EFF; }
+            """)
+        else:
+            self.setStyleSheet("""
+                QFrame { background:#1E1E2E; border-radius:8px;
+                         border:1px solid #2D2D3F; }
+                QFrame:hover { border:1px solid #4A9EFF; background:#252538; }
+            """)
 
     def set_pixmap(self, pix: QPixmap):
         self.img_label.setPixmap(pix)
 
+    def set_selected(self, val: bool):
+        self._selected = val
+        self._update_style()
+        if self.selectable and hasattr(self, "chk"):
+            self.chk.blockSignals(True)
+            self.chk.setChecked(val)
+            self.chk.blockSignals(False)
+
     def mousePressEvent(self, event):
-        self.clicked.emit(self.photo_id)
+        if self.selectable:
+            new_state = not self._selected
+            self.set_selected(new_state)
+            self.selected.emit(self.photo_id, new_state)
+        else:
+            self.clicked.emit(self.photo_id)
 
 
 # ─── Dialog: Ver/editar foto ──────────────────────────────────────────────────
@@ -184,115 +235,409 @@ class PhotoDetailDialog(QDialog):
         layout.setSpacing(12)
 
         if self.photo.is_video:
-            left = QWidget()
-            left.setMinimumWidth(500)
-            left_layout = QVBoxLayout(left)
-            left_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-            thumb_bytes = thumbnail_cache.get_video_thumbnail(self.photo.path, size=480)
-            thumb_lbl = QLabel()
-            thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            if thumb_bytes:
-                pix = QPixmap()
-                pix.loadFromData(thumb_bytes)
-                thumb_lbl.setPixmap(pix)
+            left = QWidget(); left.setMinimumWidth(500)
+            ll   = QVBoxLayout(left)
+            ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb = thumbnail_cache.get_video_thumbnail(self.photo.path, size=480)
+            lbl   = QLabel(); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if thumb:
+                pix = QPixmap(); pix.loadFromData(thumb); lbl.setPixmap(pix)
             else:
-                thumb_lbl.setText("🎬")
-                thumb_lbl.setStyleSheet("font-size:64px;")
-            left_layout.addWidget(thumb_lbl)
-
-            btn_play = QPushButton("▶  Reproducir")
-            btn_play.setStyleSheet("""
-                QPushButton {
-                    background:#4A9EFF22; color:#4A9EFF;
-                    border:1px solid #4A9EFF; border-radius:8px;
-                    padding:10px 20px; font-size:14px;
-                }
-                QPushButton:hover { background:#4A9EFF44; }
-            """)
-            btn_play.clicked.connect(self._open_video)
-            left_layout.addWidget(btn_play)
+                lbl.setText("🎬"); lbl.setStyleSheet("font-size:64px;")
+            ll.addWidget(lbl)
+            btn = QPushButton("▶  Reproducir")
+            btn.setStyleSheet(
+                "QPushButton{background:#4A9EFF22;color:#4A9EFF;"
+                "border:1px solid #4A9EFF;border-radius:8px;padding:10px 20px;font-size:14px;}"
+                "QPushButton:hover{background:#4A9EFF44;}"
+            )
+            btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.photo.path)))
+            ll.addWidget(btn)
             layout.addWidget(left)
         else:
-            self.img_label = QLabel()
-            self.img_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.img_label.setMinimumWidth(500)
+            img = QLabel(); img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img.setMinimumWidth(500)
             pix = QPixmap(self.photo.path)
             if not pix.isNull():
                 pix = pix.scaled(560, 560, Qt.AspectRatioMode.KeepAspectRatio,
                                  Qt.TransformationMode.SmoothTransformation)
-                self.img_label.setPixmap(pix)
-            layout.addWidget(self.img_label)
+                img.setPixmap(pix)
+            layout.addWidget(img)
 
-        right = QVBoxLayout()
-        right.setSpacing(10)
+        right = QVBoxLayout(); right.setSpacing(10)
         right.addWidget(QLabel(f"<b>{Path(self.photo.path).name}</b>"))
-
         right.addWidget(QLabel("Etiquetas:"))
+
         self.tags_container = QWidget()
-        self.tags_layout = QHBoxLayout(self.tags_container)
+        self.tags_layout    = QHBoxLayout(self.tags_container)
         self.tags_layout.setContentsMargins(0, 0, 0, 0)
         self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        scroll = QScrollArea()
-        scroll.setWidget(self.tags_container)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(80)
+        scroll = QScrollArea(); scroll.setWidget(self.tags_container)
+        scroll.setWidgetResizable(True); scroll.setFixedHeight(80)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right.addWidget(scroll)
 
         right.addWidget(QLabel("Agregar etiqueta:"))
-        add_row = QHBoxLayout()
-        self.tag_combo = QComboBox()
-        self.tag_combo.setEditable(True)
+        row = QHBoxLayout()
+        self.tag_combo = QComboBox(); self.tag_combo.setEditable(True)
         self.tag_combo.setPlaceholderText("Buscar o nueva etiqueta…")
-        add_row.addWidget(self.tag_combo)
-        btn_add = QPushButton("＋ Agregar")
-        btn_add.clicked.connect(self._add_tag)
-        add_row.addWidget(btn_add)
-        right.addLayout(add_row)
+        row.addWidget(self.tag_combo)
+        btn_add = QPushButton("＋ Agregar"); btn_add.clicked.connect(self._add_tag)
+        row.addWidget(btn_add)
+        right.addLayout(row)
         right.addStretch()
         layout.addLayout(right)
-
-    def _open_video(self):
-        QDesktopServices.openUrl(QUrl.fromLocalFile(self.photo.path))
 
     def _load_tags(self):
         for i in reversed(range(self.tags_layout.count())):
             self.tags_layout.itemAt(i).widget().deleteLater()
-
         for tag in services.get_photo_tags(self.photo.id):
-            self.tags_layout.addWidget(self._make_chip(tag))
-
+            self.tags_layout.addWidget(self._chip(tag))
         self.tag_combo.clear()
         for t in services.get_all_tags():
             self.tag_combo.addItem(t.name, userData=t.id)
 
-    def _make_chip(self, tag: Tag) -> QPushButton:
+    def _chip(self, tag: Tag) -> QPushButton:
         btn = QPushButton(f"{tag.name}  ✕")
-        btn.setStyleSheet(f"""
-            QPushButton {{
-                background:{tag.color}33; color:{tag.color};
-                border:1px solid {tag.color}; border-radius:10px;
-                padding:2px 8px; font-size:11px;
-            }}
-            QPushButton:hover {{ background:{tag.color}66; }}
-        """)
+        btn.setStyleSheet(
+            f"QPushButton{{background:{tag.color}33;color:{tag.color};"
+            f"border:1px solid {tag.color};border-radius:10px;padding:2px 8px;font-size:11px;}}"
+            f"QPushButton:hover{{background:{tag.color}66;}}"
+        )
         btn.clicked.connect(lambda _, tid=tag.id: self._remove_tag(tid))
         return btn
 
     def _add_tag(self):
         text = self.tag_combo.currentText().strip().lower()
-        if not text:
-            return
-        services.add_tag(self.photo.id, text)
-        self._load_tags()
-        self.tags_changed.emit()
+        if text:
+            services.add_tag(self.photo.id, text)
+            self._load_tags(); self.tags_changed.emit()
 
     def _remove_tag(self, tag_id: int):
         services.remove_tag(self.photo.id, tag_id)
-        self._load_tags()
-        self.tags_changed.emit()
+        self._load_tags(); self.tags_changed.emit()
+
+
+# ─── Dialog: Etiquetado en lote ───────────────────────────────────────────────
+
+class BulkTagDialog(QDialog):
+    """Agrega o quita una etiqueta a todas las fotos seleccionadas."""
+
+    def __init__(self, photo_ids: list[int], parent=None):
+        super().__init__(parent)
+        self.photo_ids = photo_ids
+        self.setWindowTitle(f"Etiquetar {len(photo_ids)} fotos")
+        self.setFixedSize(420, 200)
+        self.setStyleSheet(DARK_STYLE)
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        layout.addWidget(QLabel(
+            f"<b>{len(self.photo_ids)} fotos seleccionadas</b><br>"
+            "<span style='color:#888;font-size:11px;'>"
+            "Escribe o elige una etiqueta y aplica a todas.</span>"
+        ))
+
+        self.combo = QComboBox(); self.combo.setEditable(True)
+        self.combo.setPlaceholderText("Etiqueta a aplicar…")
+        for t in services.get_all_tags():
+            self.combo.addItem(t.name, userData=t.id)
+        layout.addWidget(self.combo)
+
+        row = QHBoxLayout()
+        btn_add = QPushButton("＋ Agregar a todas")
+        btn_add.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
+        btn_add.clicked.connect(self._add)
+
+        btn_rem = QPushButton("✕ Quitar de todas")
+        btn_rem.setStyleSheet("background:#FF4A4A22;color:#FF4A4A;border:1px solid #FF4A4A;")
+        btn_rem.clicked.connect(self._remove)
+
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
+
+        row.addWidget(btn_add); row.addWidget(btn_rem); row.addWidget(btn_cancel)
+        layout.addLayout(row)
+
+    def _add(self):
+        name = self.combo.currentText().strip().lower()
+        if not name:
+            return
+        n = services.bulk_add_tag(self.photo_ids, name)
+        QMessageBox.information(self, "Listo", f"Etiqueta '{name}' agregada a {n} fotos.")
+        self.accept()
+
+    def _remove(self):
+        name = self.combo.currentText().strip().lower()
+        if not name:
+            return
+        all_tags = services.get_all_tags()
+        tag = next((t for t in all_tags if t.name == name), None)
+        if not tag:
+            QMessageBox.warning(self, "No encontrada",
+                                f"La etiqueta '{name}' no existe.")
+            return
+        n = services.bulk_remove_tag(self.photo_ids, tag.id)
+        QMessageBox.information(self, "Listo", f"Etiqueta '{name}' quitada de {n} fotos.")
+        self.accept()
+
+
+# ─── Dialog: Estadísticas ─────────────────────────────────────────────────────
+
+class StatsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Estadísticas")
+        self.setMinimumSize(700, 520)
+        self.setStyleSheet(DARK_STYLE)
+        self._build_ui()
+
+    def _build_ui(self):
+        stats  = services.get_stats()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # ── Resumen numérico ───────────────────────────────────────────────
+        summary = QHBoxLayout()
+        for label, value in [
+            ("Archivos totales", f"{stats.total_photos:,}"),
+            ("Imágenes", f"{stats.by_type.get('image', 0):,}"),
+            ("Videos", f"{stats.by_type.get('video', 0):,}"),
+            ("Etiquetas", f"{stats.total_tags:,}"),
+        ]:
+            card = QWidget()
+            card.setStyleSheet("background:#1E1E2E;border-radius:8px;padding:4px;")
+            cl = QVBoxLayout(card)
+            cl.setContentsMargins(16, 10, 16, 10)
+            v = QLabel(value); v.setStyleSheet("font-size:22px;font-weight:bold;color:#4A9EFF;")
+            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            l = QLabel(label); l.setStyleSheet("font-size:11px;color:#888;")
+            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cl.addWidget(v); cl.addWidget(l)
+            summary.addWidget(card)
+        layout.addLayout(summary)
+
+        # ── Gráfico de barras por año ──────────────────────────────────────
+        if stats.years:
+            layout.addWidget(QLabel("<b>Archivos por año</b>"))
+            layout.addWidget(self._bar_chart(stats.years, "#4A9EFF"))
+
+        # ── Top 10 etiquetas ──────────────────────────────────────────────
+        if stats.top_tags:
+            layout.addWidget(QLabel("<b>Etiquetas más usadas</b>"))
+            layout.addWidget(self._bar_chart(stats.top_tags, "#9E4AFF", is_text_key=True))
+
+        layout.addStretch()
+
+    def _bar_chart(self, data: list[tuple], color: str,
+                   is_text_key: bool = False) -> QWidget:
+        """Genera un widget SVG con un gráfico de barras horizontal."""
+        if not data:
+            return QLabel("Sin datos")
+
+        max_val  = max(v for _, v in data)
+        bar_h    = 22
+        gap      = 6
+        label_w  = 80
+        chart_w  = 460
+        height   = len(data) * (bar_h + gap) + 10
+        svg_w    = label_w + chart_w + 60
+
+        bars = []
+        for i, (key, val) in enumerate(data):
+            y    = 5 + i * (bar_h + gap)
+            fill = int(val / max_val * chart_w) if max_val else 0
+            key_str = str(key)[:12]
+            bars.append(
+                f'<text x="{label_w - 6}" y="{y + bar_h - 6}" '
+                f'text-anchor="end" fill="#8888AA" font-size="11">{key_str}</text>'
+                f'<rect x="{label_w}" y="{y}" width="{fill}" height="{bar_h}" '
+                f'rx="4" fill="{color}99"/>'
+                f'<text x="{label_w + fill + 6}" y="{y + bar_h - 6}" '
+                f'fill="#CCC" font-size="11">{val:,}</text>'
+            )
+
+        svg = (
+            f'<svg xmlns="http://www.w3.org/2000/svg" '
+            f'width="{svg_w}" height="{height}">'
+            f'<rect width="{svg_w}" height="{height}" fill="#13131F" rx="8"/>'
+            + "".join(bars) +
+            "</svg>"
+        )
+
+        widget = QSvgWidget()
+        widget.load(svg.encode())
+        widget.setFixedHeight(height + 10)
+        return widget
+
+
+# ─── Dialog: Duplicados ───────────────────────────────────────────────────────
+
+class DuplicatesDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Vista de duplicados")
+        self.setMinimumSize(700, 540)
+        self.setStyleSheet(DARK_STYLE)
+        self._groups: list[DuplicateGroup] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        layout.addWidget(QLabel(
+            "<b>Duplicados por hash MD5</b><br>"
+            "<span style='color:#888;font-size:11px;'>"
+            "Los archivos con el mismo contenido aparecen agrupados. "
+            "Puedes eliminar físicamente las copias extra.</span>"
+        ))
+
+        # Barra de cálculo de MD5
+        md5_bar = QHBoxLayout()
+        self.md5_progress = QProgressBar(); self.md5_progress.setRange(0, 100)
+        self.md5_progress.setVisible(False)
+        self.btn_scan = QPushButton("🔍  Escanear duplicados")
+        self.btn_scan.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
+        self.btn_scan.clicked.connect(self._start_scan)
+        md5_bar.addWidget(self.btn_scan)
+        md5_bar.addWidget(self.md5_progress, stretch=1)
+        layout.addLayout(md5_bar)
+
+        self.status_lbl = QLabel("Presiona 'Escanear' para calcular los MD5s.")
+        self.status_lbl.setStyleSheet("color:#8888AA;font-size:11px;")
+        layout.addWidget(self.status_lbl)
+
+        # Lista de grupos
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget()
+        self.vbox = QVBoxLayout(self.container)
+        self.vbox.setSpacing(8)
+        self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll, stretch=1)
+
+        btn_close = QPushButton("Cerrar"); btn_close.clicked.connect(self.accept)
+        layout.addWidget(btn_close)
+
+    def _start_scan(self):
+        self.btn_scan.setEnabled(False)
+        self.md5_progress.setVisible(True)
+        self.md5_progress.setValue(0)
+        self.status_lbl.setText("Calculando hashes…")
+        self._worker = MD5Worker()
+        self._worker.progress.connect(
+            lambda c, t: self.md5_progress.setValue(int(c / t * 100) if t else 0)
+        )
+        self._worker.finished.connect(self._on_scan_done)
+        self._worker.error.connect(lambda e: (
+            QMessageBox.critical(self, "Error", e),
+            self.btn_scan.setEnabled(True),
+        ))
+        self._worker.start()
+
+    def _on_scan_done(self, n: int):
+        self.md5_progress.setVisible(False)
+        self.btn_scan.setEnabled(True)
+        self._groups = services.get_duplicate_groups()
+        self._render_groups()
+
+    def _render_groups(self):
+        for i in reversed(range(self.vbox.count())):
+            w = self.vbox.itemAt(i).widget()
+            if w: w.deleteLater()
+
+        if not self._groups:
+            self.status_lbl.setText("✓ No se encontraron duplicados.")
+            self.vbox.addWidget(QLabel("No hay duplicados."))
+            return
+
+        total_wasted = sum(g.wasted_bytes for g in self._groups)
+        self.status_lbl.setText(
+            f"{len(self._groups)} grupos de duplicados  •  "
+            f"{total_wasted / 1_048_576:.1f} MB recuperables"
+        )
+
+        for group in self._groups:
+            card = QWidget()
+            card.setStyleSheet("background:#1A1A2E;border-radius:8px;")
+            cl = QVBoxLayout(card); cl.setContentsMargins(10, 8, 10, 8); cl.setSpacing(6)
+
+            header_lbl = QLabel(
+                f"<b>{group.size} copias</b>  "
+                f"<span style='color:#888;font-size:11px;'>"
+                f"MD5: {group.md5[:16]}…  •  "
+                f"+{group.wasted_bytes // 1024} KB duplicados</span>"
+            )
+            header_lbl.setTextFormat(Qt.TextFormat.RichText)
+            cl.addWidget(header_lbl)
+
+            photos_row = QHBoxLayout()
+            for photo in group.photos:
+                col = QVBoxLayout()
+                # Miniatura pequeña
+                img_lbl = QLabel()
+                img_lbl.setFixedSize(100, 100)
+                img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                img_lbl.setStyleSheet("background:#13131F;border-radius:4px;")
+                jpeg = thumbnail_cache.get_thumbnail(photo.path, size=100)
+                if jpeg:
+                    pix = QPixmap(); pix.loadFromData(jpeg)
+                    img_lbl.setPixmap(pix.scaled(100, 100,
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation))
+                col.addWidget(img_lbl)
+
+                name = QLabel(photo.short_name)
+                name.setStyleSheet("font-size:10px;color:#8888AA;")
+                name.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                col.addWidget(name)
+
+                size_lbl = QLabel(f"{(photo.filesize or 0) // 1024} KB")
+                size_lbl.setStyleSheet("font-size:10px;color:#666;")
+                size_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                col.addWidget(size_lbl)
+
+                btn_del = QPushButton("🗑 Eliminar")
+                btn_del.setFixedWidth(90)
+                btn_del.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;font-size:11px;")
+                btn_del.clicked.connect(
+                    lambda _, pid=photo.id, g=group: self._delete_photo(pid, g)
+                )
+                col.addWidget(btn_del)
+                photos_row.addLayout(col)
+
+            photos_row.addStretch()
+            cl.addLayout(photos_row)
+            self.vbox.addWidget(card)
+
+        self.vbox.addStretch()
+
+    def _delete_photo(self, photo_id: int, group: DuplicateGroup):
+        if group.size <= 1:
+            QMessageBox.warning(self, "Atención",
+                "No puedes eliminar la última copia del archivo.")
+            return
+        reply = QMessageBox.question(
+            self, "Confirmar eliminación",
+            "¿Eliminar este archivo del disco y de la base de datos?\n"
+            "Esta acción no se puede deshacer.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        ok = services.delete_photo_file(photo_id)
+        if ok:
+            group.photos = [p for p in group.photos if p.id != photo_id]
+            self._render_groups()
+        else:
+            QMessageBox.critical(self, "Error", "No se pudo eliminar el archivo.")
 
 
 # ─── Dialog: Configuración ────────────────────────────────────────────────────
@@ -300,59 +645,63 @@ class PhotoDetailDialog(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, current_page_size: int, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Configuración de visualización")
-        self.setFixedSize(420, 260)
+        self.setWindowTitle("Configuración")
+        self.setFixedSize(440, 320)
         self.setStyleSheet(DARK_STYLE)
         self.page_size = current_page_size
         self._build_ui()
 
     def _build_ui(self):
-        from PyQt6.QtWidgets import QSpinBox
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(16)
-
+        layout.setSpacing(14)
         layout.addWidget(QLabel("<b>Configuración de visualización</b>"))
 
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("Fotos por página:"))
-        self.spin_page = QSpinBox()
-        self.spin_page.setRange(10, 500)
-        self.spin_page.setSingleStep(10)
-        self.spin_page.setValue(self.page_size)
-        self.spin_page.setFixedWidth(80)
-        row1.addWidget(self.spin_page)
-        row1.addStretch()
-        layout.addLayout(row1)
+        r1 = QHBoxLayout()
+        r1.addWidget(QLabel("Fotos por página:"))
+        self.spin = QSpinBox()
+        self.spin.setRange(10, 500); self.spin.setSingleStep(10)
+        self.spin.setValue(self.page_size); self.spin.setFixedWidth(80)
+        r1.addWidget(self.spin); r1.addStretch()
+        layout.addLayout(r1)
 
-        info = QLabel("💡 Menos fotos por página = carga más rápida.\nRecomendado: 50-100 para colecciones grandes.")
-        info.setStyleSheet("color:#666; font-size:11px;")
+        info = QLabel("💡 Recomendado: 50-100 para colecciones grandes.")
+        info.setStyleSheet("color:#666;font-size:11px;")
         layout.addWidget(info)
 
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep)
+
+        layout.addWidget(QLabel("<b>Caché de miniaturas</b>"))
         self.cache_lbl = QLabel()
         self._refresh_cache_label()
-        self.cache_lbl.setStyleSheet("color:#8888AA; font-size:11px;")
+        self.cache_lbl.setStyleSheet("color:#8888AA;font-size:11px;")
         layout.addWidget(self.cache_lbl)
 
-        btn_clear_cache = QPushButton("🗑  Limpiar caché de miniaturas")
-        btn_clear_cache.setStyleSheet("color:#FFD700; border:1px solid #FFD700;")
-        btn_clear_cache.clicked.connect(self._clear_cache)
-        layout.addWidget(btn_clear_cache)
+        cache_row = QHBoxLayout()
+        btn_clear = QPushButton("🗑  Limpiar caché")
+        btn_clear.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
+        btn_clear.clicked.connect(self._clear_cache)
+
+        btn_purge = QPushButton("🧹  Purgar huérfanos")
+        btn_purge.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
+        btn_purge.setToolTip("Elimina miniaturas de archivos que ya no están indexados")
+        btn_purge.clicked.connect(self._purge_orphans)
+
+        cache_row.addWidget(btn_clear); cache_row.addWidget(btn_purge)
+        layout.addLayout(cache_row)
 
         layout.addStretch()
         btn_row = QHBoxLayout()
-        btn_cancel = QPushButton("Cancelar")
-        btn_cancel.clicked.connect(self.reject)
+        btn_cancel = QPushButton("Cancelar"); btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton("Aplicar")
-        btn_ok.setStyleSheet("background:#4A9EFF22; color:#4A9EFF; border:1px solid #4A9EFF;")
+        btn_ok.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
         btn_ok.clicked.connect(self._apply)
-        btn_row.addWidget(btn_cancel)
-        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel); btn_row.addWidget(btn_ok)
         layout.addLayout(btn_row)
 
     def _refresh_cache_label(self):
-        mb = thumbnail_cache.cache_size_mb()
-        self.cache_lbl.setText(f"Caché de miniaturas: {mb} MB")
+        self.cache_lbl.setText(f"Tamaño del caché: {thumbnail_cache.cache_size_mb()} MB")
 
     def _clear_cache(self):
         import shutil
@@ -360,10 +709,16 @@ class SettingsDialog(QDialog):
             shutil.rmtree(thumbnail_cache.CACHE_DIR)
         self._refresh_cache_label()
         QMessageBox.information(self, "Caché limpiado",
-            "El caché de miniaturas fue eliminado.\nSe regenerará al navegar la galería.")
+            "El caché fue eliminado. Se regenerará al navegar la galería.")
+
+    def _purge_orphans(self):
+        n = services.purge_cache_orphans()
+        self._refresh_cache_label()
+        QMessageBox.information(self, "Purga completada",
+            f"Se eliminaron {n} miniaturas huérfanas del caché.")
 
     def _apply(self):
-        self.page_size = self.spin_page.value()
+        self.page_size = self.spin.value()
         self.accept()
 
 
@@ -373,124 +728,69 @@ class CategoryManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Gestionar categorías")
-        self.setMinimumSize(480, 500)
-        self.setStyleSheet(DARK_STYLE)
-        self._build_ui()
-        self._refresh()
+        self.setMinimumSize(480, 500); self.setStyleSheet(DARK_STYLE)
+        self._build_ui(); self._refresh()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 12, 12, 12); layout.setSpacing(10)
         layout.addWidget(QLabel("<b>Gestionar categorías de etiquetas</b>"))
-
-        box = QGroupBox("Nueva categoría")
-        form = QHBoxLayout(box)
+        box = QGroupBox("Nueva categoría"); form = QHBoxLayout(box)
         self.new_cat_edit = QLineEdit()
-        self.new_cat_edit.setPlaceholderText("Nombre de la nueva categoría…")
-        btn_create = QPushButton("＋ Crear")
-        btn_create.clicked.connect(self._create_category)
-        form.addWidget(self.new_cat_edit)
-        form.addWidget(btn_create)
+        self.new_cat_edit.setPlaceholderText("Nombre…")
+        btn = QPushButton("＋ Crear"); btn.clicked.connect(self._create)
+        form.addWidget(self.new_cat_edit); form.addWidget(btn)
         layout.addWidget(box)
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.container = QWidget()
-        self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(6)
-        self.scroll.setWidget(self.container)
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
+        self.vbox.setSpacing(6); self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, stretch=1)
-
-        info = QLabel("💡 Al eliminar una categoría, sus etiquetas se mueven a 'general'.")
-        info.setStyleSheet("color:#666; font-size:10px;")
-        layout.addWidget(info)
+        info = QLabel("💡 Al eliminar una categoría sus etiquetas se mueven a 'general'.")
+        info.setStyleSheet("color:#666;font-size:10px;"); layout.addWidget(info)
 
     def _refresh(self):
         for i in reversed(range(self.vbox.count())):
             w = self.vbox.itemAt(i).widget()
             if w: w.deleteLater()
-
         for cat in services.get_all_categories():
             tags  = services.get_tags_by_category(cat)
             count = len(tags)
-
-            row = QWidget()
-            row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
-            hl = QHBoxLayout(row)
-            hl.setContentsMargins(8, 6, 8, 6)
-            hl.setSpacing(6)
-
-            name_edit = QLineEdit(cat)
-            name_edit.setStyleSheet(
-                "background:#13131F; border:1px solid #3A3A5A; border-radius:4px; padding:3px 6px;"
-            )
-            name_edit.setFixedWidth(140)
-            hl.addWidget(name_edit)
-
-            count_lbl = QLabel(f"{count} etiqueta{'s' if count != 1 else ''}")
-            count_lbl.setStyleSheet("color:#666; font-size:11px;")
-            hl.addWidget(count_lbl, stretch=1)
-
-            preview = QWidget()
-            ph = QHBoxLayout(preview)
-            ph.setContentsMargins(0, 0, 0, 0)
-            ph.setSpacing(2)
-            for tag in tags[:6]:
-                dot = QLabel("●")
-                dot.setStyleSheet(f"color:{tag.color}; font-size:10px;")
-                ph.addWidget(dot)
-            if count > 6:
-                ph.addWidget(QLabel(f"+{count-6}"))
-            hl.addWidget(preview)
-
-            btn_rename = QPushButton("✎")
-            btn_rename.setFixedSize(28, 28)
-            btn_rename.setToolTip("Renombrar categoría")
-            btn_rename.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF; border-radius:4px;")
-            btn_rename.clicked.connect(
-                lambda _, old=cat, edit=name_edit: self._rename(old, edit.text())
-            )
-            hl.addWidget(btn_rename)
-
-            btn_del = QPushButton("✕")
-            btn_del.setFixedSize(28, 28)
-            btn_del.setToolTip("Eliminar categoría (mueve etiquetas a general)")
-            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A; border-radius:4px;")
-            btn_del.clicked.connect(lambda _, c=cat: self._delete(c))
-            hl.addWidget(btn_del)
-
+            row   = QWidget()
+            row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
+            hl = QHBoxLayout(row); hl.setContentsMargins(8,6,8,6); hl.setSpacing(6)
+            edit = QLineEdit(cat)
+            edit.setStyleSheet("background:#13131F;border:1px solid #3A3A5A;border-radius:4px;padding:3px 6px;")
+            edit.setFixedWidth(140); hl.addWidget(edit)
+            hl.addWidget(QLabel(f"{count} etiq."), stretch=1)
+            btn_r = QPushButton("✎"); btn_r.setFixedSize(28,28)
+            btn_r.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;border-radius:4px;")
+            btn_r.clicked.connect(lambda _, o=cat, e=edit: (
+                services.rename_category(o, e.text()), self._refresh()
+            ))
+            hl.addWidget(btn_r)
+            btn_d = QPushButton("✕"); btn_d.setFixedSize(28,28)
+            btn_d.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;border-radius:4px;")
+            btn_d.clicked.connect(lambda _, c=cat: self._delete(c))
+            hl.addWidget(btn_d)
             self.vbox.addWidget(row)
-
         self.vbox.addStretch()
 
-    def _create_category(self):
+    def _create(self):
         name = self.new_cat_edit.text().strip().lower()
-        if not name:
-            return
+        if not name: return
         if services.create_category(name):
-            self.new_cat_edit.clear()
-            self._refresh()
+            self.new_cat_edit.clear(); self._refresh()
         else:
             QMessageBox.information(self, "Ya existe", f'La categoría "{name}" ya existe.')
-
-    def _rename(self, old_name: str, new_name: str):
-        new_name = new_name.strip().lower()
-        if not new_name or new_name == old_name:
-            return
-        services.rename_category(old_name, new_name)
-        self._refresh()
 
     def _delete(self, cat_name: str):
         tags = services.get_tags_by_category(cat_name)
         msg  = f'¿Eliminar la categoría "{cat_name}"?'
-        if tags:
-            msg += f"\n\nSus {len(tags)} etiqueta(s) se moverán a 'general'."
-        reply = QMessageBox.question(self, "Confirmar", msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        if reply == QMessageBox.StandardButton.Yes:
-            services.delete_category(cat_name)
-            self._refresh()
+        if tags: msg += f"\n\nSus {len(tags)} etiqueta(s) se moverán a 'general'."
+        if QMessageBox.question(self, "Confirmar", msg,
+           QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            services.delete_category(cat_name); self._refresh()
 
 
 # ─── Dialog: Gestionar etiquetas ─────────────────────────────────────────────
@@ -499,114 +799,114 @@ class TagManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Gestionar etiquetas")
-        self.setMinimumSize(500, 500)
-        self.setStyleSheet(DARK_STYLE)
-        self._build_ui()
-        self._refresh()
+        self.setMinimumSize(520, 560); self.setStyleSheet(DARK_STYLE)
+        self._build_ui(); self._refresh()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout = QVBoxLayout(self); layout.setContentsMargins(12,12,12,12); layout.setSpacing(8)
 
-        box = QGroupBox("Nueva etiqueta")
-        form = QHBoxLayout(box)
+        box  = QGroupBox("Nueva etiqueta"); form = QHBoxLayout(box)
         self.new_name  = QLineEdit(); self.new_name.setPlaceholderText("Nombre")
         self.new_cat   = QComboBox(); self.new_cat.setEditable(True)
-        self.new_cat.setPlaceholderText("Categoría")
         self.new_cat.addItems(services.get_all_categories())
         self.new_color = QPushButton("Color"); self.new_color.setFixedWidth(60)
-        self._color_val = "#4A9EFF"
-        self.new_color.setStyleSheet(f"background:{self._color_val};")
+        self._color    = "#4A9EFF"
+        self.new_color.setStyleSheet(f"background:{self._color};")
         self.new_color.clicked.connect(self._pick_color)
-        btn_create = QPushButton("Crear")
-        btn_create.clicked.connect(self._create)
-        for w in [self.new_name, self.new_cat, self.new_color, btn_create]:
+        btn_cr = QPushButton("Crear"); btn_cr.clicked.connect(self._create)
+        for w in [self.new_name, self.new_cat, self.new_color, btn_cr]:
             form.addWidget(w)
         layout.addWidget(box)
 
+        btns_row = QHBoxLayout()
         btn_cats = QPushButton("📂  Gestionar categorías")
-        btn_cats.setStyleSheet("color:#4A9EFF; border:1px solid #4A9EFF;")
-        btn_cats.clicked.connect(self._open_category_manager)
-        layout.addWidget(btn_cats)
+        btn_cats.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;")
+        btn_cats.clicked.connect(self._open_cats)
+        btns_row.addWidget(btn_cats)
 
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.container = QWidget()
-        self.grid = QVBoxLayout(self.container)
-        self.grid.setSpacing(4)
-        self.scroll.setWidget(self.container)
+        # ── FEATURE: exportar/importar JSON ──────────────────────────────
+        btn_exp = QPushButton("⬆  Exportar JSON")
+        btn_exp.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
+        btn_exp.clicked.connect(self._export)
+        btns_row.addWidget(btn_exp)
+
+        btn_imp = QPushButton("⬇  Importar JSON")
+        btn_imp.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
+        btn_imp.clicked.connect(self._import)
+        btns_row.addWidget(btn_imp)
+        layout.addLayout(btns_row)
+
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget(); self.grid = QVBoxLayout(self.container)
+        self.grid.setSpacing(4); self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll)
 
     def _pick_color(self):
-        c = QColorDialog.getColor(QColor(self._color_val), self)
+        c = QColorDialog.getColor(QColor(self._color), self)
         if c.isValid():
-            self._color_val = c.name()
-            self.new_color.setStyleSheet(f"background:{self._color_val};")
+            self._color = c.name()
+            self.new_color.setStyleSheet(f"background:{self._color};")
 
     def _create(self):
         name = self.new_name.text().strip()
-        if not name:
-            return
+        if not name: return
         cat = self.new_cat.currentText().strip().lower() or "general"
-        services.create_tag(name, cat, self._color_val)
+        services.create_tag(name, cat, self._color)
         self.new_name.clear()
-        self.new_cat.clear()
-        self.new_cat.addItems(services.get_all_categories())
+        self.new_cat.clear(); self.new_cat.addItems(services.get_all_categories())
         self._refresh()
 
     def _refresh(self):
         for i in reversed(range(self.grid.count())):
             w = self.grid.itemAt(i).widget()
             if w: w.deleteLater()
-
         for tag in services.get_all_tags():
-            row = QWidget()
-            hl  = QHBoxLayout(row)
-            hl.setContentsMargins(4, 2, 4, 2)
-
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color:{tag.color}; font-size:16px;")
+            row = QWidget(); hl = QHBoxLayout(row); hl.setContentsMargins(4,2,4,2)
+            dot = QLabel("●"); dot.setStyleSheet(f"color:{tag.color};font-size:16px;")
             hl.addWidget(dot)
-
             lbl = QLabel(f"<b>{tag.name}</b>  <span style='color:#666;'>[{tag.category}]</span>")
-            lbl.setTextFormat(Qt.TextFormat.RichText)
-            hl.addWidget(lbl, stretch=1)
-
-            chk_hide = QCheckBox("Ocultar fotos")
-            chk_hide.setChecked(tag.hidden)
-            chk_hide.setToolTip("Las fotos con esta etiqueta no aparecen en la galería")
-            chk_hide.stateChanged.connect(
-                lambda state, tid=tag.id: services.set_tag_hidden(tid, bool(state))
-            )
-            hl.addWidget(chk_hide)
-
-            chk_sidebar = QCheckBox("Ocultar del sidebar")
-            chk_sidebar.setChecked(tag.sidebar_hidden)
-            chk_sidebar.setToolTip("La etiqueta no aparece en el panel de filtros")
-            chk_sidebar.stateChanged.connect(
-                lambda state, tid=tag.id: services.set_tag_sidebar_hidden(tid, bool(state))
-            )
-            hl.addWidget(chk_sidebar)
-
-            btn_del = QPushButton("Eliminar")
-            btn_del.setFixedWidth(70)
-            btn_del.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A;")
-            btn_del.clicked.connect(lambda _, tid=tag.id: self._delete(tid))
-            hl.addWidget(btn_del)
-
-            row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
+            lbl.setTextFormat(Qt.TextFormat.RichText); hl.addWidget(lbl, stretch=1)
+            chk1 = QCheckBox("Ocultar fotos"); chk1.setChecked(tag.hidden)
+            chk1.stateChanged.connect(lambda s, tid=tag.id: services.set_tag_hidden(tid, bool(s)))
+            hl.addWidget(chk1)
+            chk2 = QCheckBox("Ocultar sidebar"); chk2.setChecked(tag.sidebar_hidden)
+            chk2.stateChanged.connect(lambda s, tid=tag.id: services.set_tag_sidebar_hidden(tid, bool(s)))
+            hl.addWidget(chk2)
+            btn_d = QPushButton("Eliminar"); btn_d.setFixedWidth(70)
+            btn_d.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
+            btn_d.clicked.connect(lambda _, tid=tag.id: (services.delete_tag(tid), self._refresh()))
+            hl.addWidget(btn_d)
+            row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
             self.grid.addWidget(row)
-
         self.grid.addStretch()
 
-    def _delete(self, tag_id: int):
-        services.delete_tag(tag_id)
-        self._refresh()
+    def _open_cats(self):
+        CategoryManagerDialog(self).exec(); self._refresh()
 
-    def _open_category_manager(self):
-        dlg = CategoryManagerDialog(self)
-        dlg.exec()
-        self._refresh()
+    def _export(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exportar etiquetas", "photovault_tags.json",
+            "JSON (*.json)"
+        )
+        if not path: return
+        try:
+            n = services.export_tags(path)
+            QMessageBox.information(self, "Exportado", f"Se exportaron {n} etiquetas a:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _import(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Importar etiquetas", "", "JSON (*.json)"
+        )
+        if not path: return
+        try:
+            created, skipped = services.import_tags(path)
+            QMessageBox.information(self, "Importado",
+                f"Etiquetas creadas: {created}\nYa existían (omitidas): {skipped}")
+            self._refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Error al importar", str(e))
 
 
 # ─── Dialog: Indexar carpeta ──────────────────────────────────────────────────
@@ -617,66 +917,44 @@ class IndexDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Indexar carpeta")
-        self.setFixedSize(500, 200)
-        self.setStyleSheet(DARK_STYLE)
-        self.worker = None
-        self._build_ui()
+        self.setFixedSize(500, 200); self.setStyleSheet(DARK_STYLE)
+        self.worker = None; self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
+        layout = QVBoxLayout(self); layout.setContentsMargins(16,16,16,16); layout.setSpacing(10)
         row = QHBoxLayout()
-        self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("Ruta de la carpeta…")
-        btn_browse = QPushButton("Examinar")
-        btn_browse.clicked.connect(self._browse)
-        row.addWidget(self.path_edit)
-        row.addWidget(btn_browse)
-        layout.addLayout(row)
-
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        layout.addWidget(self.progress)
-
-        self.status_lbl = QLabel("Listo para indexar.")
-        self.status_lbl.setStyleSheet("color:#8888AA; font-size:10px;")
-        layout.addWidget(self.status_lbl)
-
+        self.path_edit = QLineEdit(); self.path_edit.setPlaceholderText("Ruta de la carpeta…")
+        btn_b = QPushButton("Examinar"); btn_b.clicked.connect(self._browse)
+        row.addWidget(self.path_edit); row.addWidget(btn_b); layout.addLayout(row)
+        self.progress = QProgressBar(); self.progress.setRange(0,100); layout.addWidget(self.progress)
+        self.status = QLabel("Listo para indexar.")
+        self.status.setStyleSheet("color:#8888AA;font-size:10px;"); layout.addWidget(self.status)
         self.btn_start = QPushButton("▶  Iniciar indexación")
-        self.btn_start.clicked.connect(self._start)
-        layout.addWidget(self.btn_start)
+        self.btn_start.clicked.connect(self._start); layout.addWidget(self.btn_start)
 
     def _browse(self):
-        folder = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta")
-        if folder:
-            self.path_edit.setText(folder)
+        f = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta")
+        if f: self.path_edit.setText(f)
 
     def _start(self):
         folder = self.path_edit.text().strip()
         if not folder or not Path(folder).exists():
-            QMessageBox.warning(self, "Error", "Selecciona una carpeta válida.")
-            return
+            QMessageBox.warning(self, "Error", "Selecciona una carpeta válida."); return
         self.btn_start.setEnabled(False)
         self.worker = IndexWorker(folder)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.error.connect(self._on_error)
+        self.worker.progress.connect(lambda c,t,p: (
+            self.progress.setValue(int(c/t*100)),
+            self.status.setText(f"[{c}/{t}] {Path(p).name}")
+        ))
+        self.worker.finished.connect(lambda a,s,e: (
+            self.status.setText(f"✓ Listo: {a} indexadas, {e} errores."),
+            self.btn_start.setEnabled(True),
+            self.indexing_done.emit()
+        ))
+        self.worker.error.connect(lambda m: (
+            QMessageBox.critical(self,"Error",m), self.btn_start.setEnabled(True)
+        ))
         self.worker.start()
-
-    def _on_progress(self, cur, total, path):
-        self.progress.setValue(int(cur / total * 100))
-        self.status_lbl.setText(f"[{cur}/{total}] {Path(path).name}")
-
-    def _on_finished(self, added, skipped, errors):
-        self.status_lbl.setText(f"✓ Listo: {added} indexadas, {errors} errores.")
-        self.btn_start.setEnabled(True)
-        self.indexing_done.emit()
-
-    def _on_error(self, msg):
-        QMessageBox.critical(self, "Error", msg)
-        self.btn_start.setEnabled(True)
 
 
 # ─── Dialog: Des-indexar carpetas ─────────────────────────────────────────────
@@ -685,92 +963,56 @@ class DeindexDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Des-indexar carpetas")
-        self.setMinimumSize(560, 420)
-        self.setStyleSheet(DARK_STYLE)
-        self._build_ui()
-        self._refresh()
+        self.setMinimumSize(560, 420); self.setStyleSheet(DARK_STYLE)
+        self._build_ui(); self._refresh()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
-
+        layout = QVBoxLayout(self); layout.setContentsMargins(16,16,16,16); layout.setSpacing(10)
         layout.addWidget(QLabel("<b>Carpetas indexadas</b>"))
-        layout.addWidget(QLabel(
-            "Selecciona una carpeta para eliminar sus registros de la base de datos.\n"
-            "Los archivos originales NO se borran del disco."
-        ))
-
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.container = QWidget()
-        self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(4)
-        self.scroll.setWidget(self.container)
+        layout.addWidget(QLabel("Los archivos originales NO se borran del disco."))
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
+        self.vbox.setSpacing(4); self.scroll.setWidget(self.container)
         layout.addWidget(self.scroll, stretch=1)
-
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;")
-        layout.addWidget(sep)
-
-        btn_missing = QPushButton("🧹  Eliminar registros de archivos que ya no existen en disco")
-        btn_missing.setStyleSheet("color:#FFD700; border:1px solid #FFD700;")
-        btn_missing.clicked.connect(self._remove_missing)
-        layout.addWidget(btn_missing)
+        sep.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep)
+        btn = QPushButton("🧹  Eliminar registros de archivos que ya no existen en disco")
+        btn.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
+        btn.clicked.connect(self._remove_missing); layout.addWidget(btn)
 
     def _refresh(self):
         for i in reversed(range(self.vbox.count())):
             w = self.vbox.itemAt(i).widget()
             if w: w.deleteLater()
-
         folders = services.get_indexed_folders()
         if not folders:
             lbl = QLabel("No hay carpetas indexadas.")
-            lbl.setStyleSheet("color:#666;")
-            self.vbox.addWidget(lbl)
+            lbl.setStyleSheet("color:#666;"); self.vbox.addWidget(lbl)
         else:
             for folder, count in folders:
-                row = QWidget()
-                row.setStyleSheet("background:#1E1E2E; border-radius:6px;")
-                hl = QHBoxLayout(row)
-                hl.setContentsMargins(8, 6, 8, 6)
-                lbl = QLabel(
-                    f"<b>{folder}</b>  <span style='color:#666;'>{count:,} archivos</span>"
-                )
-                lbl.setTextFormat(Qt.TextFormat.RichText)
-                hl.addWidget(lbl, stretch=1)
-                btn = QPushButton("Eliminar")
-                btn.setFixedWidth(75)
-                btn.setStyleSheet("color:#FF4A4A; border:1px solid #FF4A4A;")
-                btn.clicked.connect(lambda _, f=folder: self._deindex_folder(f))
-                hl.addWidget(btn)
-                self.vbox.addWidget(row)
+                row = QWidget(); row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
+                hl  = QHBoxLayout(row); hl.setContentsMargins(8,6,8,6)
+                lbl = QLabel(f"<b>{folder}</b>  <span style='color:#666;'>{count:,} archivos</span>")
+                lbl.setTextFormat(Qt.TextFormat.RichText); hl.addWidget(lbl, stretch=1)
+                btn = QPushButton("Eliminar"); btn.setFixedWidth(75)
+                btn.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
+                btn.clicked.connect(lambda _, f=folder: self._deindex(f))
+                hl.addWidget(btn); self.vbox.addWidget(row)
         self.vbox.addStretch()
 
-    def _deindex_folder(self, folder: str):
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"¿Eliminar todos los registros de:\n{folder}\n\nLos archivos originales no se borrarán.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-        services.deindex_folder(folder)
-        self._refresh()
+    def _deindex(self, folder: str):
+        if QMessageBox.question(self, "Confirmar",
+            f"¿Eliminar registros de:\n{folder}\n\nLos archivos NO se borrarán.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        ) == QMessageBox.StandardButton.Yes:
+            services.deindex_folder(folder); self._refresh()
 
     def _remove_missing(self):
         count = services.remove_missing_files()
-        if count == 0:
-            QMessageBox.information(self, "Listo", "No se encontraron archivos faltantes.")
-            return
-        reply = QMessageBox.question(
-            self, "Confirmar",
-            f"Se eliminarán {count} registros de archivos que ya no existen en disco.\n¿Continuar?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            QMessageBox.information(self, "Listo", f"Se eliminaron {count} registros.")
-            self._refresh()
+        msg   = "No se encontraron archivos faltantes." if count == 0 else \
+                f"Se eliminaron {count} registros."
+        QMessageBox.information(self, "Listo", msg)
+        if count: self._refresh()
 
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
@@ -782,16 +1024,20 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
         self.setStyleSheet(DARK_STYLE)
 
-        self._active_tags:    list[int]              = []
-        self._offset:         int                    = 0
-        self._page_size:      int                    = 100
-        self._current_page:   GalleryPage | None     = None
+        self._active_tags:    list[int]                 = []
+        self._offset:         int                       = 0
+        self._page_size:      int                       = 100
+        self._sort_field:     SortField                 = SortField.DATE
+        self._sort_order:     SortOrder                 = SortOrder.DESC
+        self._current_page:   GalleryPage | None        = None
         self._thumbnails:     dict[int, PhotoThumbnail] = {}
-        self._pending_photos: list[tuple[int, Photo]]   = []
-        self._grid_cols:      int                    = 4
-        self._loader:         ThumbnailLoader | None = None
+        self._pending_photos: list                      = []
+        self._grid_cols:      int                       = 4
+        self._loader:         ThumbnailLoader | None    = None
+        self._select_mode:    bool                      = False
+        self._selected_ids:   set[int]                  = set()
 
-        self._build_timer = QTimer(self)
+        self._build_timer  = QTimer(self)
         self._build_timer.setInterval(0)
         self._build_timer.timeout.connect(self._add_next_batch)
 
@@ -809,92 +1055,101 @@ class MainWindow(QMainWindow):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        central = QWidget()
-        self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
+        central = QWidget(); self.setCentralWidget(central)
+        root    = QHBoxLayout(central)
+        root.setContentsMargins(0,0,0,0); root.setSpacing(0)
 
-        # Sidebar
-        sidebar = QWidget()
-        sidebar.setFixedWidth(220)
-        sidebar.setStyleSheet("background:#13131F; border-right:1px solid #2D2D3F;")
-        sb = QVBoxLayout(sidebar)
-        sb.setContentsMargins(10, 16, 10, 16)
-        sb.setSpacing(8)
+        # ── Sidebar ────────────────────────────────────────────────────────
+        sidebar = QWidget(); sidebar.setFixedWidth(220)
+        sidebar.setStyleSheet("background:#13131F;border-right:1px solid #2D2D3F;")
+        sb = QVBoxLayout(sidebar); sb.setContentsMargins(10,16,10,16); sb.setSpacing(8)
 
         logo = QLabel("📸 PhotoVault")
-        logo.setStyleSheet("font-size:18px; font-weight:bold; color:#4A9EFF; margin-bottom:8px;")
+        logo.setStyleSheet("font-size:18px;font-weight:bold;color:#4A9EFF;margin-bottom:8px;")
         sb.addWidget(logo)
 
         for label, slot in [
-            ("＋ Indexar carpeta",    self._open_index_dialog),
+            ("＋ Indexar carpeta",     self._open_index_dialog),
             ("🏷  Gestionar etiquetas", self._open_tag_manager),
-            ("🗂  Des-indexar carpetas", self._open_deindex_dialog),
+            ("🗂  Des-indexar",         self._open_deindex_dialog),
+            ("📊  Estadísticas",        self._open_stats_dialog),
+            ("🔍  Duplicados",          self._open_duplicates_dialog),
             ("⚙  Configuración",       self._open_settings_dialog),
         ]:
-            btn = QPushButton(label)
-            btn.clicked.connect(slot)
-            sb.addWidget(btn)
+            btn = QPushButton(label); btn.clicked.connect(slot); sb.addWidget(btn)
 
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;")
-        sb.addWidget(sep)
+        sep.setStyleSheet("color:#2D2D3F;"); sb.addWidget(sep)
         sb.addWidget(QLabel("Filtrar por etiqueta:"))
 
-        self.tag_scroll = QScrollArea()
-        self.tag_scroll.setWidgetResizable(True)
+        self.tag_scroll = QScrollArea(); self.tag_scroll.setWidgetResizable(True)
         self.tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.tag_widget = QWidget()
-        self.tag_vbox   = QVBoxLayout(self.tag_widget)
-        self.tag_vbox.setContentsMargins(0, 0, 0, 0)
-        self.tag_vbox.setSpacing(2)
+        self.tag_widget = QWidget(); self.tag_vbox = QVBoxLayout(self.tag_widget)
+        self.tag_vbox.setContentsMargins(0,0,0,0); self.tag_vbox.setSpacing(2)
         self.tag_scroll.setWidget(self.tag_widget)
         sb.addWidget(self.tag_scroll, stretch=1)
 
         btn_clear = QPushButton("✕ Limpiar filtros")
-        btn_clear.setStyleSheet("color:#FF4A4A;")
-        btn_clear.clicked.connect(self._clear_filters)
+        btn_clear.setStyleSheet("color:#FF4A4A;"); btn_clear.clicked.connect(self._clear_filters)
         sb.addWidget(btn_clear)
 
-        self.stats_lbl = QLabel("")
-        self.stats_lbl.setStyleSheet("color:#666; font-size:10px;")
+        self.stats_lbl = QLabel(""); self.stats_lbl.setStyleSheet("color:#666;font-size:10px;")
         sb.addWidget(self.stats_lbl)
         root.addWidget(sidebar)
 
-        # Área principal
-        main_area = QWidget()
-        ml = QVBoxLayout(main_area)
-        ml.setContentsMargins(12, 12, 12, 12)
-        ml.setSpacing(8)
+        # ── Área principal ─────────────────────────────────────────────────
+        main_area = QWidget(); ml = QVBoxLayout(main_area)
+        ml.setContentsMargins(12,12,12,12); ml.setSpacing(8)
 
+        # Barra superior
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Buscar por nombre…")
         self.search_edit.textChanged.connect(self._on_search)
         top_bar.addWidget(self.search_edit)
-        self.count_lbl = QLabel("0 fotos")
-        self.count_lbl.setStyleSheet("color:#8888AA;")
+
+        # ── FEATURE: ordenamiento ─────────────────────────────────────────
+        top_bar.addWidget(QLabel("Ordenar:"))
+        self.sort_field_combo = QComboBox()
+        for f in SortField:
+            self.sort_field_combo.addItem(f.value, userData=f)
+        self.sort_field_combo.currentIndexChanged.connect(self._on_sort_changed)
+        top_bar.addWidget(self.sort_field_combo)
+
+        self.sort_order_combo = QComboBox()
+        self.sort_order_combo.addItem("↓ desc", userData=SortOrder.DESC)
+        self.sort_order_combo.addItem("↑ asc",  userData=SortOrder.ASC)
+        self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
+        top_bar.addWidget(self.sort_order_combo)
+
+        self.count_lbl = QLabel("0 fotos"); self.count_lbl.setStyleSheet("color:#8888AA;")
         top_bar.addWidget(self.count_lbl)
+
+        # ── FEATURE: modo selección ───────────────────────────────────────
+        self.btn_select = QPushButton("☐ Seleccionar")
+        self.btn_select.setCheckable(True)
+        self.btn_select.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
+        self.btn_select.toggled.connect(self._toggle_select_mode)
+        top_bar.addWidget(self.btn_select)
+
+        self.btn_bulk_tag = QPushButton("🏷 Etiquetar selección")
+        self.btn_bulk_tag.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
+        self.btn_bulk_tag.setVisible(False)
+        self.btn_bulk_tag.clicked.connect(self._open_bulk_tag)
+        top_bar.addWidget(self.btn_bulk_tag)
+
         ml.addLayout(top_bar)
 
-        self.scroll_area = QScrollArea()
-        self.scroll_area.setWidgetResizable(True)
-        self.grid_widget = QWidget()
-        self.grid_layout = QGridLayout(self.grid_widget)
-        self.grid_layout.setSpacing(8)
-        self.scroll_area.setWidget(self.grid_widget)
+        self.scroll_area = QScrollArea(); self.scroll_area.setWidgetResizable(True)
+        self.grid_widget = QWidget(); self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(8); self.scroll_area.setWidget(self.grid_widget)
         ml.addWidget(self.scroll_area, stretch=1)
 
         pg_bar = QHBoxLayout()
-        self.prev_btn = QPushButton("← Anterior")
-        self.prev_btn.clicked.connect(self._prev_page)
-        self.next_btn = QPushButton("Siguiente →")
-        self.next_btn.clicked.connect(self._next_page)
-        self.page_lbl = QLabel("")
-        self.page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pg_bar.addWidget(self.prev_btn)
-        pg_bar.addWidget(self.page_lbl, stretch=1)
+        self.prev_btn = QPushButton("← Anterior"); self.prev_btn.clicked.connect(self._prev_page)
+        self.next_btn = QPushButton("Siguiente →"); self.next_btn.clicked.connect(self._next_page)
+        self.page_lbl = QLabel(""); self.page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pg_bar.addWidget(self.prev_btn); pg_bar.addWidget(self.page_lbl, stretch=1)
         pg_bar.addWidget(self.next_btn)
         ml.addLayout(pg_bar)
 
@@ -907,62 +1162,38 @@ class MainWindow(QMainWindow):
             w = self.tag_vbox.itemAt(i).widget()
             if w: w.deleteLater()
 
-        # services.get_sidebar_tags() ya agrupa por categoría
         for category, tags in services.get_sidebar_tags().items():
             header = QPushButton(f"▾  {category.upper()}")
-            header.setCheckable(True)
-            header.setChecked(True)
+            header.setCheckable(True); header.setChecked(True)
             header.setStyleSheet("""
-                QPushButton {
-                    background:#1A1A2E; color:#6688AA; border:none;
-                    border-top:1px solid #2D2D3F; border-radius:0;
-                    text-align:left; padding:4px 6px;
-                    font-size:10px; font-weight:bold; letter-spacing:1px;
-                }
-                QPushButton:hover { color:#88AACC; background:#1E1E2E; }
+                QPushButton { background:#1A1A2E;color:#6688AA;border:none;
+                    border-top:1px solid #2D2D3F;border-radius:0;
+                    text-align:left;padding:4px 6px;font-size:10px;
+                    font-weight:bold;letter-spacing:1px; }
+                QPushButton:hover { color:#88AACC;background:#1E1E2E; }
             """)
-
-            group_widget = QWidget()
-            group_vbox   = QVBoxLayout(group_widget)
-            group_vbox.setContentsMargins(8, 0, 0, 4)
-            group_vbox.setSpacing(1)
-
+            group_widget = QWidget(); gv = QVBoxLayout(group_widget)
+            gv.setContentsMargins(8,0,0,4); gv.setSpacing(1)
             for tag in tags:
-                row = QWidget()
-                hl  = QHBoxLayout(row)
-                hl.setContentsMargins(0, 0, 0, 0)
-                hl.setSpacing(4)
-
-                chk = QCheckBox(tag.name)
-                chk.setStyleSheet(f"color:{tag.color};")
+                row = QWidget(); hl = QHBoxLayout(row)
+                hl.setContentsMargins(0,0,0,0); hl.setSpacing(4)
+                chk = QCheckBox(tag.name); chk.setStyleSheet(f"color:{tag.color};")
                 chk.setProperty("tag_id", tag.id)
-                if tag.id in self._active_tags:
-                    chk.setChecked(True)
+                if tag.id in self._active_tags: chk.setChecked(True)
                 chk.stateChanged.connect(self._on_tag_filter_changed)
                 hl.addWidget(chk, stretch=1)
-
-                eye_btn = QPushButton("👁" if not tag.sidebar_hidden else "🚫")
-                eye_btn.setFixedSize(22, 22)
-                eye_btn.setToolTip(
-                    "Ocultar del sidebar" if not tag.sidebar_hidden else "Mostrar en sidebar"
-                )
-                eye_btn.setStyleSheet(
-                    "QPushButton { background:transparent; border:none; font-size:11px; padding:0; }"
-                    "QPushButton:hover { background:#2D2D3F; border-radius:4px; }"
-                )
-                eye_btn.clicked.connect(
-                    lambda _, tid=tag.id, cur=tag.sidebar_hidden:
-                        self._toggle_sidebar_hidden(tid, cur)
-                )
-                hl.addWidget(eye_btn)
-                group_vbox.addWidget(row)
-
+                eye = QPushButton("👁" if not tag.sidebar_hidden else "🚫")
+                eye.setFixedSize(22,22)
+                eye.setStyleSheet("QPushButton{background:transparent;border:none;font-size:11px;padding:0;}"
+                                  "QPushButton:hover{background:#2D2D3F;border-radius:4px;}")
+                eye.clicked.connect(lambda _, tid=tag.id, cur=tag.sidebar_hidden:
+                    self._toggle_sidebar_hidden(tid, cur))
+                hl.addWidget(eye); gv.addWidget(row)
             header.toggled.connect(lambda checked, gw=group_widget, btn=header: (
                 gw.setVisible(checked),
                 btn.setText(f"{'▾' if checked else '▸'}  {btn.text()[2:]}")
             ))
-            self.tag_vbox.addWidget(header)
-            self.tag_vbox.addWidget(group_widget)
+            self.tag_vbox.addWidget(header); self.tag_vbox.addWidget(group_widget)
 
         self.tag_vbox.addStretch()
         self._update_stats()
@@ -975,79 +1206,101 @@ class MainWindow(QMainWindow):
         self._active_tags = []
         for i in range(self.tag_vbox.count()):
             w = self.tag_vbox.itemAt(i).widget()
-            if w is None:
-                continue
+            if not w: continue
             for chk in w.findChildren(QCheckBox):
                 if chk.isChecked() and chk.property("tag_id") is not None:
                     self._active_tags.append(chk.property("tag_id"))
-        self._offset = 0
-        self._load_photos()
+        self._offset = 0; self._load_photos()
 
     def _clear_filters(self):
         self._active_tags = []
         for i in range(self.tag_vbox.count()):
             w = self.tag_vbox.itemAt(i).widget()
-            if w is None:
-                continue
+            if not w: continue
             for chk in w.findChildren(QCheckBox):
-                chk.blockSignals(True)
-                chk.setChecked(False)
-                chk.blockSignals(False)
-        self._offset = 0
+                chk.blockSignals(True); chk.setChecked(False); chk.blockSignals(False)
+        self._offset = 0; self._load_photos()
+
+    # ── Ordenamiento ──────────────────────────────────────────────────────────
+
+    def _on_sort_changed(self):
+        self._sort_field = self.sort_field_combo.currentData()
+        self._sort_order = self.sort_order_combo.currentData()
+        self._offset = 0; self._load_photos()
+
+    # ── Modo selección ────────────────────────────────────────────────────────
+
+    def _toggle_select_mode(self, checked: bool):
+        self._select_mode  = checked
+        self._selected_ids = set()
+        self.btn_bulk_tag.setVisible(checked)
+        self.btn_select.setText("✓ Cancelar selección" if checked else "☐ Seleccionar")
         self._load_photos()
+
+    def _on_thumb_selected(self, photo_id: int, is_selected: bool):
+        if is_selected:
+            self._selected_ids.add(photo_id)
+        else:
+            self._selected_ids.discard(photo_id)
+        n = len(self._selected_ids)
+        self.btn_bulk_tag.setText(f"🏷 Etiquetar {n} fotos" if n else "🏷 Etiquetar selección")
+
+    def _open_bulk_tag(self):
+        if not self._selected_ids:
+            QMessageBox.information(self, "Sin selección", "Selecciona al menos una foto.")
+            return
+        dlg = BulkTagDialog(list(self._selected_ids), self)
+        if dlg.exec():
+            self._selected_ids.clear()
+            self._toggle_select_mode(False)
+            self.btn_select.setChecked(False)
 
     # ── Carga de fotos ────────────────────────────────────────────────────────
 
     def _stop_loader(self):
         if self._loader is not None:
             self._loader.loaded.disconnect()
-            try:
-                self._loader.finished.disconnect()
-            except Exception:
-                pass
-            self._loader.stop()
-            self._loader.wait(500)
+            try: self._loader.finished.disconnect()
+            except Exception: pass
+            self._loader.stop(); self._loader.wait(500)
             self._loader = None
 
     def _load_photos(self):
-        self._build_timer.stop()
-        self._stop_loader()
-
+        self._build_timer.stop(); self._stop_loader()
         for i in reversed(range(self.grid_layout.count())):
             w = self.grid_layout.itemAt(i).widget()
             if w: w.deleteLater()
         self._thumbnails.clear()
 
         search = self.search_edit.text().strip() or None
-
-        # Una sola llamada al servicio devuelve todo lo necesario
         self._current_page = services.get_gallery_page(
-            tag_ids = self._active_tags or None,
-            search  = search,
-            limit   = self._page_size,
-            offset  = self._offset,
+            tag_ids    = self._active_tags or None,
+            search     = search,
+            limit      = self._page_size,
+            offset     = self._offset,
+            sort_field = self._sort_field,
+            sort_order = self._sort_order,
         )
 
         self.count_lbl.setText(f"{self._current_page.total:,} fotos")
         self._update_pagination()
 
         new_cols = max(1, (self.scroll_area.width() - 30) // 218)
-        self._grid_cols      = new_cols
-        self._last_grid_cols = new_cols
-
+        self._grid_cols = self._last_grid_cols = new_cols
         self._pending_photos = list(enumerate(self._current_page.photos))
         self._build_timer.start()
 
     def _add_next_batch(self):
         BATCH = 10
-        batch, self._pending_photos = (
-            self._pending_photos[:BATCH],
-            self._pending_photos[BATCH:],
-        )
-
+        batch, self._pending_photos = self._pending_photos[:BATCH], self._pending_photos[BATCH:]
         for idx, photo in batch:
-            thumb = PhotoThumbnail(photo)
-            thumb.clicked.connect(self._open_photo)
+            thumb = PhotoThumbnail(photo, selectable=self._select_mode)
+            if self._select_mode:
+                thumb.selected.connect(self._on_thumb_selected)
+                if photo.id in self._selected_ids:
+                    thumb.set_selected(True)
+            else:
+                thumb.clicked.connect(self._open_photo)
             self.grid_layout.addWidget(thumb, idx // self._grid_cols, idx % self._grid_cols)
             self._thumbnails[photo.id] = thumb
 
@@ -1055,146 +1308,112 @@ class MainWindow(QMainWindow):
             self._build_timer.stop()
             self._loader = ThumbnailLoader(self._current_page.photos)
             self._loader.loaded.connect(self._on_thumb_loaded)
-            self._loader.finished.connect(self._on_loader_finished)
+            self._loader.finished.connect(lambda: setattr(self, "_loader", None))
             self._loader.start()
-
-    def _on_loader_finished(self):
-        self._loader = None
 
     def _on_thumb_loaded(self, photo_id: int, pix: QPixmap):
         if photo_id in self._thumbnails:
             self._thumbnails[photo_id].set_pixmap(pix)
 
     def _on_search(self):
-        self._offset = 0
-        self._load_photos()
+        self._offset = 0; self._load_photos()
 
     # ── Paginación ────────────────────────────────────────────────────────────
 
     def _update_pagination(self):
-        if not self._current_page:
-            return
+        if not self._current_page: return
         p = self._current_page
         self.page_lbl.setText(f"Página {p.page_number} / {p.total_pages}")
         self.prev_btn.setEnabled(p.has_prev)
         self.next_btn.setEnabled(p.has_next)
 
     def _prev_page(self):
-        self._offset = max(0, self._offset - self._page_size)
-        self._load_photos()
+        self._offset = max(0, self._offset - self._page_size); self._load_photos()
 
     def _next_page(self):
-        self._offset += self._page_size
-        self._load_photos()
+        self._offset += self._page_size; self._load_photos()
 
-    # ── Resize con debounce ───────────────────────────────────────────────────
+    # ── Resize ────────────────────────────────────────────────────────────────
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self._resize_timer.start()
+        super().resizeEvent(event); self._resize_timer.start()
 
     def _on_resize_settled(self):
         new_cols = max(1, (self.scroll_area.width() - 30) // 218)
         if new_cols != self._last_grid_cols:
-            self._last_grid_cols = new_cols
-            self._load_photos()
+            self._last_grid_cols = new_cols; self._load_photos()
 
     # ── Acciones ──────────────────────────────────────────────────────────────
 
     def _open_photo(self, photo_id: int):
-        if not self._current_page:
-            return
+        if not self._current_page: return
         photo = next((p for p in self._current_page.photos if p.id == photo_id), None)
-        if not photo:
-            return
+        if not photo: return
         dlg = PhotoDetailDialog(photo, self)
-        dlg.tags_changed.connect(self._load_photos)
-        dlg.exec()
+        dlg.tags_changed.connect(self._load_photos); dlg.exec()
 
     def _open_index_dialog(self):
-        dlg = IndexDialog(self)
-        dlg.indexing_done.connect(self._on_index_done)
-        dlg.exec()
+        dlg = IndexDialog(self); dlg.indexing_done.connect(self._on_index_done); dlg.exec()
 
     def _on_index_done(self):
-        self._refresh_tags()
-        self._load_photos()
+        self._refresh_tags(); self._load_photos()
 
     def _open_tag_manager(self):
-        dlg = TagManagerDialog(self)
-        dlg.exec()
-        self._refresh_tags()
-        self._load_photos()
+        TagManagerDialog(self).exec(); self._refresh_tags(); self._load_photos()
 
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self._page_size, self)
         if dlg.exec():
-            self._page_size = dlg.page_size
-            self._offset    = 0
-            self._load_photos()
+            self._page_size = dlg.page_size; self._offset = 0; self._load_photos()
 
     def _open_deindex_dialog(self):
-        dlg = DeindexDialog(self)
-        dlg.exec()
-        self._load_photos()
+        DeindexDialog(self).exec(); self._load_photos()
+
+    def _open_stats_dialog(self):
+        StatsDialog(self).exec()
+
+    def _open_duplicates_dialog(self):
+        DuplicatesDialog(self).exec(); self._load_photos()
 
     def _update_stats(self):
         stats = services.get_stats()
-        self.stats_lbl.setText(
-            f"{stats.total_photos:,} fotos  •  {stats.total_tags} etiquetas"
-        )
+        self.stats_lbl.setText(f"{stats.total_photos:,} fotos  •  {stats.total_tags} etiquetas")
 
     def closeEvent(self, event):
-        self._build_timer.stop()
-        self._stop_loader()
-        db.close_connection()   # cerrar conexión del hilo principal
-        super().closeEvent(event)
+        self._build_timer.stop(); self._stop_loader()
+        db.close_connection(); super().closeEvent(event)
 
 
-# ─── Estilos globales ─────────────────────────────────────────────────────────
+# ─── Estilos ──────────────────────────────────────────────────────────────────
 
 DARK_STYLE = """
-    * { font-family: 'Segoe UI', sans-serif; font-size: 13px; }
-    QMainWindow, QDialog, QWidget { background: #0D0D1A; color: #D0D0E8; }
-    QPushButton {
-        background: #1E1E2E; color: #D0D0E8;
-        border: 1px solid #3A3A5A; border-radius: 6px; padding: 6px 12px;
-    }
-    QPushButton:hover   { background: #2A2A3E; border-color: #4A9EFF; }
-    QPushButton:pressed { background: #4A9EFF33; }
-    QPushButton:disabled { color: #444; border-color: #222; }
-    QLineEdit, QComboBox {
-        background: #1E1E2E; color: #D0D0E8;
-        border: 1px solid #3A3A5A; border-radius: 6px; padding: 6px 10px;
-    }
-    QLineEdit:focus, QComboBox:focus { border-color: #4A9EFF; }
-    QScrollArea { border: none; }
-    QScrollBar:vertical { background: #13131F; width: 8px; border-radius: 4px; }
-    QScrollBar::handle:vertical {
-        background: #3A3A5A; border-radius: 4px; min-height: 20px;
-    }
-    QScrollBar::handle:vertical:hover { background: #4A9EFF; }
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-    QProgressBar {
-        background: #1E1E2E; border: 1px solid #3A3A5A;
-        border-radius: 4px; text-align: center; color: #D0D0E8;
-    }
-    QProgressBar::chunk { background: #4A9EFF; border-radius: 4px; }
-    QGroupBox {
-        border: 1px solid #3A3A5A; border-radius: 6px;
-        margin-top: 8px; padding-top: 8px; color: #8888AA; font-size: 11px;
-    }
-    QCheckBox { color: #D0D0E8; spacing: 6px; }
-    QCheckBox::indicator {
-        width: 14px; height: 14px;
-        border: 1px solid #3A3A5A; border-radius: 3px; background: #1E1E2E;
-    }
-    QCheckBox::indicator:checked { background: #4A9EFF; border-color: #4A9EFF; }
-    QLabel { color: #D0D0E8; }
-    QComboBox QAbstractItemView {
-        background: #1E1E2E; border: 1px solid #3A3A5A;
-        selection-background-color: #4A9EFF33;
-    }
+    * { font-family:'Segoe UI',sans-serif; font-size:13px; }
+    QMainWindow,QDialog,QWidget { background:#0D0D1A; color:#D0D0E8; }
+    QPushButton { background:#1E1E2E;color:#D0D0E8;border:1px solid #3A3A5A;
+                  border-radius:6px;padding:6px 12px; }
+    QPushButton:hover   { background:#2A2A3E;border-color:#4A9EFF; }
+    QPushButton:pressed { background:#4A9EFF33; }
+    QPushButton:disabled { color:#444;border-color:#222; }
+    QLineEdit,QComboBox { background:#1E1E2E;color:#D0D0E8;border:1px solid #3A3A5A;
+                          border-radius:6px;padding:6px 10px; }
+    QLineEdit:focus,QComboBox:focus { border-color:#4A9EFF; }
+    QScrollArea { border:none; }
+    QScrollBar:vertical { background:#13131F;width:8px;border-radius:4px; }
+    QScrollBar::handle:vertical { background:#3A3A5A;border-radius:4px;min-height:20px; }
+    QScrollBar::handle:vertical:hover { background:#4A9EFF; }
+    QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
+    QProgressBar { background:#1E1E2E;border:1px solid #3A3A5A;border-radius:4px;
+                   text-align:center;color:#D0D0E8; }
+    QProgressBar::chunk { background:#4A9EFF;border-radius:4px; }
+    QGroupBox { border:1px solid #3A3A5A;border-radius:6px;margin-top:8px;
+                padding-top:8px;color:#8888AA;font-size:11px; }
+    QCheckBox { color:#D0D0E8;spacing:6px; }
+    QCheckBox::indicator { width:14px;height:14px;border:1px solid #3A3A5A;
+                           border-radius:3px;background:#1E1E2E; }
+    QCheckBox::indicator:checked { background:#4A9EFF;border-color:#4A9EFF; }
+    QLabel { color:#D0D0E8; }
+    QComboBox QAbstractItemView { background:#1E1E2E;border:1px solid #3A3A5A;
+                                  selection-background-color:#4A9EFF33; }
 """
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

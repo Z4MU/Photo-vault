@@ -1,14 +1,6 @@
 """
 PhotoVault - database.py
 Maneja toda la interacción con SQLite.
-
-Mejoras de arquitectura:
-  - Conexiones por hilo con threading.local() en lugar de abrir una nueva
-    conexión por cada operación. Esto elimina el overhead de sqlite3.connect()
-    en cada llamada y es seguro en entornos multihilo (PyQt usa varios hilos).
-  - upsert_photo ahora actualiza width y height correctamente.
-  - Las funciones de lectura devuelven modelos tipados (Photo, Tag, Stats)
-    en lugar de sqlite3.Row o dicts, para que la UI no dependa del esquema SQL.
 """
 
 import sqlite3
@@ -16,38 +8,27 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from models import Photo, Tag, Stats
+from models import Photo, Tag, Stats, SortField, SortOrder, sort_to_sql
 
 DB_PATH = Path.home() / ".photovault" / "photovault.db"
-
-# ── Conexiones por hilo ───────────────────────────────────────────────────────
-# Cada hilo tiene su propia conexión SQLite. sqlite3 no es thread-safe con una
-# conexión compartida, y abrir una conexión por llamada es costoso para
-# operaciones frecuentes como cargar miniaturas.
 
 _local = threading.local()
 
 
 def get_connection() -> sqlite3.Connection:
-    """
-    Devuelve la conexión SQLite del hilo actual.
-    La crea la primera vez que el hilo la solicita.
-    """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
     conn = getattr(_local, "conn", None)
     if conn is None:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA cache_size=-8000")   # 8 MB de caché por conexión
+        conn.execute("PRAGMA cache_size=-8000")
         _local.conn = conn
     return conn
 
 
 def close_connection():
-    """Cierra la conexión del hilo actual (útil al terminar un QThread)."""
     conn = getattr(_local, "conn", None)
     if conn is not None:
         try:
@@ -57,10 +38,7 @@ def close_connection():
         _local.conn = None
 
 
-# ── Contexto de transacción ───────────────────────────────────────────────────
-
 class _Transaction:
-    """Context manager que hace commit/rollback sobre la conexión del hilo."""
     def __enter__(self):
         self._conn = get_connection()
         return self._conn
@@ -70,7 +48,7 @@ class _Transaction:
             self._conn.commit()
         else:
             self._conn.rollback()
-        return False   # no suprimir excepciones
+        return False
 
 
 def transaction() -> "_Transaction":
@@ -80,7 +58,6 @@ def transaction() -> "_Transaction":
 # ── Inicialización ────────────────────────────────────────────────────────────
 
 def init_db():
-    """Crea las tablas si no existen y aplica migraciones."""
     with transaction() as conn:
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS photos (
@@ -94,6 +71,7 @@ def init_db():
                 width       INTEGER,
                 height      INTEGER,
                 duration    REAL,
+                md5         TEXT,
                 added_at    TEXT DEFAULT (datetime('now'))
             );
 
@@ -122,10 +100,11 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_photo_tags_tag    ON photo_tags(tag_id);
         """)
 
-        # ── Migraciones para DBs viejas ───────────────────────────────────
+        # Migraciones — deben correr ANTES de crear índices que las usen
         for col, typedef in [
             ("media_type", "TEXT DEFAULT 'image'"),
             ("duration",   "REAL"),
+            ("md5",        "TEXT"),
         ]:
             try:
                 conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {typedef}")
@@ -140,7 +119,15 @@ def init_db():
             except Exception:
                 pass
 
-        # Poblar categories desde tags existentes (migración DB vieja)
+        # Crear índice md5 aquí, después de asegurar que la columna existe
+        try:
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_photos_md5 ON photos(md5)"
+            )
+            conn.commit()
+        except Exception:
+            pass
+
         try:
             conn.execute(
                 "INSERT OR IGNORE INTO categories (name) "
@@ -149,7 +136,6 @@ def init_db():
         except Exception:
             pass
 
-        # ── Etiquetas y categorías predefinidas ───────────────────────────
         conn.executescript("""
             INSERT OR IGNORE INTO tags (name, category, color) VALUES
                 ('sfw', 'contenido', '#4AFF9E'),
@@ -217,10 +203,6 @@ def init_db():
 def upsert_photo(path: str, filename: str, year: int, month: int,
                  filesize: int, width: int = None, height: int = None,
                  media_type: str = "image", duration: float = None) -> int:
-    """
-    Inserta o actualiza una foto. Ahora incluye width y height en el UPDATE
-    (antes solo se actualizaban en INSERT, dejando nulls al re-indexar).
-    """
     with transaction() as conn:
         cur = conn.execute("""
             INSERT INTO photos (path, filename, media_type, year, month,
@@ -241,8 +223,13 @@ def upsert_photo(path: str, filename: str, year: int, month: int,
         return row[0]
 
 
+def update_photo_md5(photo_id: int, md5: str):
+    with transaction() as conn:
+        conn.execute("UPDATE photos SET md5 = ? WHERE id = ?", (md5, photo_id))
+
+
 def _row_to_photo(row: sqlite3.Row) -> Photo:
-    """Convierte una fila SQLite al modelo Photo."""
+    keys = row.keys()
     return Photo(
         id         = row["id"],
         path       = row["path"],
@@ -251,11 +238,14 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
         month      = row["month"],
         media_type = row["media_type"] or "image",
         duration   = row["duration"],
+        filesize   = row["filesize"] if "filesize" in keys else None,
     )
 
 
 def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
-               search: str = None, limit: int = 200, offset: int = 0) -> list[Photo]:
+               search: str = None, limit: int = 200, offset: int = 0,
+               sort_field: SortField = SortField.DATE,
+               sort_order: SortOrder = SortOrder.DESC) -> list[Photo]:
     params = []
     where_clauses = []
 
@@ -263,31 +253,29 @@ def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
         placeholders = ",".join("?" * len(hidden_tag_ids))
         where_clauses.append(f"""
             p.id NOT IN (
-                SELECT photo_id FROM photo_tags
-                WHERE tag_id IN ({placeholders})
+                SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders})
             )
         """)
         params.extend(hidden_tag_ids)
 
     if tag_ids:
         for tid in tag_ids:
-            where_clauses.append(
-                "p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)"
-            )
+            where_clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
             params.append(tid)
 
     if search:
         where_clauses.append("p.filename LIKE ?")
         params.append(f"%{search}%")
 
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    where_sql  = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    order_sql  = sort_to_sql(sort_field, sort_order)
 
     conn = get_connection()
     rows = conn.execute(f"""
-        SELECT p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration
+        SELECT p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, p.filesize
         FROM photos p
         {where_sql}
-        ORDER BY p.year DESC, p.month DESC, p.filename
+        ORDER BY {order_sql}
         LIMIT ? OFFSET ?
     """, params + [limit, offset]).fetchall()
 
@@ -303,17 +291,14 @@ def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
         placeholders = ",".join("?" * len(hidden_tag_ids))
         where_clauses.append(f"""
             p.id NOT IN (
-                SELECT photo_id FROM photo_tags
-                WHERE tag_id IN ({placeholders})
+                SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders})
             )
         """)
         params.extend(hidden_tag_ids)
 
     if tag_ids:
         for tid in tag_ids:
-            where_clauses.append(
-                "p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)"
-            )
+            where_clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
             params.append(tid)
 
     if search:
@@ -321,33 +306,46 @@ def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
         params.append(f"%{search}%")
 
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-
     conn = get_connection()
-    row = conn.execute(
-        f"SELECT COUNT(*) FROM photos p {where_sql}", params
-    ).fetchone()
+    row  = conn.execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
     return row[0]
 
 
 def get_photo_by_id(photo_id: int) -> Optional[Photo]:
     conn = get_connection()
-    row = conn.execute(
-        "SELECT id, path, filename, year, month, media_type, duration FROM photos WHERE id = ?",
+    row  = conn.execute(
+        "SELECT id, path, filename, year, month, media_type, duration, filesize FROM photos WHERE id = ?",
         (photo_id,)
     ).fetchone()
     return _row_to_photo(row) if row else None
 
 
+def get_all_photos_for_duplicates() -> list[Photo]:
+    """Devuelve id, path, filename, filesize, md5 de todas las fotos."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, path, filename, year, month, media_type, duration, filesize, md5 FROM photos"
+    ).fetchall()
+    photos = []
+    for r in rows:
+        p = _row_to_photo(r)
+        # md5 no está en Photo pero lo necesitamos — lo pegamos como attr extra
+        object.__setattr__(p, '_md5', r["md5"]) if hasattr(p, '__dataclass_fields__') else None
+        photos.append((p, r["md5"]))
+    return photos
+
+
 # ── Etiquetas de una foto ─────────────────────────────────────────────────────
 
 def _row_to_tag(row: sqlite3.Row) -> Tag:
+    keys = row.keys()
     return Tag(
         id             = row["id"],
         name           = row["name"],
         category       = row["category"] or "general",
         color          = row["color"] or "#4A9EFF",
-        hidden         = bool(row["hidden"]) if "hidden" in row.keys() else False,
-        sidebar_hidden = bool(row["sidebar_hidden"]) if "sidebar_hidden" in row.keys() else False,
+        hidden         = bool(row["hidden"]) if "hidden" in keys else False,
+        sidebar_hidden = bool(row["sidebar_hidden"]) if "sidebar_hidden" in keys else False,
     )
 
 
@@ -355,8 +353,7 @@ def get_photo_tags(photo_id: int) -> list[Tag]:
     conn = get_connection()
     rows = conn.execute("""
         SELECT t.id, t.name, t.category, t.color, t.hidden, t.sidebar_hidden
-        FROM tags t
-        JOIN photo_tags pt ON pt.tag_id = t.id
+        FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
         WHERE pt.photo_id = ?
         ORDER BY t.category, t.name
     """, (photo_id,)).fetchall()
@@ -380,11 +377,29 @@ def add_tag_to_photo(photo_id: int, tag_id: int):
         )
 
 
+def add_tag_to_photos(photo_ids: list[int], tag_id: int):
+    """Agrega una etiqueta a múltiples fotos de una vez."""
+    with transaction() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)",
+            [(pid, tag_id) for pid in photo_ids]
+        )
+
+
 def remove_tag_from_photo(photo_id: int, tag_id: int):
     with transaction() as conn:
         conn.execute(
             "DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?",
             (photo_id, tag_id)
+        )
+
+
+def remove_tag_from_photos(photo_ids: list[int], tag_id: int):
+    """Quita una etiqueta de múltiples fotos de una vez."""
+    with transaction() as conn:
+        conn.executemany(
+            "DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?",
+            [(pid, tag_id) for pid in photo_ids]
         )
 
 
@@ -394,8 +409,7 @@ def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
     conn = get_connection()
     if include_sidebar_hidden:
         rows = conn.execute(
-            "SELECT id, name, category, color, hidden, sidebar_hidden "
-            "FROM tags ORDER BY category, name"
+            "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags ORDER BY category, name"
         ).fetchall()
     else:
         rows = conn.execute(
@@ -443,8 +457,7 @@ def delete_tag(tag_id: int):
 def get_tags_by_category(category: str) -> list[Tag]:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, name, color, category, hidden, sidebar_hidden "
-        "FROM tags WHERE category = ? ORDER BY name",
+        "SELECT id, name, color, category, hidden, sidebar_hidden FROM tags WHERE category = ? ORDER BY name",
         (category,)
     ).fetchall()
     return [_row_to_tag(r) for r in rows]
@@ -490,11 +503,39 @@ def get_stats() -> Stats:
     conn = get_connection()
     total_photos = conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
     total_tags   = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-    years        = [
+
+    years = [
         (r["year"], r["c"])
         for r in conn.execute(
-            "SELECT year, COUNT(*) as c FROM photos "
-            "WHERE year IS NOT NULL GROUP BY year ORDER BY year"
+            "SELECT year, COUNT(*) as c FROM photos WHERE year IS NOT NULL GROUP BY year ORDER BY year"
         ).fetchall()
     ]
-    return Stats(total_photos=total_photos, total_tags=total_tags, years=years)
+    by_month = [
+        (r["year"], r["month"], r["c"])
+        for r in conn.execute(
+            "SELECT year, month, COUNT(*) as c FROM photos "
+            "WHERE year IS NOT NULL AND month IS NOT NULL "
+            "GROUP BY year, month ORDER BY year, month"
+        ).fetchall()
+    ]
+    by_type = {}
+    for r in conn.execute("SELECT media_type, COUNT(*) as c FROM photos GROUP BY media_type").fetchall():
+        by_type[r["media_type"] or "image"] = r["c"]
+
+    top_tags = [
+        (r["name"], r["c"])
+        for r in conn.execute("""
+            SELECT t.name, COUNT(pt.photo_id) as c
+            FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
+            GROUP BY t.id ORDER BY c DESC LIMIT 10
+        """).fetchall()
+    ]
+
+    return Stats(
+        total_photos = total_photos,
+        total_tags   = total_tags,
+        years        = years,
+        by_month     = by_month,
+        by_type      = by_type,
+        top_tags     = top_tags,
+    )
