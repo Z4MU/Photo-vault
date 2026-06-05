@@ -16,24 +16,51 @@ from models import GalleryPage, Photo, Tag, Stats, SortField, SortOrder, Duplica
 # ── Galería ───────────────────────────────────────────────────────────────────
 
 def get_gallery_page(
-    tag_ids:    list[int]  = None,
-    search:     str        = None,
-    limit:      int        = 100,
-    offset:     int        = 0,
-    sort_field: SortField  = SortField.DATE,
-    sort_order: SortOrder  = SortOrder.DESC,
+    tag_ids:      list[int]  = None,
+    search:       str        = None,
+    limit:        int        = 100,
+    offset:       int        = 0,
+    sort_field:   SortField  = SortField.DATE,
+    sort_order:   SortOrder  = SortOrder.DESC,
+    folder:       str        = None,
+    untagged_only: bool      = False,
 ) -> GalleryPage:
     hidden = db.get_hidden_tag_ids()
     total  = db.get_photo_count(
-        tag_ids=tag_ids or None, hidden_tag_ids=hidden, search=search
+        tag_ids=tag_ids or None, hidden_tag_ids=hidden, search=search,
+        folder=folder, untagged_only=untagged_only,
     )
     photos = db.get_photos(
         tag_ids=tag_ids or None, hidden_tag_ids=hidden, search=search,
         limit=limit, offset=offset, sort_field=sort_field, sort_order=sort_order,
+        folder=folder, untagged_only=untagged_only,
     )
     return GalleryPage(
         photos=photos, total=total, offset=offset, limit=limit,
         sort_field=sort_field, sort_order=sort_order,
+    )
+
+
+def get_photos_for_tagging(
+    folder:       str       = None,
+    tag_ids:      list[int] = None,
+    untagged_only: bool     = False,
+) -> list[Photo]:
+    """
+    Devuelve la lista completa de fotos para el modo etiquetado rápido.
+    Sin paginación — carga todos los IDs en memoria para permitir
+    navegación libre sin consultas adicionales.
+    """
+    hidden = db.get_hidden_tag_ids()
+    return db.get_photos(
+        tag_ids=tag_ids or None,
+        hidden_tag_ids=hidden,
+        folder=folder,
+        untagged_only=untagged_only,
+        limit=99_999,
+        offset=0,
+        sort_field=SortField.DATE,
+        sort_order=SortOrder.ASC,
     )
 
 

@@ -304,7 +304,9 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
 def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
                search: str = None, limit: int = 200, offset: int = 0,
                sort_field: SortField = SortField.DATE,
-               sort_order: SortOrder = SortOrder.DESC) -> list[Photo]:
+               sort_order: SortOrder = SortOrder.DESC,
+               folder: str = None,
+               untagged_only: bool = False) -> list[Photo]:
     params = []
     where_clauses = []
 
@@ -325,6 +327,13 @@ def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
     if search:
         where_clauses.append("p.filename LIKE ?")
         params.append(f"%{search}%")
+
+    if folder:
+        where_clauses.append("p.path LIKE ?")
+        params.append(folder.rstrip("/\\") + "%")
+
+    if untagged_only:
+        where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
 
     where_sql  = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     order_sql  = sort_to_sql(sort_field, sort_order)
@@ -342,7 +351,8 @@ def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
 
 
 def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
-                    search: str = None) -> int:
+                    search: str = None, folder: str = None,
+                    untagged_only: bool = False) -> int:
     params = []
     where_clauses = []
 
@@ -363,6 +373,13 @@ def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
     if search:
         where_clauses.append("p.filename LIKE ?")
         params.append(f"%{search}%")
+
+    if folder:
+        where_clauses.append("p.path LIKE ?")
+        params.append(folder.rstrip("/\\") + "%")
+
+    if untagged_only:
+        where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
 
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     conn = get_connection()
