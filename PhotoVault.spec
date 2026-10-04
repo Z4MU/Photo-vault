@@ -16,22 +16,15 @@ from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
 block_cipher = None
 
 # ── Archivos fuente del proyecto ──────────────────────────────────────────────
-src_files = [
-    'main.py',
-    'database.py',
-    'models.py',
-    'services.py',
-    'indexer.py',
-    'thumbnail_cache.py',
-    'backup.py',
-    'logging_setup.py',
-    'xmp_sidecar.py',
-]
+# No hace falta listarlos: PyInstaller sigue los imports desde main.py
+# (incluido el paquete ui/). Solo los archivos que NO son .py van en `datas`.
 
 # ── Datos extra a empaquetar (recursos no-.py) ────────────────────────────────
+datas = [
+    ('ui/dark.qss', 'ui'),   # Hoja de estilos (ui/style.py la lee al importar)
+]
 # PyQt6 necesita sus archivos de plugins para funcionar correctamente.
 # collect_data_files hace el trabajo pesado de localizarlos.
-datas = []
 datas += collect_data_files('PyQt6')
 
 # Si pillow-heif está instalado, incluir sus datos también

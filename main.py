@@ -2,23 +2,19 @@
 PhotoVault - main.py
 Punto de entrada: logging, backup diario, migraciones de la DB y ventana principal.
 La interfaz está en el paquete ui/.
+
+Importante: aquí arriba solo se importa lo mínimo para configurar el logging.
+El resto (PyQt, Pillow, la UI…) se importa dentro de main(), DESPUÉS de
+setup_logging(), para que cualquier fallo al importar quede en el log; el .exe
+no tiene consola y si no, se cerraría sin dejar rastro.
 """
 
 import logging
 import sys
 
-from PyQt6.QtWidgets import QApplication, QMessageBox
-
-import backup
-import database as db
 import logging_setup
-import services
-from ui.main_window import MainWindow
 
 logger = logging.getLogger(__name__)
-
-
-# ─── Entry point ──────────────────────────────────────────────────────────────
 
 
 def _startup() -> bool:
@@ -26,6 +22,12 @@ def _startup() -> bool:
     Backup diario + migraciones de la DB. Devuelve False si la app no debe
     abrirse (el error ya se mostró al usuario).
     """
+    from PyQt6.QtWidgets import QMessageBox
+
+    import backup
+    import database as db
+    import services
+
     backup.daily_backup(db.DB_PATH)
     try:
         db.init_db()
@@ -50,16 +52,31 @@ def _startup() -> bool:
     return True
 
 
-if __name__ == "__main__":
+def main() -> int:
     logging_setup.setup_logging()
+    try:
+        from PyQt6.QtWidgets import QApplication
+
+        import config
+        import database as db
+        from ui.main_window import MainWindow
+    except Exception:
+        logger.critical("No se pudo cargar la aplicación", exc_info=True)
+        return 2
+
     app = QApplication(sys.argv)
-    app.setApplicationName("PhotoVault")
+    app.setApplicationName(config.APP_NAME)
+    app.setApplicationVersion(config.APP_VERSION)
     logging_setup.install_qt_handlers()
-    logger.info("PhotoVault iniciando (esquema DB v%d)", db.SCHEMA_VERSION)
+    logger.info("%s %s iniciando (esquema DB v%d)", config.APP_NAME, config.APP_VERSION, db.SCHEMA_VERSION)
     if not _startup():
-        sys.exit(1)
+        return 1
     window = MainWindow()
     window.show()
     code = app.exec()
     logger.info("PhotoVault cerrado (código %d)", code)
-    sys.exit(code)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
