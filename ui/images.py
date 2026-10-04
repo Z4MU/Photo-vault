@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Utilidades de imagen ─────────────────────────────────────────────────────
 
+
 def load_preview_pixmap(path: str, max_side: int) -> QPixmap | None:
     """
     Carga una imagen grande para mostrarla, ya escalada y con la orientación

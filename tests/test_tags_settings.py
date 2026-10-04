@@ -17,6 +17,7 @@ def _tag(name: str):
 
 # ── Editar etiquetas ──────────────────────────────────────────────────────────
 
+
 def test_editar_tag_conserva_asignaciones():
     pid = db.upsert_photo(r"C:\a.jpg", "a.jpg", 2020, 1, 1)
     tag = _tag("meme")
@@ -57,18 +58,20 @@ def test_add_tag_devuelve_el_tag():
 
 # ── Tags ocultos del sidebar ─────────────────────────────────────────────────
 
+
 def test_tags_ocultos_se_pueden_listar_para_restaurarlos():
     tag = _tag("meme")
     services.set_tag_sidebar_hidden(tag.id, True)
 
     visibles = [t.id for ts in services.get_sidebar_tags().values() for t in ts]
-    todos    = [t.id for ts in services.get_sidebar_tags(include_hidden=True).values() for t in ts]
+    todos = [t.id for ts in services.get_sidebar_tags(include_hidden=True).values() for t in ts]
     assert tag.id not in visibles
     assert tag.id in todos
     assert services.count_sidebar_hidden_tags() == 1
 
 
 # ── Tamaño de página ─────────────────────────────────────────────────────────
+
 
 def test_tamano_de_pagina_por_defecto():
     assert services.get_page_size() == services.PAGE_SIZE_DEFAULT

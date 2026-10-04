@@ -17,9 +17,9 @@ Correcciones aplicadas:
 
 import logging
 import re
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from PIL import Image
 
@@ -33,20 +33,41 @@ logger = logging.getLogger(__name__)
 # pero no generan miniatura. Con él se comportan como cualquier imagen.
 try:
     from pillow_heif import register_heif_opener
+
     register_heif_opener()
     _HEIF_AVAILABLE = True
 except ImportError:
     _HEIF_AVAILABLE = False
 
 IMAGE_EXTENSIONS = {
-    ".jpg", ".jpeg", ".png", ".gif", ".bmp",
-    ".webp", ".tiff", ".tif", ".heic", ".heif", ".avif"
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".bmp",
+    ".webp",
+    ".tiff",
+    ".tif",
+    ".heic",
+    ".heif",
+    ".avif",
 }
 
 VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".avi", ".mov", ".wmv",
-    ".flv", ".webm", ".m4v", ".mpg", ".mpeg",
-    ".3gp", ".ts", ".mts", ".m2ts"
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".wmv",
+    ".flv",
+    ".webm",
+    ".m4v",
+    ".mpg",
+    ".mpeg",
+    ".3gp",
+    ".ts",
+    ".mts",
+    ".m2ts",
 }
 
 SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
@@ -70,13 +91,10 @@ SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 DATE_PATTERNS = [
     # 2020-05-12 / 2020/05/12 / 2020_05_12  (separadores explícitos)
     r"(\d{4})[_\-/\\](\d{1,2})[_\-/\\](\d{1,2})",
-
     # 20200512  — solo si NO está rodeado de otros dígitos (evita resoluciones)
     r"(?<!\d)(\d{4})(\d{2})(\d{2})(?!\d)",
-
     # IMG_20200512 / VID_20200512 / IMG-20200512-WA0001
     r"(?:IMG|VID)[_\-](\d{4})(\d{2})(\d{2})",
-
     # 2020-05 (sin día)
     r"(\d{4})[_\-](\d{2})(?![_\-\d])",
 ]
@@ -90,9 +108,9 @@ _COMPILED_PATTERNS = [re.compile(p) for p in DATE_PATTERNS]
 #   DateTimeDigitized (36868, IFD Exif) — cuándo se digitalizó (escaneos)
 #   DateTime          (306,   IFD0)     — última MODIFICACIÓN: solo como último recurso
 _EXIF_IFD = 0x8769
-_TAG_DATETIME_ORIGINAL  = 36867
+_TAG_DATETIME_ORIGINAL = 36867
 _TAG_DATETIME_DIGITIZED = 36868
-_TAG_DATETIME           = 306
+_TAG_DATETIME = 306
 
 
 def _parse_exif_date(value) -> tuple[int, int] | None:
@@ -116,9 +134,11 @@ def _extract_date_from_exif(path: str) -> tuple[int | None, int | None]:
             if not exif:
                 return None, None
             exif_ifd = exif.get_ifd(_EXIF_IFD)
-            for value in (exif_ifd.get(_TAG_DATETIME_ORIGINAL),
-                          exif_ifd.get(_TAG_DATETIME_DIGITIZED),
-                          exif.get(_TAG_DATETIME)):
+            for value in (
+                exif_ifd.get(_TAG_DATETIME_ORIGINAL),
+                exif_ifd.get(_TAG_DATETIME_DIGITIZED),
+                exif.get(_TAG_DATETIME),
+            ):
                 parsed = _parse_exif_date(value)
                 if parsed:
                     return parsed
@@ -168,14 +188,15 @@ def _get_video_info(path: str):
     """Extrae duración (segundos) y dimensiones del video usando opencv."""
     try:
         import cv2
+
         cap = cv2.VideoCapture(path)
         if not cap.isOpened():
             return None, None, None
-        fps         = cap.get(cv2.CAP_PROP_FPS) or 0
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
         frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-        width       = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height      = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration    = (frame_count / fps) if fps > 0 else None
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        duration = (frame_count / fps) if fps > 0 else None
         cap.release()
         return duration, width or None, height or None
     except Exception as e:
@@ -189,12 +210,15 @@ def extract_video_thumbnail(path: str, size: int = 200) -> bytes | None:
     Usar thumbnail_cache.get_video_thumbnail() directamente en código nuevo.
     """
     from thumbnail_cache import get_video_thumbnail
+
     return get_video_thumbnail(path, size=size)
 
 
-def index_folder(folder: str,
-                 progress_callback: Callable[[int, int, str], None] | None = None,
-                 should_stop: Callable[[], bool] | None = None) -> tuple[int, int, int]:
+def index_folder(
+    folder: str,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+) -> tuple[int, int, int]:
     """
     Escanea una carpeta recursivamente e indexa imágenes y videos.
     progress_callback(current, total, filepath) se llama por cada archivo.
@@ -205,13 +229,10 @@ def index_folder(folder: str,
     if not root.exists():
         raise ValueError(f"La carpeta no existe: {root}")
 
-    all_files = [
-        p for p in root.rglob("*")
-        if p.suffix.lower() in SUPPORTED_EXTENSIONS and p.is_file()
-    ]
+    all_files = [p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_EXTENSIONS and p.is_file()]
 
-    total  = len(all_files)
-    added  = updated = errors = 0
+    total = len(all_files)
+    added = updated = errors = 0
 
     for i, filepath in enumerate(all_files):
         if should_stop and should_stop():
@@ -221,11 +242,11 @@ def index_folder(folder: str,
             progress_callback(i + 1, total, str(filepath))
 
         try:
-            path_str   = str(filepath)
-            filename   = filepath.name
-            filesize   = filepath.stat().st_size
-            ext        = filepath.suffix.lower()
-            is_video   = ext in VIDEO_EXTENSIONS
+            path_str = str(filepath)
+            filename = filepath.name
+            filesize = filepath.stat().st_size
+            ext = filepath.suffix.lower()
+            is_video = ext in VIDEO_EXTENSIONS
             media_type = "video" if is_video else "image"
 
             # ── Fecha ──────────────────────────────────────────────────────
@@ -248,10 +269,7 @@ def index_folder(folder: str,
                 duration = None
 
             existed = db.photo_exists(path_str)
-            db.upsert_photo(
-                path_str, filename, year, month, filesize,
-                width, height, media_type, duration
-            )
+            db.upsert_photo(path_str, filename, year, month, filesize, width, height, media_type, duration)
             if existed:
                 updated += 1
             else:

@@ -34,6 +34,7 @@ def _user_version(path) -> int:
 
 # ── DB nueva ──────────────────────────────────────────────────────────────────
 
+
 def test_db_nueva_crea_esquema_y_version(db_path):
     db.init_db()
     assert {"photos", "tags", "photo_tags", "categories", "app_settings"} <= _tables(db_path)
@@ -66,6 +67,7 @@ def test_init_db_es_idempotente(db_path):
 
 # ── Regresión: lo que el usuario borra no reaparece ──────────────────────────
 
+
 def test_tag_borrado_no_reaparece(db_path):
     db.init_db()
     tag = next(t for t in db.get_all_tags() if t.name == "meme")
@@ -85,12 +87,13 @@ def test_categoria_borrada_no_reaparece(db_path):
 
 # ── DB vieja (V1) ─────────────────────────────────────────────────────────────
 
+
 def test_migra_db_vieja_sin_perder_datos(db_path):
     make_legacy_db(db_path)
     db.init_db()
 
     cols_photos = db._columns(db.get_connection(), "photos")
-    cols_tags   = db._columns(db.get_connection(), "tags")
+    cols_tags = db._columns(db.get_connection(), "tags")
     assert {"media_type", "duration", "md5"} <= cols_photos
     assert "sidebar_hidden" in cols_tags
     assert "idx_photos_md5" in _indexes(db_path)
@@ -144,6 +147,7 @@ def test_si_el_backup_falla_no_se_migra(db_path, monkeypatch):
 
 
 # ── Transaccionalidad y versiones ────────────────────────────────────────────
+
 
 def test_migracion_fallida_hace_rollback(db_path, monkeypatch):
     db.init_db()

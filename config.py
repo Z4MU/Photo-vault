@@ -9,32 +9,32 @@ los tests puedan redirigirlas con monkeypatch. Cambia el valor aquí, no allá.
 
 from pathlib import Path
 
-APP_NAME    = "PhotoVault"
+APP_NAME = "PhotoVault"
 APP_VERSION = "1.2.0"
 
 # ── Datos del usuario (fuera del repo) ────────────────────────────────────────
-DATA_DIR   = Path.home() / ".photovault"
-DB_PATH    = DATA_DIR / "photovault.db"
+DATA_DIR = Path.home() / ".photovault"
+DB_PATH = DATA_DIR / "photovault.db"
 THUMBS_DIR = DATA_DIR / "thumbs"
 BACKUP_DIR = DATA_DIR / "backups"
-LOG_DIR    = DATA_DIR / "logs"
+LOG_DIR = DATA_DIR / "logs"
 
 # ── Miniaturas (lado máximo en píxeles) ───────────────────────────────────────
-THUMB_SIZE_SMALL   = 100   # vista de duplicados
-THUMB_SIZE_GALLERY = 200   # galería
-THUMB_SIZE_LARGE   = 480   # etiquetado rápido, detalle de videos
+THUMB_SIZE_SMALL = 100  # vista de duplicados
+THUMB_SIZE_GALLERY = 200  # galería
+THUMB_SIZE_LARGE = 480  # etiquetado rápido, detalle de videos
 
 # ── Paleta del tema oscuro (también usada en ui/dark.qss) ─────────────────────
 COLORS = {
-    "bg":        "#0D0D1A",
-    "panel":     "#13131F",
+    "bg": "#0D0D1A",
+    "panel": "#13131F",
     "panel_alt": "#1E1E2E",
-    "border":    "#2D2D3F",
+    "border": "#2D2D3F",
     "border_alt": "#3A3A5A",
-    "text":      "#D0D0E8",
-    "text_dim":  "#8888AA",
-    "accent":    "#4A9EFF",
-    "danger":    "#FF4A4A",
-    "warning":   "#FFD700",
-    "success":   "#4AFF9E",
+    "text": "#D0D0E8",
+    "text_dim": "#8888AA",
+    "accent": "#4A9EFF",
+    "danger": "#FF4A4A",
+    "warning": "#FFD700",
+    "success": "#4AFF9E",
 }

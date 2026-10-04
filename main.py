@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
+
 def _startup() -> bool:
     """
     Backup diario + migraciones de la DB. Devuelve False si la app no debe
@@ -35,7 +36,8 @@ def _startup() -> bool:
     except Exception as e:
         logger.exception("No se pudo inicializar la base de datos")
         QMessageBox.critical(
-            None, "Error al abrir la base de datos",
+            None,
+            "Error al abrir la base de datos",
             f"No se pudo preparar la base de datos:\n\n{e}\n\n"
             f"No se hicieron cambios. Detalles en:\n{logging_setup.LOG_FILE}",
         )

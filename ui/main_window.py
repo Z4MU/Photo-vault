@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
 
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -55,21 +56,21 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1100, 700)
         self.setStyleSheet(DARK_STYLE)
 
-        self._active_tags:    list[int]                 = []
-        self._offset:         int                       = 0
-        self._page_size:      int                       = services.get_page_size()
-        self._sort_field:     SortField                 = SortField.DATE
-        self._sort_order:     SortOrder                 = SortOrder.DESC
-        self._current_page:   GalleryPage | None        = None
-        self._thumbnails:     dict[int, PhotoThumbnail] = {}
-        self._pending_photos: list                      = []
-        self._grid_cols:      int                       = 4
-        self._loader:         ThumbnailLoader | None    = None
-        self._select_mode:    bool                      = False
-        self._selected_ids:   set[int]                  = set()
-        self._show_sidebar_hidden: bool                 = False
+        self._active_tags: list[int] = []
+        self._offset: int = 0
+        self._page_size: int = services.get_page_size()
+        self._sort_field: SortField = SortField.DATE
+        self._sort_order: SortOrder = SortOrder.DESC
+        self._current_page: GalleryPage | None = None
+        self._thumbnails: dict[int, PhotoThumbnail] = {}
+        self._pending_photos: list = []
+        self._grid_cols: int = 4
+        self._loader: ThumbnailLoader | None = None
+        self._select_mode: bool = False
+        self._selected_ids: set[int] = set()
+        self._show_sidebar_hidden: bool = False
 
-        self._build_timer  = QTimer(self)
+        self._build_timer = QTimer(self)
         self._build_timer.setInterval(0)
         self._build_timer.timeout.connect(self._add_next_batch)
 
@@ -87,28 +88,35 @@ class MainWindow(QMainWindow):
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        central = QWidget(); self.setCentralWidget(central)
-        root    = QHBoxLayout(central)
-        root.setContentsMargins(0,0,0,0); root.setSpacing(0)
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QHBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
         # ── Sidebar ────────────────────────────────────────────────────────
-        sidebar = QWidget(); sidebar.setFixedWidth(220)
+        sidebar = QWidget()
+        sidebar.setFixedWidth(220)
         sidebar.setStyleSheet("background:#13131F;border-right:1px solid #2D2D3F;")
-        sb = QVBoxLayout(sidebar); sb.setContentsMargins(10,16,10,16); sb.setSpacing(8)
+        sb = QVBoxLayout(sidebar)
+        sb.setContentsMargins(10, 16, 10, 16)
+        sb.setSpacing(8)
 
         logo = QLabel("📸 PhotoVault")
         logo.setStyleSheet("font-size:18px;font-weight:bold;color:#4A9EFF;margin-bottom:8px;")
         sb.addWidget(logo)
 
         for label, slot in [
-            ("＋ Indexar carpeta",     self._open_index_dialog),
+            ("＋ Indexar carpeta", self._open_index_dialog),
             ("🏷  Gestionar etiquetas", self._open_tag_manager),
-            ("🗂  Carpetas",            self._open_deindex_dialog),
-            ("📊  Estadísticas",        self._open_stats_dialog),
-            ("🔍  Duplicados",          self._open_duplicates_dialog),
-            ("⚙  Configuración",       self._open_settings_dialog),
+            ("🗂  Carpetas", self._open_deindex_dialog),
+            ("📊  Estadísticas", self._open_stats_dialog),
+            ("🔍  Duplicados", self._open_duplicates_dialog),
+            ("⚙  Configuración", self._open_settings_dialog),
         ]:
-            btn = QPushButton(label); btn.clicked.connect(slot); sb.addWidget(btn)
+            btn = QPushButton(label)
+            btn.clicked.connect(slot)
+            sb.addWidget(btn)
 
         # Botón de etiquetado rápido — destacado visualmente
         btn_qt = QPushButton("⚡  Etiquetado rápido")
@@ -120,14 +128,19 @@ class MainWindow(QMainWindow):
         btn_qt.clicked.connect(self._open_quick_tag)
         sb.addWidget(btn_qt)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;"); sb.addWidget(sep)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#2D2D3F;")
+        sb.addWidget(sep)
         sb.addWidget(QLabel("Filtrar por etiqueta:"))
 
-        self.tag_scroll = QScrollArea(); self.tag_scroll.setWidgetResizable(True)
+        self.tag_scroll = QScrollArea()
+        self.tag_scroll.setWidgetResizable(True)
         self.tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.tag_widget = QWidget(); self.tag_vbox = QVBoxLayout(self.tag_widget)
-        self.tag_vbox.setContentsMargins(0,0,0,0); self.tag_vbox.setSpacing(2)
+        self.tag_widget = QWidget()
+        self.tag_vbox = QVBoxLayout(self.tag_widget)
+        self.tag_vbox.setContentsMargins(0, 0, 0, 0)
+        self.tag_vbox.setSpacing(2)
         self.tag_scroll.setWidget(self.tag_widget)
         sb.addWidget(self.tag_scroll, stretch=1)
 
@@ -142,16 +155,20 @@ class MainWindow(QMainWindow):
         sb.addWidget(self.btn_show_hidden)
 
         btn_clear = QPushButton("✕ Limpiar filtros")
-        btn_clear.setStyleSheet("color:#FF4A4A;"); btn_clear.clicked.connect(self._clear_filters)
+        btn_clear.setStyleSheet("color:#FF4A4A;")
+        btn_clear.clicked.connect(self._clear_filters)
         sb.addWidget(btn_clear)
 
-        self.stats_lbl = QLabel(""); self.stats_lbl.setStyleSheet("color:#666;font-size:10px;")
+        self.stats_lbl = QLabel("")
+        self.stats_lbl.setStyleSheet("color:#666;font-size:10px;")
         sb.addWidget(self.stats_lbl)
         root.addWidget(sidebar)
 
         # ── Área principal ─────────────────────────────────────────────────
-        main_area = QWidget(); ml = QVBoxLayout(main_area)
-        ml.setContentsMargins(12,12,12,12); ml.setSpacing(8)
+        main_area = QWidget()
+        ml = QVBoxLayout(main_area)
+        ml.setContentsMargins(12, 12, 12, 12)
+        ml.setSpacing(8)
 
         # Barra superior
         top_bar = QHBoxLayout()
@@ -170,11 +187,12 @@ class MainWindow(QMainWindow):
 
         self.sort_order_combo = QComboBox()
         self.sort_order_combo.addItem("↓ desc", userData=SortOrder.DESC)
-        self.sort_order_combo.addItem("↑ asc",  userData=SortOrder.ASC)
+        self.sort_order_combo.addItem("↑ asc", userData=SortOrder.ASC)
         self.sort_order_combo.currentIndexChanged.connect(self._on_sort_changed)
         top_bar.addWidget(self.sort_order_combo)
 
-        self.count_lbl = QLabel("0 fotos"); self.count_lbl.setStyleSheet("color:#8888AA;")
+        self.count_lbl = QLabel("0 fotos")
+        self.count_lbl.setStyleSheet("color:#8888AA;")
         top_bar.addWidget(self.count_lbl)
 
         # ── FEATURE: modo selección ───────────────────────────────────────
@@ -192,16 +210,23 @@ class MainWindow(QMainWindow):
 
         ml.addLayout(top_bar)
 
-        self.scroll_area = QScrollArea(); self.scroll_area.setWidgetResizable(True)
-        self.grid_widget = QWidget(); self.grid_layout = QGridLayout(self.grid_widget)
-        self.grid_layout.setSpacing(8); self.scroll_area.setWidget(self.grid_widget)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.grid_widget = QWidget()
+        self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(8)
+        self.scroll_area.setWidget(self.grid_widget)
         ml.addWidget(self.scroll_area, stretch=1)
 
         pg_bar = QHBoxLayout()
-        self.prev_btn = QPushButton("← Anterior"); self.prev_btn.clicked.connect(self._prev_page)
-        self.next_btn = QPushButton("Siguiente →"); self.next_btn.clicked.connect(self._next_page)
-        self.page_lbl = QLabel(""); self.page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pg_bar.addWidget(self.prev_btn); pg_bar.addWidget(self.page_lbl, stretch=1)
+        self.prev_btn = QPushButton("← Anterior")
+        self.prev_btn.clicked.connect(self._prev_page)
+        self.next_btn = QPushButton("Siguiente →")
+        self.next_btn.clicked.connect(self._next_page)
+        self.page_lbl = QLabel("")
+        self.page_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pg_bar.addWidget(self.prev_btn)
+        pg_bar.addWidget(self.page_lbl, stretch=1)
         pg_bar.addWidget(self.next_btn)
         ml.addLayout(pg_bar)
 
@@ -218,14 +243,16 @@ class MainWindow(QMainWindow):
         self.btn_show_hidden.setChecked(self._show_sidebar_hidden)
         self.btn_show_hidden.blockSignals(False)
         self.btn_show_hidden.setText(
-            f"🚫 Ocultar escondidas ({n_hidden})" if self._show_sidebar_hidden
+            f"🚫 Ocultar escondidas ({n_hidden})"
+            if self._show_sidebar_hidden
             else f"👁 Mostrar escondidas ({n_hidden})"
         )
 
         groups = services.get_sidebar_tags(include_hidden=self._show_sidebar_hidden)
         for category, tags in groups.items():
             header = QPushButton(f"▾  {category.upper()}")
-            header.setCheckable(True); header.setChecked(True)
+            header.setCheckable(True)
+            header.setChecked(True)
             header.setStyleSheet("""
                 QPushButton { background:#1A1A2E;color:#6688AA;border:none;
                     border-top:1px solid #2D2D3F;border-radius:0;
@@ -233,33 +260,46 @@ class MainWindow(QMainWindow):
                     font-weight:bold;letter-spacing:1px; }
                 QPushButton:hover { color:#88AACC;background:#1E1E2E; }
             """)
-            group_widget = QWidget(); gv = QVBoxLayout(group_widget)
-            gv.setContentsMargins(8,0,0,4); gv.setSpacing(1)
+            group_widget = QWidget()
+            gv = QVBoxLayout(group_widget)
+            gv.setContentsMargins(8, 0, 0, 4)
+            gv.setSpacing(1)
             for tag in tags:
-                row = QWidget(); hl = QHBoxLayout(row)
-                hl.setContentsMargins(0,0,0,0); hl.setSpacing(4)
+                row = QWidget()
+                hl = QHBoxLayout(row)
+                hl.setContentsMargins(0, 0, 0, 0)
+                hl.setSpacing(4)
                 chk = QCheckBox(tag.name)
                 # Las escondidas se ven en cursiva mientras se muestran
                 italic = "font-style:italic;" if tag.sidebar_hidden else ""
                 chk.setStyleSheet(f"color:{tag.color};{italic}")
                 chk.setProperty("tag_id", tag.id)
-                if tag.id in self._active_tags: chk.setChecked(True)
+                if tag.id in self._active_tags:
+                    chk.setChecked(True)
                 chk.stateChanged.connect(self._on_tag_filter_changed)
                 hl.addWidget(chk, stretch=1)
                 eye = QPushButton("👁" if not tag.sidebar_hidden else "🚫")
-                eye.setToolTip("Volver a mostrar en el sidebar" if tag.sidebar_hidden
-                               else "Esconder del sidebar")
-                eye.setFixedSize(22,22)
-                eye.setStyleSheet("QPushButton{background:transparent;border:none;font-size:11px;padding:0;}"
-                                  "QPushButton:hover{background:#2D2D3F;border-radius:4px;}")
-                eye.clicked.connect(lambda _, tid=tag.id, cur=tag.sidebar_hidden:
-                    self._toggle_sidebar_hidden(tid, cur))
-                hl.addWidget(eye); gv.addWidget(row)
-            header.toggled.connect(lambda checked, gw=group_widget, btn=header: (
-                gw.setVisible(checked),
-                btn.setText(f"{'▾' if checked else '▸'}  {btn.text()[2:]}")
-            ))
-            self.tag_vbox.addWidget(header); self.tag_vbox.addWidget(group_widget)
+                eye.setToolTip(
+                    "Volver a mostrar en el sidebar" if tag.sidebar_hidden else "Esconder del sidebar"
+                )
+                eye.setFixedSize(22, 22)
+                eye.setStyleSheet(
+                    "QPushButton{background:transparent;border:none;font-size:11px;padding:0;}"
+                    "QPushButton:hover{background:#2D2D3F;border-radius:4px;}"
+                )
+                eye.clicked.connect(
+                    lambda _, tid=tag.id, cur=tag.sidebar_hidden: self._toggle_sidebar_hidden(tid, cur)
+                )
+                hl.addWidget(eye)
+                gv.addWidget(row)
+            header.toggled.connect(
+                lambda checked, gw=group_widget, btn=header: (
+                    gw.setVisible(checked),
+                    btn.setText(f"{'▾' if checked else '▸'}  {btn.text()[2:]}"),
+                )
+            )
+            self.tag_vbox.addWidget(header)
+            self.tag_vbox.addWidget(group_widget)
 
         self.tag_vbox.addStretch()
         self._update_stats()
@@ -275,31 +315,39 @@ class MainWindow(QMainWindow):
         self._refresh_tags()
 
     def _sidebar_checkboxes(self) -> list[QCheckBox]:
-        return [chk for w in layout_widgets(self.tag_vbox) for chk in w.findChildren(QCheckBox)
-                if chk.property("tag_id") is not None]
+        return [
+            chk
+            for w in layout_widgets(self.tag_vbox)
+            for chk in w.findChildren(QCheckBox)
+            if chk.property("tag_id") is not None
+        ]
 
     def _on_tag_filter_changed(self):
-        self._active_tags = [chk.property("tag_id") for chk in self._sidebar_checkboxes()
-                             if chk.isChecked()]
-        self._offset = 0; self._load_photos()
+        self._active_tags = [chk.property("tag_id") for chk in self._sidebar_checkboxes() if chk.isChecked()]
+        self._offset = 0
+        self._load_photos()
 
     def _clear_filters(self):
         self._active_tags = []
         for chk in self._sidebar_checkboxes():
-            chk.blockSignals(True); chk.setChecked(False); chk.blockSignals(False)
-        self._offset = 0; self._load_photos()
+            chk.blockSignals(True)
+            chk.setChecked(False)
+            chk.blockSignals(False)
+        self._offset = 0
+        self._load_photos()
 
     # ── Ordenamiento ──────────────────────────────────────────────────────────
 
     def _on_sort_changed(self):
         self._sort_field = self.sort_field_combo.currentData()
         self._sort_order = self.sort_order_combo.currentData()
-        self._offset = 0; self._load_photos()
+        self._offset = 0
+        self._load_photos()
 
     # ── Modo selección ────────────────────────────────────────────────────────
 
     def _toggle_select_mode(self, checked: bool):
-        self._select_mode  = checked
+        self._select_mode = checked
         self._selected_ids = set()
         self.btn_bulk_tag.setVisible(checked)
         self.btn_select.setText("✓ Cancelar selección" if checked else "☐ Seleccionar")
@@ -333,18 +381,19 @@ class MainWindow(QMainWindow):
             self._loader = None
 
     def _load_photos(self):
-        self._build_timer.stop(); self._stop_loader()
+        self._build_timer.stop()
+        self._stop_loader()
         clear_layout(self.grid_layout)
         self._thumbnails.clear()
 
         search = self.search_edit.text().strip() or None
         self._current_page = services.get_gallery_page(
-            tag_ids    = self._active_tags or None,
-            search     = search,
-            limit      = self._page_size,
-            offset     = self._offset,
-            sort_field = self._sort_field,
-            sort_order = self._sort_order,
+            tag_ids=self._active_tags or None,
+            search=search,
+            limit=self._page_size,
+            offset=self._offset,
+            sort_field=self._sort_field,
+            sort_order=self._sort_order,
         )
 
         self.count_lbl.setText(f"{self._current_page.total:,} fotos")
@@ -373,7 +422,7 @@ class MainWindow(QMainWindow):
             self._build_timer.stop()
             loader = ThumbnailLoader(self._current_page.photos)
             loader.loaded.connect(self._on_thumb_loaded)
-            loader.finished.connect(lambda l=loader: self._on_loader_finished(l))
+            loader.finished.connect(lambda ldr=loader: self._on_loader_finished(ldr))
             self._loader = loader
             loader.start()
 
@@ -387,66 +436,83 @@ class MainWindow(QMainWindow):
             self._thumbnails[photo_id].set_pixmap(QPixmap.fromImage(img))
 
     def _on_search(self):
-        self._offset = 0; self._load_photos()
+        self._offset = 0
+        self._load_photos()
 
     # ── Paginación ────────────────────────────────────────────────────────────
 
     def _update_pagination(self):
-        if not self._current_page: return
+        if not self._current_page:
+            return
         p = self._current_page
         self.page_lbl.setText(f"Página {p.page_number} / {p.total_pages}")
         self.prev_btn.setEnabled(p.has_prev)
         self.next_btn.setEnabled(p.has_next)
 
     def _prev_page(self):
-        self._offset = max(0, self._offset - self._page_size); self._load_photos()
+        self._offset = max(0, self._offset - self._page_size)
+        self._load_photos()
 
     def _next_page(self):
-        self._offset += self._page_size; self._load_photos()
+        self._offset += self._page_size
+        self._load_photos()
 
     # ── Resize ────────────────────────────────────────────────────────────────
 
     def resizeEvent(self, event):
-        super().resizeEvent(event); self._resize_timer.start()
+        super().resizeEvent(event)
+        self._resize_timer.start()
 
     def _on_resize_settled(self):
         new_cols = max(1, (self.scroll_area.width() - 30) // 218)
         if new_cols != self._last_grid_cols:
-            self._last_grid_cols = new_cols; self._load_photos()
+            self._last_grid_cols = new_cols
+            self._load_photos()
 
     # ── Acciones ──────────────────────────────────────────────────────────────
 
     def _open_photo(self, photo_id: int):
-        if not self._current_page: return
+        if not self._current_page:
+            return
         photo = next((p for p in self._current_page.photos if p.id == photo_id), None)
-        if not photo: return
+        if not photo:
+            return
         dlg = PhotoDetailDialog(photo, self)
-        dlg.tags_changed.connect(self._load_photos); dlg.exec()
+        dlg.tags_changed.connect(self._load_photos)
+        dlg.exec()
 
     def _open_index_dialog(self):
-        dlg = IndexDialog(self); dlg.indexing_done.connect(self._on_index_done); dlg.exec()
+        dlg = IndexDialog(self)
+        dlg.indexing_done.connect(self._on_index_done)
+        dlg.exec()
 
     def _on_index_done(self):
-        self._refresh_tags(); self._load_photos()
+        self._refresh_tags()
+        self._load_photos()
 
     def _open_tag_manager(self):
-        TagManagerDialog(self).exec(); self._refresh_tags(); self._load_photos()
+        TagManagerDialog(self).exec()
+        self._refresh_tags()
+        self._load_photos()
 
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self._page_size, self)
         if dlg.exec():
             self._page_size = dlg.page_size
             services.set_page_size(self._page_size)
-            self._offset = 0; self._load_photos()
+            self._offset = 0
+            self._load_photos()
 
     def _open_deindex_dialog(self):
-        DeindexDialog(self).exec(); self._load_photos()
+        DeindexDialog(self).exec()
+        self._load_photos()
 
     def _open_stats_dialog(self):
         StatsDialog(self).exec()
 
     def _open_duplicates_dialog(self):
-        DuplicatesDialog(self).exec(); self._load_photos()
+        DuplicatesDialog(self).exec()
+        self._load_photos()
 
     def _update_stats(self):
         stats = services.get_stats()
@@ -457,19 +523,20 @@ class MainWindow(QMainWindow):
         if setup.exec() != QDialog.DialogCode.Accepted:
             return
         photos = services.get_photos_for_tagging(
-            folder        = setup.selected_folder,
-            tag_ids       = setup.selected_tag_ids or None,
-            untagged_only = setup.untagged_only,
+            folder=setup.selected_folder,
+            tag_ids=setup.selected_tag_ids or None,
+            untagged_only=setup.untagged_only,
         )
         if not photos:
-            QMessageBox.information(self, "Sin fotos",
-                "No se encontraron fotos con ese filtro.")
+            QMessageBox.information(self, "Sin fotos", "No se encontraron fotos con ese filtro.")
             return
         win = QuickTagWindow(photos, self)
         win.done_signal.connect(self._load_photos)
         win.exec()
 
     def closeEvent(self, event):
-        self._build_timer.stop(); self._stop_loader()
+        self._build_timer.stop()
+        self._stop_loader()
         wait_all_threads()
-        db.close_connection(); super().closeEvent(event)
+        db.close_connection()
+        super().closeEvent(event)

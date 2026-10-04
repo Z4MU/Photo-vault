@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Dialog: Ver/editar foto ──────────────────────────────────────────────────
 
+
 class PhotoDetailDialog(QDialog):
     tags_changed = pyqtSignal()
 
@@ -52,15 +53,20 @@ class PhotoDetailDialog(QDialog):
         layout.setSpacing(12)
 
         if self.photo.is_video:
-            left = QWidget(); left.setMinimumWidth(500)
-            ll   = QVBoxLayout(left)
+            left = QWidget()
+            left.setMinimumWidth(500)
+            ll = QVBoxLayout(left)
             ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
             thumb = thumbnail_cache.get_video_thumbnail(self.photo.path, size=config.THUMB_SIZE_LARGE)
-            lbl   = QLabel(); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl = QLabel()
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             if thumb:
-                pix = QPixmap(); pix.loadFromData(thumb); lbl.setPixmap(pix)
+                pix = QPixmap()
+                pix.loadFromData(thumb)
+                lbl.setPixmap(pix)
             else:
-                lbl.setText("🎬"); lbl.setStyleSheet("font-size:64px;")
+                lbl.setText("🎬")
+                lbl.setStyleSheet("font-size:64px;")
             ll.addWidget(lbl)
             btn = QPushButton("▶  Reproducir")
             btn.setStyleSheet(
@@ -72,7 +78,8 @@ class PhotoDetailDialog(QDialog):
             ll.addWidget(btn)
             layout.addWidget(left)
         else:
-            img = QLabel(); img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            img = QLabel()
+            img.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img.setMinimumWidth(500)
             preview = load_preview_pixmap(self.photo.path, 560)
             if preview is not None:
@@ -81,26 +88,31 @@ class PhotoDetailDialog(QDialog):
                 img.setText("No se pudo cargar la imagen")
             layout.addWidget(img)
 
-        right = QVBoxLayout(); right.setSpacing(10)
+        right = QVBoxLayout()
+        right.setSpacing(10)
         right.addWidget(QLabel(f"<b>{html.escape(Path(self.photo.path).name)}</b>"))
         right.addWidget(QLabel("Etiquetas:"))
 
         self.tags_container = QWidget()
-        self.tags_layout    = QHBoxLayout(self.tags_container)
+        self.tags_layout = QHBoxLayout(self.tags_container)
         self.tags_layout.setContentsMargins(0, 0, 0, 0)
         self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        scroll = QScrollArea(); scroll.setWidget(self.tags_container)
-        scroll.setWidgetResizable(True); scroll.setFixedHeight(80)
+        scroll = QScrollArea()
+        scroll.setWidget(self.tags_container)
+        scroll.setWidgetResizable(True)
+        scroll.setFixedHeight(80)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         right.addWidget(scroll)
 
         right.addWidget(QLabel("Agregar etiqueta:"))
         row = QHBoxLayout()
-        self.tag_combo = QComboBox(); self.tag_combo.setEditable(True)
+        self.tag_combo = QComboBox()
+        self.tag_combo.setEditable(True)
         self.tag_combo.setPlaceholderText("Buscar o nueva etiqueta…")
         row.addWidget(self.tag_combo)
-        btn_add = QPushButton("＋ Agregar"); btn_add.clicked.connect(self._add_tag)
+        btn_add = QPushButton("＋ Agregar")
+        btn_add.clicked.connect(self._add_tag)
         row.addWidget(btn_add)
         right.addLayout(row)
         right.addStretch()
@@ -128,14 +140,17 @@ class PhotoDetailDialog(QDialog):
         text = self.tag_combo.currentText().strip().lower()
         if text:
             services.add_tag(self.photo.id, text)
-            self._load_tags(); self.tags_changed.emit()
+            self._load_tags()
+            self.tags_changed.emit()
 
     def _remove_tag(self, tag_id: int):
         services.remove_tag(self.photo.id, tag_id)
-        self._load_tags(); self.tags_changed.emit()
+        self._load_tags()
+        self.tags_changed.emit()
 
 
 # ─── Dialog: Etiquetado en lote ───────────────────────────────────────────────
+
 
 class BulkTagDialog(QDialog):
     """Agrega o quita una etiqueta a todas las fotos seleccionadas."""
@@ -153,13 +168,16 @@ class BulkTagDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(12)
 
-        layout.addWidget(QLabel(
-            f"<b>{len(self.photo_ids)} fotos seleccionadas</b><br>"
-            "<span style='color:#888;font-size:11px;'>"
-            "Escribe o elige una etiqueta y aplica a todas.</span>"
-        ))
+        layout.addWidget(
+            QLabel(
+                f"<b>{len(self.photo_ids)} fotos seleccionadas</b><br>"
+                "<span style='color:#888;font-size:11px;'>"
+                "Escribe o elige una etiqueta y aplica a todas.</span>"
+            )
+        )
 
-        self.combo = QComboBox(); self.combo.setEditable(True)
+        self.combo = QComboBox()
+        self.combo.setEditable(True)
         self.combo.setPlaceholderText("Etiqueta a aplicar…")
         for t in services.get_all_tags():
             self.combo.addItem(t.name, userData=t.id)
@@ -177,7 +195,9 @@ class BulkTagDialog(QDialog):
         btn_cancel = QPushButton("Cancelar")
         btn_cancel.clicked.connect(self.reject)
 
-        row.addWidget(btn_add); row.addWidget(btn_rem); row.addWidget(btn_cancel)
+        row.addWidget(btn_add)
+        row.addWidget(btn_rem)
+        row.addWidget(btn_cancel)
         layout.addLayout(row)
 
     def _add(self):
@@ -195,8 +215,7 @@ class BulkTagDialog(QDialog):
         all_tags = services.get_all_tags()
         tag = next((t for t in all_tags if t.name == name), None)
         if not tag:
-            QMessageBox.warning(self, "No encontrada",
-                                f"La etiqueta '{name}' no existe.")
+            QMessageBox.warning(self, "No encontrada", f"La etiqueta '{name}' no existe.")
             return
         n = services.bulk_remove_tag(self.photo_ids, tag.id)
         QMessageBox.information(self, "Listo", f"Etiqueta '{name}' quitada de {n} fotos.")

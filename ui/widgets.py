@@ -49,6 +49,7 @@ def layout_widgets(layout: QLayout) -> list[QWidget]:
 
 class ClickableRow(QWidget):
     """QWidget que emite `clicked` al hacer clic (en vez de reasignar mousePressEvent)."""
+
     clicked = pyqtSignal()
 
     def mousePressEvent(self, event):
@@ -58,15 +59,16 @@ class ClickableRow(QWidget):
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────
 
+
 class PhotoThumbnail(QFrame):
-    clicked  = pyqtSignal(int)
-    selected = pyqtSignal(int, bool)   # photo_id, is_selected
+    clicked = pyqtSignal(int)
+    selected = pyqtSignal(int, bool)  # photo_id, is_selected
 
     def __init__(self, photo: Photo, selectable: bool = False, parent=None):
         super().__init__(parent)
-        self.photo_id   = photo.id
+        self.photo_id = photo.id
         self.selectable = selectable
-        self._selected  = False
+        self._selected = False
         self.setFixedSize(210, 230)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._update_style()
@@ -90,16 +92,14 @@ class PhotoThumbnail(QFrame):
         if photo.is_video:
             play = QLabel("▶", img_container)
             play.setStyleSheet(
-                "color:white;font-size:28px;background:rgba(0,0,0,0.55);"
-                "border-radius:20px;padding:4px 8px;"
+                "color:white;font-size:28px;background:rgba(0,0,0,0.55);border-radius:20px;padding:4px 8px;"
             )
             play.adjustSize()
             play.move((200 - play.width()) // 2, (200 - play.height()) // 2)
             if photo.duration_str:
                 dur = QLabel(photo.duration_str, img_container)
                 dur.setStyleSheet(
-                    "color:white;font-size:10px;background:rgba(0,0,0,0.7);"
-                    "border-radius:3px;padding:1px 5px;"
+                    "color:white;font-size:10px;background:rgba(0,0,0,0.7);border-radius:3px;padding:1px 5px;"
                 )
                 dur.adjustSize()
                 dur.move(200 - dur.width() - 6, 200 - dur.height() - 6)
@@ -117,9 +117,7 @@ class PhotoThumbnail(QFrame):
                 }
             """)
             self.chk.move(6, 6)
-            self.chk.stateChanged.connect(
-                lambda s: self.selected.emit(self.photo_id, bool(s))
-            )
+            self.chk.stateChanged.connect(lambda s: self.selected.emit(self.photo_id, bool(s)))
 
         layout.addWidget(img_container)
         name_label = QLabel(photo.short_name)

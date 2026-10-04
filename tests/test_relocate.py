@@ -32,12 +32,12 @@ def test_cambio_de_letra_de_unidad(photo):
 
     paths = {x.path for x in db.get_photos()}
     assert paths == {r"E:\Fotos\2020\a.jpg", r"E:\b.jpg", r"H:\c.jpg"}
-    assert [t.name for t in db.get_photo_tags(a)] == ["playa"]        # mismo registro, mismos tags
+    assert [t.name for t in db.get_photo_tags(a)] == ["playa"]  # mismo registro, mismos tags
 
 
 def test_mover_carpeta_a_otra_ruta(photo):
     photo(r"D:\Fotos\sub\a.jpg")
-    photo(r"D:\Fotos2\b.jpg")         # carpeta hermana: no se toca
+    photo(r"D:\Fotos2\b.jpg")  # carpeta hermana: no se toca
     p = services.preview_relocation(r"D:\Fotos", r"E:\Respaldo\Fotos")
     services.apply_relocation(p)
     assert {x.path for x in db.get_photos()} == {r"E:\Respaldo\Fotos\sub\a.jpg", r"D:\Fotos2\b.jpg"}
@@ -61,7 +61,8 @@ def test_vista_previa_no_cambia_nada(photo):
 
 
 def test_comprobacion_en_disco(tmp_path, photo):
-    old = tmp_path / "viejo"; new = tmp_path / "nuevo"
+    old = tmp_path / "viejo"
+    new = tmp_path / "nuevo"
     new.mkdir()
     for i in range(10):
         (new / f"{i}.jpg").write_bytes(b"x")
@@ -82,7 +83,8 @@ def test_rutas_invalidas(photo, old, new):
 
 def test_raices_indexadas(tmp_path, photo):
     photo(str(tmp_path / "a.jpg"))
-    photo(r"Q:\b.jpg"); photo(r"Q:\c.jpg")
+    photo(r"Q:\b.jpg")
+    photo(r"Q:\c.jpg")
     roots = {r: (n, ok) for r, n, ok in services.get_indexed_roots()}
     assert roots["Q:\\"] == (2, False)
     assert roots[tmp_path.anchor] == (1, True)

@@ -31,15 +31,16 @@ logger = logging.getLogger(__name__)
 # indexer.py: este módulo no debe depender de que otro se haya importado antes.
 try:
     from pillow_heif import register_heif_opener
+
     register_heif_opener()
 except ImportError:
     logger.warning("pillow-heif no está instalado: los .heic no tendrán miniatura")
 
 # Directorio donde se guardan las miniaturas
 CACHE_DIR = config.THUMBS_DIR
-THUMB_SIZE = config.THUMB_SIZE_GALLERY   # píxeles (lado máximo)
-THUMB_QUALITY = 85        # calidad JPEG
-THUMB_VERSION = 2         # v2: orientación EXIF + tamaño en el nombre
+THUMB_SIZE = config.THUMB_SIZE_GALLERY  # píxeles (lado máximo)
+THUMB_QUALITY = 85  # calidad JPEG
+THUMB_VERSION = 2  # v2: orientación EXIF + tamaño en el nombre
 
 _VIDEO_PREFIX = "v_"
 
@@ -141,6 +142,7 @@ def _generate_video(filepath: str, size: int) -> bytes | None:
     """Genera miniatura de video con opencv."""
     try:
         import cv2
+
         cap = cv2.VideoCapture(filepath)
         if not cap.isOpened():
             return None

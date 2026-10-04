@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Dialog: Estadísticas ─────────────────────────────────────────────────────
 
+
 class StatsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -33,7 +34,7 @@ class StatsDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
-        stats  = services.get_stats()
+        stats = services.get_stats()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(12)
@@ -50,11 +51,14 @@ class StatsDialog(QDialog):
             card.setStyleSheet("background:#1E1E2E;border-radius:8px;padding:4px;")
             cl = QVBoxLayout(card)
             cl.setContentsMargins(16, 10, 16, 10)
-            v = QLabel(value); v.setStyleSheet("font-size:22px;font-weight:bold;color:#4A9EFF;")
-            v.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            l = QLabel(label); l.setStyleSheet("font-size:11px;color:#888;")
-            l.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            cl.addWidget(v); cl.addWidget(l)
+            value_lbl = QLabel(value)
+            value_lbl.setStyleSheet("font-size:22px;font-weight:bold;color:#4A9EFF;")
+            value_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            caption_lbl = QLabel(label)
+            caption_lbl.setStyleSheet("font-size:11px;color:#888;")
+            caption_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cl.addWidget(value_lbl)
+            cl.addWidget(caption_lbl)
             summary.addWidget(card)
         layout.addLayout(summary)
 
@@ -70,8 +74,7 @@ class StatsDialog(QDialog):
 
         layout.addStretch()
 
-    def _bar_chart(self, data: list[tuple], color: str,
-                   is_text_key: bool = False) -> QWidget:
+    def _bar_chart(self, data: list[tuple], color: str, is_text_key: bool = False) -> QWidget:
         """Genera un widget SVG con un gráfico de barras horizontal."""
         if not data:
             return QLabel("Sin datos")

@@ -8,7 +8,7 @@ import indexer
 
 
 def _jpeg_with_dates(path, original: str | None = None, modified: str | None = None) -> None:
-    img  = Image.new("RGB", (40, 30))
+    img = Image.new("RGB", (40, 30))
     exif = Image.Exif()
     if modified:
         exif[indexer._TAG_DATETIME] = modified
@@ -18,6 +18,7 @@ def _jpeg_with_dates(path, original: str | None = None, modified: str | None = N
 
 
 # ── Fecha EXIF ────────────────────────────────────────────────────────────────
+
 
 def test_prioriza_datetime_original_sobre_modificacion(tmp_path):
     p = tmp_path / "editada.jpg"
@@ -43,19 +44,23 @@ def test_sin_exif(tmp_path):
     assert indexer._extract_date_from_exif(str(p)) == (None, None)
 
 
-@pytest.mark.parametrize("value, expected", [
-    ("2020:05:12 13:14:15", (2020, 5)),
-    (b"2020:05:12 13:14:15", (2020, 5)),
-    ("", None),
-    ("    :  :     :  :  ", None),
-    ("1850:01:01 00:00:00", None),
-    (None, None),
-])
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("2020:05:12 13:14:15", (2020, 5)),
+        (b"2020:05:12 13:14:15", (2020, 5)),
+        ("", None),
+        ("    :  :     :  :  ", None),
+        ("1850:01:01 00:00:00", None),
+        (None, None),
+    ],
+)
 def test_parse_exif_date(value, expected):
     assert indexer._parse_exif_date(value) == expected
 
 
 # ── index_folder ──────────────────────────────────────────────────────────────
+
 
 def _make_collection(root, n: int = 3):
     root.mkdir(parents=True, exist_ok=True)

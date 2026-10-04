@@ -22,10 +22,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 NS = {
-    "x":          "adobe:ns:meta/",
-    "rdf":        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "dc":         "http://purl.org/dc/elements/1.1/",
-    "lr":         "http://ns.adobe.com/lightroom/1.0/",
+    "x": "adobe:ns:meta/",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "dc": "http://purl.org/dc/elements/1.1/",
+    "lr": "http://ns.adobe.com/lightroom/1.0/",
     "photovault": "https://github.com/Z4MU/Photo-vault/ns/1.0/",
 }
 for _prefix, _uri in NS.items():
@@ -35,11 +35,11 @@ _MANAGED_ATTR = f"{{{NS['photovault']}}}managed"
 
 
 class WriteResult(Enum):
-    WRITTEN         = "escrito"
-    REMOVED         = "eliminado"       # la foto quedó sin etiquetas
-    UNCHANGED       = "sin cambios"
-    SKIPPED_FOREIGN = "omitido"         # existe un .xmp de otro programa
-    ERROR           = "error"
+    WRITTEN = "escrito"
+    REMOVED = "eliminado"  # la foto quedó sin etiquetas
+    UNCHANGED = "sin cambios"
+    SKIPPED_FOREIGN = "omitido"  # existe un .xmp de otro programa
+    ERROR = "error"
 
 
 def sidecar_path(photo_path: str) -> Path:
@@ -58,7 +58,7 @@ def build_xmp(tags: list[tuple[str, str | None]]) -> str:
     q = lambda prefix, tag: f"{{{NS[prefix]}}}{tag}"  # noqa: E731
 
     meta = ET.Element(q("x", "xmpmeta"), {q("x", "xmptk"): "PhotoVault"})
-    rdf  = ET.SubElement(meta, q("rdf", "RDF"))
+    rdf = ET.SubElement(meta, q("rdf", "RDF"))
     desc = ET.SubElement(rdf, q("rdf", "Description"), {q("rdf", "about"): "", _MANAGED_ATTR: "True"})
 
     subject = ET.SubElement(ET.SubElement(desc, q("dc", "subject")), q("rdf", "Bag"))
@@ -71,11 +71,7 @@ def build_xmp(tags: list[tuple[str, str | None]]) -> str:
 
     ET.indent(meta, space=" ")
     body = ET.tostring(meta, encoding="unicode")
-    return (
-        '<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
-        f"{body}\n"
-        '<?xpacket end="w"?>\n'
-    )
+    return f'<?xpacket begin="﻿" id="W5M0MpCehiHzreSzNTczkc9d"?>\n{body}\n<?xpacket end="w"?>\n'
 
 
 def parse_xmp(text: str) -> tuple[list[tuple[str, str | None]], bool]:
@@ -90,13 +86,14 @@ def parse_xmp(text: str) -> tuple[list[tuple[str, str | None]], bool]:
         start = text.find("<rdf:RDF")
     end_meta = text.rfind("</x:xmpmeta>")
     if start >= 0 and end_meta > start:
-        text = text[start:end_meta + len("</x:xmpmeta>")]
+        text = text[start : end_meta + len("</x:xmpmeta>")]
     root = ET.fromstring(text)
 
     managed = any(el.get(_MANAGED_ATTR) == "True" for el in root.iter())
 
-    names = [li.text.strip() for li in root.iterfind(".//dc:subject//rdf:li", NS)
-             if li.text and li.text.strip()]
+    names = [
+        li.text.strip() for li in root.iterfind(".//dc:subject//rdf:li", NS) if li.text and li.text.strip()
+    ]
     categories: dict[str, str] = {}
     for li in root.iterfind(".//lr:hierarchicalSubject//rdf:li", NS):
         if li.text and "|" in li.text:

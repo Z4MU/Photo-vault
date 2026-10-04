@@ -56,7 +56,8 @@ def test_ida_y_vuelta_tras_perder_la_db(tmp_path, db_path, photo):
 
     # Se pierde la DB y se vuelve a indexar la colección (sin etiquetas)
     _reset_db(db_path)
-    a = photo(r"G:\a.jpg"); b = photo(r"G:\b.jpg")
+    a = photo(r"G:\a.jpg")
+    b = photo(r"G:\b.jpg")
 
     r = services.import_tags(str(out))
     assert (r.photos_matched, r.photos_by_name, r.photos_missing) == (2, 0, 0)
@@ -84,7 +85,8 @@ def test_no_adivina_si_hay_varias_coincidencias(tmp_path, db_path, photo):
     out = tmp_path / "export.json"
     services.export_tags(str(out))
     _reset_db(db_path)
-    photo(r"E:\x\a.jpg", size=5); photo(r"E:\y\a.jpg", size=5)
+    photo(r"E:\x\a.jpg", size=5)
+    photo(r"E:\y\a.jpg", size=5)
 
     r = services.import_tags(str(out))
     assert r.photos_missing == 1 and r.pairs_added == 0
@@ -111,11 +113,16 @@ def test_importar_nunca_quita_etiquetas(tmp_path, photo):
 
 def test_formato_v1_sigue_funcionando(tmp_path, photo):
     old = tmp_path / "v1.json"
-    old.write_text(json.dumps({
-        "version": 1,
-        "tags": [{"name": "Antigua", "category": "vieja", "color": "#111111"}],
-        "categories": ["vieja"],
-    }), encoding="utf-8")
+    old.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tags": [{"name": "Antigua", "category": "vieja", "color": "#111111"}],
+                "categories": ["vieja"],
+            }
+        ),
+        encoding="utf-8",
+    )
     assert services.read_export_summary(str(old)).assignments == 0
     r = services.import_tags(str(old))
     assert r.created == 1

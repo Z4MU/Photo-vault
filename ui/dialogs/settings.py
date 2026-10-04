@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Dialog: Configuración ────────────────────────────────────────────────────
 
+
 class SettingsDialog(QDialog):
     def __init__(self, current_page_size: int, parent=None):
         super().__init__(parent)
@@ -47,17 +48,22 @@ class SettingsDialog(QDialog):
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Fotos por página:"))
         self.spin = QSpinBox()
-        self.spin.setRange(services.PAGE_SIZE_MIN, services.PAGE_SIZE_MAX); self.spin.setSingleStep(10)
-        self.spin.setValue(self.page_size); self.spin.setFixedWidth(80)
-        r1.addWidget(self.spin); r1.addStretch()
+        self.spin.setRange(services.PAGE_SIZE_MIN, services.PAGE_SIZE_MAX)
+        self.spin.setSingleStep(10)
+        self.spin.setValue(self.page_size)
+        self.spin.setFixedWidth(80)
+        r1.addWidget(self.spin)
+        r1.addStretch()
         layout.addLayout(r1)
 
         info = QLabel("💡 Recomendado: 50-100 para colecciones grandes.")
         info.setStyleSheet("color:#666;font-size:11px;")
         layout.addWidget(info)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#2D2D3F;")
+        layout.addWidget(sep)
 
         layout.addWidget(QLabel("<b>Caché de miniaturas</b>"))
         self.cache_lbl = QLabel()
@@ -75,11 +81,14 @@ class SettingsDialog(QDialog):
         btn_purge.setToolTip("Elimina miniaturas de archivos que ya no están indexados")
         btn_purge.clicked.connect(self._purge_orphans)
 
-        cache_row.addWidget(btn_clear); cache_row.addWidget(btn_purge)
+        cache_row.addWidget(btn_clear)
+        cache_row.addWidget(btn_purge)
         layout.addLayout(cache_row)
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep2)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("color:#2D2D3F;")
+        layout.addWidget(sep2)
 
         # ── Sidecars XMP ──────────────────────────────────────────────────
         layout.addWidget(QLabel("<b>Etiquetas en archivos .xmp</b>"))
@@ -106,16 +115,19 @@ class SettingsDialog(QDialog):
         btn_read.setToolTip("Busca .xmp junto a las fotos indexadas y agrega sus etiquetas")
         btn_read.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
         btn_read.clicked.connect(self._import_xmp)
-        xmp_row.addWidget(btn_sync); xmp_row.addWidget(btn_read)
+        xmp_row.addWidget(btn_sync)
+        xmp_row.addWidget(btn_read)
         layout.addLayout(xmp_row)
 
         layout.addStretch()
         btn_row = QHBoxLayout()
-        btn_cancel = QPushButton("Cancelar"); btn_cancel.clicked.connect(self.reject)
+        btn_cancel = QPushButton("Cancelar")
+        btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton("Aplicar")
         btn_ok.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
         btn_ok.clicked.connect(self._apply)
-        btn_row.addWidget(btn_cancel); btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
         layout.addLayout(btn_row)
 
     def _refresh_cache_label(self):
@@ -123,21 +135,25 @@ class SettingsDialog(QDialog):
 
     def _clear_cache(self):
         import shutil
+
         if thumbnail_cache.CACHE_DIR.exists():
             shutil.rmtree(thumbnail_cache.CACHE_DIR)
         self._refresh_cache_label()
-        QMessageBox.information(self, "Caché limpiado",
-            "El caché fue eliminado. Se regenerará al navegar la galería.")
+        QMessageBox.information(
+            self, "Caché limpiado", "El caché fue eliminado. Se regenerará al navegar la galería."
+        )
 
     def _purge_orphans(self):
         n = services.purge_cache_orphans()
         self._refresh_cache_label()
-        QMessageBox.information(self, "Purga completada",
-            f"Se eliminaron {n} miniaturas huérfanas del caché.")
+        QMessageBox.information(
+            self, "Purga completada", f"Se eliminaron {n} miniaturas huérfanas del caché."
+        )
 
     def _sync_xmp(self):
-        r = run_with_progress(self, "Escribir .xmp", "Escribiendo etiquetas en archivos .xmp…",
-                              services.sync_all_sidecars)
+        r = run_with_progress(
+            self, "Escribir .xmp", "Escribiendo etiquetas en archivos .xmp…", services.sync_all_sidecars
+        )
         if r is None:
             return
         msg = f"Escritos: {r.written:,}\nSin cambios: {r.unchanged:,}"
@@ -148,13 +164,17 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "Archivos .xmp", msg)
 
     def _import_xmp(self):
-        r = run_with_progress(self, "Importar desde .xmp",
-                              "Buscando archivos .xmp junto a las fotos…",
-                              services.import_from_sidecars)
+        r = run_with_progress(
+            self,
+            "Importar desde .xmp",
+            "Buscando archivos .xmp junto a las fotos…",
+            services.import_from_sidecars,
+        )
         if r is None:
             return
         QMessageBox.information(
-            self, "Importado desde .xmp",
+            self,
+            "Importado desde .xmp",
             f"Fotos revisadas: {r.checked:,}\n"
             f"Con archivo .xmp: {r.with_xmp:,}\n"
             f"Etiquetas nuevas creadas: {r.tags_created:,}\n"
@@ -166,11 +186,15 @@ class SettingsDialog(QDialog):
         was_enabled = services.is_xmp_enabled()
         services.set_xmp_enabled(self.chk_xmp.isChecked())
         if self.chk_xmp.isChecked() and not was_enabled:
-            if QMessageBox.question(
-                self, "Archivos .xmp",
-                "Desde ahora cada cambio de etiquetas actualiza el .xmp de la foto.\n\n"
-                "¿Escribir ya los .xmp de las fotos que tienen etiquetas?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            ) == QMessageBox.StandardButton.Yes:
+            if (
+                QMessageBox.question(
+                    self,
+                    "Archivos .xmp",
+                    "Desde ahora cada cambio de etiquetas actualiza el .xmp de la foto.\n\n"
+                    "¿Escribir ya los .xmp de las fotos que tienen etiquetas?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                == QMessageBox.StandardButton.Yes
+            ):
                 self._sync_xmp()
         self.accept()

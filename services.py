@@ -12,7 +12,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
 from send2trash import send2trash
 
@@ -24,40 +23,54 @@ from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Sta
 logger = logging.getLogger(__name__)
 
 ProgressCallback = Callable[[int, int], None]
-StopCheck        = Callable[[], bool]
+StopCheck = Callable[[], bool]
 
 # ── Galería ───────────────────────────────────────────────────────────────────
 
+
 def get_gallery_page(
-    tag_ids:       list[int] | None = None,
-    search:        str | None       = None,
-    limit:         int              = 100,
-    offset:        int              = 0,
-    sort_field:    SortField        = SortField.DATE,
-    sort_order:    SortOrder        = SortOrder.DESC,
-    folder:        str | None       = None,
-    untagged_only: bool             = False,
+    tag_ids: list[int] | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_field: SortField = SortField.DATE,
+    sort_order: SortOrder = SortOrder.DESC,
+    folder: str | None = None,
+    untagged_only: bool = False,
 ) -> GalleryPage:
     hidden = db.get_hidden_tag_ids()
-    total  = db.get_photo_count(
-        tag_ids=tag_ids or None, hidden_tag_ids=hidden, search=search,
-        folder=folder, untagged_only=untagged_only,
+    total = db.get_photo_count(
+        tag_ids=tag_ids or None,
+        hidden_tag_ids=hidden,
+        search=search,
+        folder=folder,
+        untagged_only=untagged_only,
     )
     photos = db.get_photos(
-        tag_ids=tag_ids or None, hidden_tag_ids=hidden, search=search,
-        limit=limit, offset=offset, sort_field=sort_field, sort_order=sort_order,
-        folder=folder, untagged_only=untagged_only,
+        tag_ids=tag_ids or None,
+        hidden_tag_ids=hidden,
+        search=search,
+        limit=limit,
+        offset=offset,
+        sort_field=sort_field,
+        sort_order=sort_order,
+        folder=folder,
+        untagged_only=untagged_only,
     )
     return GalleryPage(
-        photos=photos, total=total, offset=offset, limit=limit,
-        sort_field=sort_field, sort_order=sort_order,
+        photos=photos,
+        total=total,
+        offset=offset,
+        limit=limit,
+        sort_field=sort_field,
+        sort_order=sort_order,
     )
 
 
 def get_photos_for_tagging(
-    folder:        str | None       = None,
-    tag_ids:       list[int] | None = None,
-    untagged_only: bool             = False,
+    folder: str | None = None,
+    tag_ids: list[int] | None = None,
+    untagged_only: bool = False,
 ) -> list[Photo]:
     """
     Devuelve la lista completa de fotos para el modo etiquetado rápido.
@@ -78,9 +91,9 @@ def get_photos_for_tagging(
 
 
 def count_photos_for_tagging(
-    folder:        str | None       = None,
-    tag_ids:       list[int] | None = None,
-    untagged_only: bool             = False,
+    folder: str | None = None,
+    tag_ids: list[int] | None = None,
+    untagged_only: bool = False,
 ) -> int:
     """Cuántas fotos devolvería get_photos_for_tagging (sin cargarlas)."""
     return db.get_photo_count(
@@ -91,11 +104,12 @@ def count_photos_for_tagging(
     )
 
 
-def get_photo(photo_id: int) -> Optional[Photo]:
+def get_photo(photo_id: int) -> Photo | None:
     return db.get_photo_by_id(photo_id)
 
 
 # ── Etiquetas de una foto ─────────────────────────────────────────────────────
+
 
 def get_photo_tags(photo_id: int) -> list[Tag]:
     return db.get_photo_tags(photo_id)
@@ -126,6 +140,7 @@ def remove_tag(photo_id: int, tag_id: int):
 
 # ── Etiquetado en lote ────────────────────────────────────────────────────────
 
+
 def bulk_add_tag(photo_ids: list[int], tag_name: str) -> int:
     """
     Agrega una etiqueta a varias fotos a la vez.
@@ -150,12 +165,13 @@ def bulk_remove_tag(photo_ids: list[int], tag_id: int) -> int:
 
 # ── Gestión de etiquetas ──────────────────────────────────────────────────────
 
+
 def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
     return db.get_all_tags(include_sidebar_hidden=include_sidebar_hidden)
 
 
 def get_sidebar_tags(include_hidden: bool = False) -> dict[str, list[Tag]]:
-    tags   = db.get_all_tags(include_sidebar_hidden=include_hidden)
+    tags = db.get_all_tags(include_sidebar_hidden=include_hidden)
     groups: dict[str, list[Tag]] = {}
     for tag in tags:
         groups.setdefault(tag.category or "general", []).append(tag)
@@ -176,7 +192,7 @@ def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
     _sync_sidecars(db.get_photo_ids_with_tag(tag_id))
 
 
-def get_tag(tag_id: int) -> Optional[Tag]:
+def get_tag(tag_id: int) -> Tag | None:
     return db.get_tag(tag_id)
 
 
@@ -199,6 +215,7 @@ def set_tag_sidebar_hidden(tag_id: int, hidden: bool):
 
 
 # ── Gestión de categorías ─────────────────────────────────────────────────────
+
 
 def get_all_categories() -> list[str]:
     return db.get_all_categories()
@@ -233,6 +250,7 @@ def delete_category(name: str):
 
 # ── Estadísticas ──────────────────────────────────────────────────────────────
 
+
 def get_stats() -> Stats:
     return db.get_stats()
 
@@ -240,8 +258,8 @@ def get_stats() -> Stats:
 # ── Preferencias ──────────────────────────────────────────────────────────────
 
 PAGE_SIZE_DEFAULT = 100
-PAGE_SIZE_MIN     = 10
-PAGE_SIZE_MAX     = 500
+PAGE_SIZE_MIN = 10
+PAGE_SIZE_MAX = 500
 
 
 def get_page_size() -> int:
@@ -264,18 +282,18 @@ EXPORT_VERSION = 2
 
 @dataclass
 class ExportSummary:
-    tags:        int
-    assignments: int   # fotos con etiquetas
+    tags: int
+    assignments: int  # fotos con etiquetas
 
 
 @dataclass
 class ImportResult:
-    created:         int = 0   # etiquetas nuevas
-    skipped:         int = 0   # etiquetas que ya existían
-    photos_matched:  int = 0   # fotos encontradas por ruta exacta
-    photos_by_name:  int = 0   # encontradas por nombre + tamaño (ruta distinta)
-    photos_missing:  int = 0   # no encontradas en la DB
-    pairs_added:     int = 0   # asignaciones foto↔etiqueta nuevas
+    created: int = 0  # etiquetas nuevas
+    skipped: int = 0  # etiquetas que ya existían
+    photos_matched: int = 0  # fotos encontradas por ruta exacta
+    photos_by_name: int = 0  # encontradas por nombre + tamaño (ruta distinta)
+    photos_missing: int = 0  # no encontradas en la DB
+    pairs_added: int = 0  # asignaciones foto↔etiqueta nuevas
 
 
 def export_tags(path: str) -> ExportSummary:
@@ -290,14 +308,18 @@ def export_tags(path: str) -> ExportSummary:
         "app": "PhotoVault",
         "exported_at": datetime.now().isoformat(timespec="seconds"),
         "tags": [
-            {"name": t.name, "category": t.category, "color": t.color,
-             "hidden": t.hidden, "sidebar_hidden": t.sidebar_hidden}
+            {
+                "name": t.name,
+                "category": t.category,
+                "color": t.color,
+                "hidden": t.hidden,
+                "sidebar_hidden": t.sidebar_hidden,
+            }
             for t in tags
         ],
         "categories": db.get_all_categories(),
         "assignments": [
-            {"path": p, "filename": fn, "filesize": size, "tags": names}
-            for p, fn, size, names in assignments
+            {"path": p, "filename": fn, "filesize": size, "tags": names} for p, fn, size, names in assignments
         ],
     }
     # Escribir a .tmp y renombrar: nunca queda un archivo a medias
@@ -319,8 +341,7 @@ def _read_export(path: str) -> dict:
 def read_export_summary(path: str) -> ExportSummary:
     """Qué contiene un archivo exportado (para preguntar antes de importar)."""
     data = _read_export(path)
-    return ExportSummary(tags=len(data.get("tags", [])),
-                         assignments=len(data.get("assignments", [])))
+    return ExportSummary(tags=len(data.get("tags", [])), assignments=len(data.get("assignments", [])))
 
 
 def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
@@ -331,7 +352,7 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
       nombre + tamaño cuando hay UNA sola coincidencia (sirve si cambió la
       letra de la unidad o se movió la carpeta). Solo agrega, nunca quita.
     """
-    data   = _read_export(path)
+    data = _read_export(path)
     result = ImportResult()
 
     for cat in data.get("categories", []):
@@ -411,16 +432,17 @@ def _sync_sidecars(photo_ids: list[int]) -> None:
 
 @dataclass
 class SidecarSyncResult:
-    written:   int = 0
+    written: int = 0
     unchanged: int = 0
-    foreign:   int = 0   # había un .xmp de otro programa: no se tocó
-    errors:    int = 0
+    foreign: int = 0  # había un .xmp de otro programa: no se tocó
+    errors: int = 0
 
 
-def sync_all_sidecars(progress_callback: ProgressCallback | None = None,
-                      should_stop: StopCheck | None = None) -> SidecarSyncResult:
+def sync_all_sidecars(
+    progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
+) -> SidecarSyncResult:
     """Escribe el sidecar de todas las fotos con etiquetas."""
-    ids    = db.get_tagged_photo_ids()
+    ids = db.get_tagged_photo_ids()
     result = SidecarSyncResult()
     for i, pid in enumerate(ids):
         if should_stop and should_stop():
@@ -442,21 +464,22 @@ def sync_all_sidecars(progress_callback: ProgressCallback | None = None,
 
 @dataclass
 class SidecarImportResult:
-    checked:     int = 0
-    with_xmp:    int = 0
+    checked: int = 0
+    with_xmp: int = 0
     pairs_added: int = 0
     tags_created: int = 0
 
 
-def import_from_sidecars(progress_callback: ProgressCallback | None = None,
-                         should_stop: StopCheck | None = None) -> SidecarImportResult:
+def import_from_sidecars(
+    progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
+) -> SidecarImportResult:
     """
     Lee los .xmp junto a cada foto indexada (de PhotoVault o de otros
     programas) y agrega esas etiquetas. Solo agrega, nunca quita.
     """
-    rows    = db.get_all_photo_paths()
+    rows = db.get_all_photo_paths()
     tag_ids = db.get_tag_ids_by_name()
-    result  = SidecarImportResult()
+    result = SidecarImportResult()
     pairs: list[tuple[int, int]] = []
     for i, (pid, path) in enumerate(rows):
         if should_stop and should_stop():
@@ -515,15 +538,16 @@ def purge_old_trash() -> int:
 
 # ── Reubicar carpeta / unidad ─────────────────────────────────────────────────
 
+
 @dataclass
 class RelocationPreview:
-    old_folder:    str
-    new_folder:    str
-    count:         int          # registros que cambian de ruta
-    conflicts:     int          # ya existe un registro con la ruta nueva → se fusionan
-    sample_size:   int          # cuántas rutas nuevas se revisaron en disco
-    sample_found:  int          # cuántas de ellas existen
-    plan:          list = field(default_factory=list, repr=False)
+    old_folder: str
+    new_folder: str
+    count: int  # registros que cambian de ruta
+    conflicts: int  # ya existe un registro con la ruta nueva → se fusionan
+    sample_size: int  # cuántas rutas nuevas se revisaron en disco
+    sample_found: int  # cuántas de ellas existen
+    plan: list = field(default_factory=list, repr=False)
 
     @property
     def looks_right(self) -> bool:
@@ -549,17 +573,22 @@ def preview_relocation(old_folder: str, new_folder: str, sample: int = 25) -> Re
     checked = plan[::step][:sample]
     found = sum(1 for _pid, new_path, _e in checked if Path(new_path).exists())
     return RelocationPreview(
-        old_folder=old_n, new_folder=new_n, count=len(plan),
+        old_folder=old_n,
+        new_folder=new_n,
+        count=len(plan),
         conflicts=sum(1 for _p, _n, e in plan if e is not None),
-        sample_size=len(checked), sample_found=found, plan=plan,
+        sample_size=len(checked),
+        sample_found=found,
+        plan=plan,
     )
 
 
 def apply_relocation(preview: RelocationPreview) -> tuple[int, int]:
     """Aplica una vista previa de preview_relocation. Devuelve (movidos, fusionados)."""
     moved, merged = db.apply_relocation(preview.plan)
-    logger.info("Reubicado %s → %s: %d movidos, %d fusionados",
-                preview.old_folder, preview.new_folder, moved, merged)
+    logger.info(
+        "Reubicado %s → %s: %d movidos, %d fusionados", preview.old_folder, preview.new_folder, moved, merged
+    )
     return moved, merged
 
 
@@ -572,6 +601,7 @@ def get_indexed_roots() -> list[tuple[str, int, bool]]:
 
 
 # ── Duplicados ────────────────────────────────────────────────────────────────
+
 
 def _md5_of_file(path: str, chunk: int = 65536) -> str | None:
     try:
@@ -587,8 +617,9 @@ def _md5_of_file(path: str, chunk: int = 65536) -> str | None:
         return None
 
 
-def compute_missing_md5s(progress_callback: ProgressCallback | None = None,
-                         should_stop: StopCheck | None = None) -> int:
+def compute_missing_md5s(
+    progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
+) -> int:
     """
     Calcula el MD5 de las fotos que aún no lo tienen en la DB.
     progress_callback(current, total) se llama por cada archivo procesado.
@@ -596,7 +627,7 @@ def compute_missing_md5s(progress_callback: ProgressCallback | None = None,
     Devuelve la cantidad de archivos procesados.
     """
     pending = [p for p in db.get_all_photos_for_duplicates() if not p.md5]
-    total   = len(pending)
+    total = len(pending)
 
     for i, photo in enumerate(pending):
         if should_stop and should_stop():
@@ -621,11 +652,7 @@ def get_duplicate_groups() -> list[DuplicateGroup]:
         if photo.md5:
             buckets[photo.md5].append(photo)
 
-    groups = [
-        DuplicateGroup(md5=md5, photos=photos)
-        for md5, photos in buckets.items()
-        if len(photos) >= 2
-    ]
+    groups = [DuplicateGroup(md5=md5, photos=photos) for md5, photos in buckets.items() if len(photos) >= 2]
     # Ordenar: grupos con más copias primero
     groups.sort(key=lambda g: g.size, reverse=True)
     return groups
@@ -661,19 +688,20 @@ SUSPICIOUS_ROOT_MIN = 20
 
 @dataclass
 class SkippedRoot:
-    root:   str   # p. ej. "G:\\"
-    count:  int   # registros en esa unidad
+    root: str  # p. ej. "G:\\"
+    count: int  # registros en esa unidad
     reason: str
 
 
 @dataclass
 class MissingReport:
     """Resultado de buscar registros cuyo archivo ya no existe."""
-    missing_ids: list[int]          = field(default_factory=list)
-    tagged:      int                = 0     # cuántas de ellas tienen etiquetas
-    checked:     int                = 0
-    skipped:     list[SkippedRoot]  = field(default_factory=list)
-    cancelled:   bool               = False
+
+    missing_ids: list[int] = field(default_factory=list)
+    tagged: int = 0  # cuántas de ellas tienen etiquetas
+    checked: int = 0
+    skipped: list[SkippedRoot] = field(default_factory=list)
+    cancelled: bool = False
 
     @property
     def count(self) -> int:
@@ -684,8 +712,9 @@ def _root_of(path: str) -> str:
     return Path(path).anchor or "(sin unidad)"
 
 
-def find_missing_files(progress_callback: ProgressCallback | None = None,
-                       should_stop: StopCheck | None = None) -> MissingReport:
+def find_missing_files(
+    progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
+) -> MissingReport:
     """
     Busca registros cuyo archivo no existe. NO borra nada (ver delete_missing).
 
@@ -699,8 +728,8 @@ def find_missing_files(progress_callback: ProgressCallback | None = None,
         by_root[_root_of(path)].append((pid, path))
 
     report = MissingReport()
-    total  = len(rows)
-    done   = 0
+    total = len(rows)
+    done = 0
 
     for root, items in by_root.items():
         if not Path(root).exists():
@@ -723,17 +752,24 @@ def find_missing_files(progress_callback: ProgressCallback | None = None,
                 progress_callback(done, total)
 
         if len(missing_here) == len(items) and len(items) >= SUSPICIOUS_ROOT_MIN:
-            report.skipped.append(SkippedRoot(
-                root, len(items),
-                "faltan todos sus archivos (¿es otro disco con la misma letra?)",
-            ))
+            report.skipped.append(
+                SkippedRoot(
+                    root,
+                    len(items),
+                    "faltan todos sus archivos (¿es otro disco con la misma letra?)",
+                )
+            )
         else:
             report.missing_ids.extend(missing_here)
 
     report.checked = done
-    report.tagged  = db.count_tagged(report.missing_ids)
-    logger.info("Búsqueda de faltantes: %d de %d; unidades omitidas: %s",
-                report.count, total, [(s.root, s.count) for s in report.skipped])
+    report.tagged = db.count_tagged(report.missing_ids)
+    logger.info(
+        "Búsqueda de faltantes: %d de %d; unidades omitidas: %s",
+        report.count,
+        total,
+        [(s.root, s.count) for s in report.skipped],
+    )
     return report
 
 

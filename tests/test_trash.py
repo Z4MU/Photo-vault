@@ -51,9 +51,9 @@ def test_deindex_va_a_la_papelera_y_se_restaura(photo):
     assert db.get_photo_count() == 3
 
     a = next(p for p in db.get_photos() if p.filename == "a.jpg")
-    assert a.id != pid                        # registro nuevo…
+    assert a.id != pid  # registro nuevo…
     assert (a.year, a.month, a.width, a.height, a.filesize) == (2020, 5, 640, 480, 1234)
-    assert {t.name for t in db.get_photo_tags(a.id)} == {"playa", "familia"}   # …con sus tags
+    assert {t.name for t in db.get_photo_tags(a.id)} == {"playa", "familia"}  # …con sus tags
 
 
 def test_restaurar_fusiona_si_se_reindexo(photo):
@@ -90,7 +90,8 @@ def test_faltantes_van_a_la_papelera(tmp_path, photo):
 
 
 def test_duplicado_borrado_va_a_la_papelera(tmp_path, photo, monkeypatch):
-    f = tmp_path / "copia.jpg"; f.write_bytes(b"x")
+    f = tmp_path / "copia.jpg"
+    f.write_bytes(b"x")
     pid = photo(str(f), ("dup",))
     monkeypatch.setattr(services, "send2trash", lambda p: None)
     services.delete_photo_file(pid)
@@ -98,15 +99,18 @@ def test_duplicado_borrado_va_a_la_papelera(tmp_path, photo, monkeypatch):
 
 
 def test_cada_operacion_es_un_lote(photo):
-    photo(r"D:\A\1.jpg"); photo(r"D:\B\2.jpg")
+    photo(r"D:\A\1.jpg")
+    photo(r"D:\B\2.jpg")
     services.deindex_folder(r"D:\A")
     services.deindex_folder(r"D:\B")
     assert len(services.list_trash()) == 2
 
 
 def test_eliminar_lote_y_vaciar(photo):
-    photo(r"D:\A\1.jpg"); photo(r"D:\B\2.jpg")
-    services.deindex_folder(r"D:\A"); services.deindex_folder(r"D:\B")
+    photo(r"D:\A\1.jpg")
+    photo(r"D:\B\2.jpg")
+    services.deindex_folder(r"D:\A")
+    services.deindex_folder(r"D:\B")
     b = services.list_trash()[0]
     assert services.delete_trash_batch(b.batch_id) == 1
     assert services.count_trash() == 1
@@ -115,8 +119,10 @@ def test_eliminar_lote_y_vaciar(photo):
 
 
 def test_purga_por_antiguedad(photo):
-    photo(r"D:\A\1.jpg"); photo(r"D:\B\2.jpg")
-    services.deindex_folder(r"D:\A"); services.deindex_folder(r"D:\B")
+    photo(r"D:\A\1.jpg")
+    photo(r"D:\B\2.jpg")
+    services.deindex_folder(r"D:\A")
+    services.deindex_folder(r"D:\B")
     with db.transaction() as conn:
         conn.execute(
             "UPDATE deleted_photos SET deleted_at = datetime('now', '-40 days') WHERE path LIKE 'D:\\A%'"

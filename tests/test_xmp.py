@@ -24,6 +24,7 @@ FOREIGN_XMP = """<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
 
 # ── Módulo xmp_sidecar ────────────────────────────────────────────────────────
 
+
 def test_build_y_parse_ida_y_vuelta():
     tags = [("playa", "lugar"), ("rock&roll", "música"), ("<raro>", None)]
     parsed, managed = xmp.parse_xmp(xmp.build_xmp(tags))
@@ -38,7 +39,8 @@ def test_lee_xmp_de_otro_programa():
 
 
 def test_write_crea_actualiza_y_borra(tmp_path):
-    foto = tmp_path / "IMG_1.JPG"; foto.write_bytes(b"x")
+    foto = tmp_path / "IMG_1.JPG"
+    foto.write_bytes(b"x")
     side = tmp_path / "IMG_1.JPG.xmp"
 
     assert xmp.write_sidecar(str(foto), [("a", "c")]) == xmp.WriteResult.WRITTEN
@@ -52,7 +54,8 @@ def test_write_crea_actualiza_y_borra(tmp_path):
 
 
 def test_nunca_toca_xmp_ajeno(tmp_path):
-    foto = tmp_path / "IMG_2.JPG"; foto.write_bytes(b"x")
+    foto = tmp_path / "IMG_2.JPG"
+    foto.write_bytes(b"x")
     side = tmp_path / "IMG_2.JPG.xmp"
     side.write_text(FOREIGN_XMP, encoding="utf-8")
 
@@ -62,7 +65,8 @@ def test_nunca_toca_xmp_ajeno(tmp_path):
 
 
 def test_lee_convencion_lightroom(tmp_path):
-    foto = tmp_path / "IMG_3.CR2"; foto.write_bytes(b"x")
+    foto = tmp_path / "IMG_3.CR2"
+    foto.write_bytes(b"x")
     (tmp_path / "IMG_3.xmp").write_text(FOREIGN_XMP, encoding="utf-8")
     assert ("perro", "animales") in (xmp.read_sidecar(str(foto)) or [])
 
@@ -74,19 +78,22 @@ def test_carpeta_inexistente_no_crea_nada(tmp_path):
 
 
 def test_xmp_corrupto_no_rompe_la_lectura(tmp_path):
-    foto = tmp_path / "a.jpg"; foto.write_bytes(b"x")
+    foto = tmp_path / "a.jpg"
+    foto.write_bytes(b"x")
     (tmp_path / "a.jpg.xmp").write_text("<x:xmpmeta><roto", encoding="utf-8")
     assert xmp.read_sidecar(str(foto)) is None
 
 
 # ── Integración con services ─────────────────────────────────────────────────
 
+
 @pytest.fixture
 def photo(db_path, tmp_path):
     db.init_db()
 
     def add(name: str) -> tuple[int, str]:
-        f = tmp_path / name; f.write_bytes(b"x")
+        f = tmp_path / name
+        f.write_bytes(b"x")
         return db.upsert_photo(str(f), name, 2020, 1, 1), str(f)
 
     return add
@@ -116,7 +123,7 @@ def test_activado_sigue_cada_cambio(photo):
     assert [n for n, _ in xmp.read_sidecar(path) or []] == ["verano"]
 
     services.remove_tag(pid, db.get_tag_ids_by_name()["verano"])
-    assert xmp.read_sidecar(path) is None        # sin etiquetas → sidecar eliminado
+    assert xmp.read_sidecar(path) is None  # sin etiquetas → sidecar eliminado
 
 
 def test_sync_all_e_importar_desde_sidecars(db_path, photo):

@@ -35,6 +35,7 @@ logger = logging.getLogger(__name__)
 #     pide que pare y guarda una referencia hasta que termine de verdad, así
 #     Python nunca destruye un QThread en ejecución (y la UI no se bloquea).
 
+
 class StoppableThread(QThread):
     def __init__(self):
         super().__init__()
@@ -76,9 +77,9 @@ def disconnect_all(*signals) -> None:
 
 
 class IndexWorker(StoppableThread):
-    progress  = pyqtSignal(int, int, str)
-    completed = pyqtSignal(int, int, int)   # nuevas, actualizadas, errores
-    error     = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)
+    completed = pyqtSignal(int, int, int)  # nuevas, actualizadas, errores
+    error = pyqtSignal(str)
 
     def __init__(self, folder: str):
         super().__init__()
@@ -111,16 +112,21 @@ class ThumbnailLoader(StoppableThread):
             if self._stop_flag:
                 break
             try:
-                jpeg = (thumbnail_cache.get_video_thumbnail(photo.path)
-                        if photo.is_video
-                        else thumbnail_cache.get_thumbnail(photo.path))
+                jpeg = (
+                    thumbnail_cache.get_video_thumbnail(photo.path)
+                    if photo.is_video
+                    else thumbnail_cache.get_thumbnail(photo.path)
+                )
                 if jpeg:
                     img = QImage.fromData(jpeg)
                     if not img.isNull():
                         if img.width() > 200 or img.height() > 200:
-                            img = img.scaled(200, 200,
-                                             Qt.AspectRatioMode.KeepAspectRatio,
-                                             Qt.TransformationMode.SmoothTransformation)
+                            img = img.scaled(
+                                200,
+                                200,
+                                Qt.AspectRatioMode.KeepAspectRatio,
+                                Qt.TransformationMode.SmoothTransformation,
+                            )
                         self.loaded.emit(photo.id, img)
             except Exception:
                 logger.exception("Error cargando miniatura de %s", photo.path)
@@ -130,9 +136,9 @@ class ThumbnailLoader(StoppableThread):
 
 
 class MD5Worker(StoppableThread):
-    progress  = pyqtSignal(int, int)
+    progress = pyqtSignal(int, int)
     completed = pyqtSignal(int)
-    error     = pyqtSignal(str)
+    error = pyqtSignal(str)
 
     def run(self):
         try:
@@ -150,9 +156,10 @@ class MD5Worker(StoppableThread):
 
 class MissingFilesWorker(StoppableThread):
     """Busca registros de archivos que ya no existen (no borra nada)."""
-    progress  = pyqtSignal(int, int)
-    completed = pyqtSignal(object)          # services.MissingReport
-    error     = pyqtSignal(str)
+
+    progress = pyqtSignal(int, int)
+    completed = pyqtSignal(object)  # services.MissingReport
+    error = pyqtSignal(str)
 
     def run(self):
         try:
@@ -173,9 +180,10 @@ class TaskWorker(StoppableThread):
     Corre fn(progress_callback=..., should_stop=...) en un hilo.
     Para funciones de services que siguen esa convención.
     """
-    progress  = pyqtSignal(int, int)
+
+    progress = pyqtSignal(int, int)
     completed = pyqtSignal(object)
-    error     = pyqtSignal(str)
+    error = pyqtSignal(str)
 
     def __init__(self, fn):
         super().__init__()
@@ -205,7 +213,8 @@ def run_with_progress(parent: QWidget, title: str, text: str, fn):
     dlg.setWindowTitle(title)
     dlg.setWindowModality(Qt.WindowModality.WindowModal)
     dlg.setMinimumDuration(0)
-    dlg.setAutoClose(False); dlg.setAutoReset(False)
+    dlg.setAutoClose(False)
+    dlg.setAutoReset(False)
     dlg.setStyleSheet(DARK_STYLE)
 
     worker = TaskWorker(fn)

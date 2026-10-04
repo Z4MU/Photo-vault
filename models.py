@@ -5,31 +5,34 @@ Dataclasses que representan las entidades del dominio.
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 # ── Ordenamiento ──────────────────────────────────────────────────────────────
 
+
 class SortField(Enum):
-    DATE      = "fecha"
-    FILENAME  = "nombre"
-    FILESIZE  = "tamaño"
-    ADDED_AT  = "agregado"
+    DATE = "fecha"
+    FILENAME = "nombre"
+    FILESIZE = "tamaño"
+    ADDED_AT = "agregado"
+
 
 class SortOrder(Enum):
-    ASC  = "asc"
+    ASC = "asc"
     DESC = "desc"
+
 
 # Mapa a SQL — usamos un allowlist fijo para evitar inyección
 _SORT_SQL: dict[tuple, str] = {
-    (SortField.DATE,     SortOrder.DESC): "p.year DESC, p.month DESC, p.filename",
-    (SortField.DATE,     SortOrder.ASC):  "p.year ASC,  p.month ASC,  p.filename",
-    (SortField.FILENAME, SortOrder.ASC):  "p.filename ASC",
+    (SortField.DATE, SortOrder.DESC): "p.year DESC, p.month DESC, p.filename",
+    (SortField.DATE, SortOrder.ASC): "p.year ASC,  p.month ASC,  p.filename",
+    (SortField.FILENAME, SortOrder.ASC): "p.filename ASC",
     (SortField.FILENAME, SortOrder.DESC): "p.filename DESC",
     (SortField.FILESIZE, SortOrder.DESC): "p.filesize DESC",
-    (SortField.FILESIZE, SortOrder.ASC):  "p.filesize ASC",
+    (SortField.FILESIZE, SortOrder.ASC): "p.filesize ASC",
     (SortField.ADDED_AT, SortOrder.DESC): "p.added_at DESC",
-    (SortField.ADDED_AT, SortOrder.ASC):  "p.added_at ASC",
+    (SortField.ADDED_AT, SortOrder.ASC): "p.added_at ASC",
 }
+
 
 def sort_to_sql(field: SortField, order: SortOrder) -> str:
     return _SORT_SQL.get((field, order), "p.year DESC, p.month DESC, p.filename")
@@ -37,20 +40,21 @@ def sort_to_sql(field: SortField, order: SortOrder) -> str:
 
 # ── Entidades ─────────────────────────────────────────────────────────────────
 
+
 @dataclass
 class Photo:
-    id:         int
-    path:       str
-    filename:   str
-    year:       Optional[int]
-    month:      Optional[int]
-    media_type: str           = "image"
-    duration:   Optional[float] = None
-    filesize:   Optional[int]   = None
-    width:      Optional[int]   = None
-    height:     Optional[int]   = None
-    added_at:   Optional[str]   = None
-    md5:        Optional[str]   = None   # Solo se carga donde hace falta (duplicados)
+    id: int
+    path: str
+    filename: str
+    year: int | None
+    month: int | None
+    media_type: str = "image"
+    duration: float | None = None
+    filesize: int | None = None
+    width: int | None = None
+    height: int | None = None
+    added_at: str | None = None
+    md5: str | None = None  # Solo se carga donde hace falta (duplicados)
 
     @property
     def is_video(self) -> bool:
@@ -72,20 +76,20 @@ class Photo:
 
 @dataclass
 class Tag:
-    id:             int
-    name:           str
-    category:       str  = "general"
-    color:          str  = "#4A9EFF"
-    hidden:         bool = False
+    id: int
+    name: str
+    category: str = "general"
+    color: str = "#4A9EFF"
+    hidden: bool = False
     sidebar_hidden: bool = False
 
 
 @dataclass
 class GalleryPage:
-    photos:     list[Photo]
-    total:      int
-    offset:     int
-    limit:      int
+    photos: list[Photo]
+    total: int
+    offset: int
+    limit: int
     sort_field: SortField = SortField.DATE
     sort_order: SortOrder = SortOrder.DESC
 
@@ -108,18 +112,19 @@ class GalleryPage:
 
 @dataclass
 class Stats:
-    total_photos:  int
-    total_tags:    int
-    years:         list[tuple[int, int]]   # [(year, count), ...]
-    by_month:      list[tuple[int, int, int]]  # [(year, month, count), ...]
-    by_type:       dict[str, int]          # {"image": N, "video": M}
-    top_tags:      list[tuple[str, int]]   # [(tag_name, count), ...]  top 10
+    total_photos: int
+    total_tags: int
+    years: list[tuple[int, int]]  # [(year, count), ...]
+    by_month: list[tuple[int, int, int]]  # [(year, month, count), ...]
+    by_type: dict[str, int]  # {"image": N, "video": M}
+    top_tags: list[tuple[str, int]]  # [(tag_name, count), ...]  top 10
 
 
 @dataclass
 class DuplicateGroup:
     """Un grupo de fotos que comparten el mismo hash MD5."""
-    md5:    str
+
+    md5: str
     photos: list[Photo]
 
     @property
@@ -138,8 +143,9 @@ class DuplicateGroup:
 @dataclass
 class TrashBatch:
     """Una operación que quitó registros (des-indexar, faltantes, duplicado…)."""
-    batch_id:   str
-    reason:     str
-    deleted_at: str     # UTC, formato SQLite 'YYYY-MM-DD HH:MM:SS'
-    count:      int
-    tagged:     int     # cuántos tenían etiquetas
+
+    batch_id: str
+    reason: str
+    deleted_at: str  # UTC, formato SQLite 'YYYY-MM-DD HH:MM:SS'
+    count: int
+    tagged: int  # cuántos tenían etiquetas

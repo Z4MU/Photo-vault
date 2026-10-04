@@ -15,7 +15,7 @@ from types import TracebackType
 
 import config
 
-LOG_DIR  = config.LOG_DIR
+LOG_DIR = config.LOG_DIR
 LOG_FILE = LOG_DIR / "photovault.log"
 
 _FORMAT = "%(asctime)s [%(levelname)s] %(name)s (%(threadName)s): %(message)s"
@@ -34,9 +34,7 @@ def setup_logging(level: int = logging.INFO) -> None:
 
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(
-            LOG_FILE, maxBytes=1_048_576, backupCount=5, encoding="utf-8"
-        )
+        file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_048_576, backupCount=5, encoding="utf-8")
         file_handler.setFormatter(formatter)
         file_handler._photovault = True  # type: ignore[attr-defined]
         root.addHandler(file_handler)
@@ -50,7 +48,7 @@ def setup_logging(level: int = logging.INFO) -> None:
         console._photovault = True  # type: ignore[attr-defined]
         root.addHandler(console)
 
-    sys.excepthook       = _handle_exception
+    sys.excepthook = _handle_exception
     threading.excepthook = _handle_thread_exception
 
 
@@ -64,11 +62,11 @@ def install_qt_handlers() -> None:
 
     qt_logger = logging.getLogger("qt")
     levels = {
-        QtMsgType.QtDebugMsg:    logging.DEBUG,
-        QtMsgType.QtInfoMsg:     logging.INFO,
-        QtMsgType.QtWarningMsg:  logging.WARNING,
+        QtMsgType.QtDebugMsg: logging.DEBUG,
+        QtMsgType.QtInfoMsg: logging.INFO,
+        QtMsgType.QtWarningMsg: logging.WARNING,
         QtMsgType.QtCriticalMsg: logging.ERROR,
-        QtMsgType.QtFatalMsg:    logging.CRITICAL,
+        QtMsgType.QtFatalMsg: logging.CRITICAL,
     }
 
     def handler(msg_type, _context, message):
@@ -77,8 +75,7 @@ def install_qt_handlers() -> None:
     qInstallMessageHandler(handler)
 
 
-def _handle_exception(exc_type: type[BaseException], exc: BaseException,
-                      tb: TracebackType | None) -> None:
+def _handle_exception(exc_type: type[BaseException], exc: BaseException, tb: TracebackType | None) -> None:
     if issubclass(exc_type, KeyboardInterrupt):
         sys.__excepthook__(exc_type, exc, tb)
         return
@@ -108,7 +105,7 @@ def _show_error_dialog(exc: BaseException) -> None:
     if app is None or QThread.currentThread() is not app.thread():
         return
     QMessageBox.critical(
-        None, "Error inesperado",
-        f"Ocurrió un error inesperado:\n\n{exc}\n\n"
-        f"Los detalles quedaron registrados en:\n{LOG_FILE}",
+        None,
+        "Error inesperado",
+        f"Ocurrió un error inesperado:\n\n{exc}\n\nLos detalles quedaron registrados en:\n{LOG_FILE}",
     )

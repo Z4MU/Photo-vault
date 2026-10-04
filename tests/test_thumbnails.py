@@ -39,7 +39,7 @@ def test_tamanos_distintos_no_comparten_cache(tmp_path):
     src = tmp_path / "foto.jpg"
     Image.new("RGB", (1000, 800)).save(src)
     small = tc.get_thumbnail(str(src), size=200)
-    big   = tc.get_thumbnail(str(src), size=480)
+    big = tc.get_thumbnail(str(src), size=480)
     assert max(_size_of(small)) == 200
     assert max(_size_of(big)) == 480
     # Y desde caché siguen siendo distintas
@@ -60,8 +60,10 @@ def test_cache_hit_no_regenera(tmp_path, monkeypatch):
 
 
 def test_purga_conserva_vigentes_y_borra_viejas(tmp_path):
-    a = tmp_path / "a.jpg"; Image.new("RGB", (50, 50)).save(a)
-    b = tmp_path / "b.jpg"; Image.new("RGB", (50, 50)).save(b)
+    a = tmp_path / "a.jpg"
+    Image.new("RGB", (50, 50)).save(a)
+    b = tmp_path / "b.jpg"
+    Image.new("RGB", (50, 50)).save(b)
     tc.get_thumbnail(str(a), size=200)
     tc.get_thumbnail(str(a), size=480)
     tc.get_thumbnail(str(b), size=200)
@@ -70,9 +72,9 @@ def test_purga_conserva_vigentes_y_borra_viejas(tmp_path):
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_bytes(b"x")
 
-    removed = tc.purge_orphans([str(a)])   # b ya no está indexada
+    removed = tc.purge_orphans([str(a)])  # b ya no está indexada
 
-    assert removed == 2                    # la de b + la vieja
+    assert removed == 2  # la de b + la vieja
     assert len(list(tc.CACHE_DIR.rglob("*.jpg"))) == 2
 
 
@@ -101,8 +103,7 @@ def test_heic_sin_importar_indexer(tmp_path):
         f"print('OK' if tc.get_thumbnail(r'{src}', 100) else 'FALLA')"
     )
     root = Path(__file__).resolve().parents[1]
-    out = subprocess.run([sys.executable, "-c", code, str(root)],
-                         capture_output=True, text=True, timeout=60)
+    out = subprocess.run([sys.executable, "-c", code, str(root)], capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "OK", out.stderr
 
 

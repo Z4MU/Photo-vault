@@ -20,16 +20,17 @@ import config
 
 logger = logging.getLogger(__name__)
 
-BACKUP_DIR     = config.BACKUP_DIR
-DAILY_KEEP     = 7
+BACKUP_DIR = config.BACKUP_DIR
+DAILY_KEEP = 7
 MIGRATION_KEEP = 3
 
-_DAILY_PREFIX     = "photovault-diario-"
+_DAILY_PREFIX = "photovault-diario-"
 _MIGRATION_PREFIX = "photovault-premigracion-"
 
 
-def create_backup(db_path: Path, prefix: str, backup_dir: Path | None = None,
-                  suffix: str = "") -> Path | None:
+def create_backup(
+    db_path: Path, prefix: str, backup_dir: Path | None = None, suffix: str = ""
+) -> Path | None:
     """
     Copia db_path a backup_dir/<prefix><fecha-hora><suffix>.db.
     Devuelve la ruta creada, o None si la DB todavía no existe.
@@ -46,7 +47,7 @@ def create_backup(db_path: Path, prefix: str, backup_dir: Path | None = None,
     while final.exists():  # Dos copias en el mismo segundo
         final = backup_dir / f"{prefix}{stamp}{suffix}-{n}.db"
         n += 1
-    tmp   = final.with_suffix(".db.tmp")
+    tmp = final.with_suffix(".db.tmp")
 
     src = sqlite3.connect(db_path)
     try:
@@ -64,8 +65,7 @@ def create_backup(db_path: Path, prefix: str, backup_dir: Path | None = None,
     return final
 
 
-def daily_backup(db_path: Path, backup_dir: Path | None = None,
-                 keep: int = DAILY_KEEP) -> Path | None:
+def daily_backup(db_path: Path, backup_dir: Path | None = None, keep: int = DAILY_KEEP) -> Path | None:
     """Crea la copia diaria si aún no existe una de hoy. Nunca lanza excepciones."""
     backup_dir = backup_dir or BACKUP_DIR
     try:
@@ -81,9 +81,9 @@ def daily_backup(db_path: Path, backup_dir: Path | None = None,
         return None
 
 
-def pre_migration_backup(db_path: Path, target_version: int,
-                         backup_dir: Path | None = None,
-                         keep: int = MIGRATION_KEEP) -> Path | None:
+def pre_migration_backup(
+    db_path: Path, target_version: int, backup_dir: Path | None = None, keep: int = MIGRATION_KEEP
+) -> Path | None:
     """
     Copia obligatoria antes de migrar el esquema.
     A diferencia del diario, si falla lanza la excepción: es preferible no
@@ -100,8 +100,7 @@ def list_backups(backup_dir: Path | None = None) -> list[Path]:
     backup_dir = backup_dir or BACKUP_DIR
     if not backup_dir.exists():
         return []
-    return sorted(backup_dir.glob("photovault-*.db"),
-                  key=lambda p: p.stat().st_mtime, reverse=True)
+    return sorted(backup_dir.glob("photovault-*.db"), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def _rotate(backup_dir: Path, prefix: str, keep: int) -> None:

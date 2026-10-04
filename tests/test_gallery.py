@@ -13,19 +13,20 @@ def col(db_path):
     db.init_db()
 
     def add(name, year, month, size, tags=(), video=False):
-        pid = db.upsert_photo(rf"D:\F\{name}", name, year, month, size,
-                              media_type="video" if video else "image")
+        pid = db.upsert_photo(
+            rf"D:\F\{name}", name, year, month, size, media_type="video" if video else "image"
+        )
         for t in tags:
             db.add_tag_to_photo(pid, db.create_tag(t))
         return pid
 
     ids = {
-        "a": add("a_playa.jpg",   2019, 7, 300, ("playa", "familia")),
-        "b": add("b_playa.jpg",   2020, 1, 100, ("playa",)),
-        "c": add("c_casa.jpg",    2021, 5, 500, ("familia",)),
+        "a": add("a_playa.jpg", 2019, 7, 300, ("playa", "familia")),
+        "b": add("b_playa.jpg", 2020, 1, 100, ("playa",)),
+        "c": add("c_casa.jpg", 2021, 5, 500, ("familia",)),
         "d": add("d_secreto.jpg", 2022, 2, 200, ("privado", "playa")),
-        "e": add("e_sin.jpg",     2018, 3, 50),
-        "f": add("f_video.mp4",   2023, 9, 900, ("playa",), video=True),
+        "e": add("e_sin.jpg", 2018, 3, 50),
+        "f": add("f_video.mp4", 2023, 9, 900, ("playa",), video=True),
     }
     tag_id = db.get_tag_ids_by_name()
     return ids, tag_id
@@ -54,21 +55,22 @@ def test_busqueda_por_nombre(col):
     assert sorted(_names(page)) == ["a", "b"]
 
 
-@pytest.mark.parametrize("field, order, expected", [
-    (SortField.DATE,     SortOrder.DESC, ["f", "d", "c", "b", "a", "e"]),
-    (SortField.DATE,     SortOrder.ASC,  ["e", "a", "b", "c", "d", "f"]),
-    (SortField.FILESIZE, SortOrder.DESC, ["f", "c", "a", "d", "b", "e"]),
-    (SortField.FILENAME, SortOrder.ASC,  ["a", "b", "c", "d", "e", "f"]),
-])
+@pytest.mark.parametrize(
+    "field, order, expected",
+    [
+        (SortField.DATE, SortOrder.DESC, ["f", "d", "c", "b", "a", "e"]),
+        (SortField.DATE, SortOrder.ASC, ["e", "a", "b", "c", "d", "f"]),
+        (SortField.FILESIZE, SortOrder.DESC, ["f", "c", "a", "d", "b", "e"]),
+        (SortField.FILENAME, SortOrder.ASC, ["a", "b", "c", "d", "e", "f"]),
+    ],
+)
 def test_ordenamiento(col, field, order, expected):
     assert _names(services.get_gallery_page(sort_field=field, sort_order=order)) == expected
 
 
 def test_paginacion(col):
-    p1 = services.get_gallery_page(limit=4, offset=0, sort_field=SortField.FILENAME,
-                                   sort_order=SortOrder.ASC)
-    p2 = services.get_gallery_page(limit=4, offset=4, sort_field=SortField.FILENAME,
-                                   sort_order=SortOrder.ASC)
+    p1 = services.get_gallery_page(limit=4, offset=0, sort_field=SortField.FILENAME, sort_order=SortOrder.ASC)
+    p2 = services.get_gallery_page(limit=4, offset=4, sort_field=SortField.FILENAME, sort_order=SortOrder.ASC)
     assert (p1.total, p1.total_pages, p1.page_number) == (6, 2, 1)
     assert p1.has_next and not p1.has_prev
     assert p2.has_prev and not p2.has_next and p2.page_number == 2

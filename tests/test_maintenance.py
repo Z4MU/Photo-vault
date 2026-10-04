@@ -27,6 +27,7 @@ def _paths(**filters) -> set[str]:
 
 # ── Filtro de carpeta (#7) ────────────────────────────────────────────────────
 
+
 def test_filtro_carpeta_no_incluye_hermanas(photos):
     photos(r"D:\Fotos\a.jpg")
     photos(r"D:\Fotos\sub\b.jpg")
@@ -45,9 +46,9 @@ def test_filtro_carpeta_acepta_barra_final_y_barras_normales(photos):
 
 def test_comodines_en_la_ruta_son_literales(photos):
     photos(r"D:\mis_fotos\a.jpg")
-    photos(r"D:\misXfotos\b.jpg")      # "_" como comodín coincidiría con esto
+    photos(r"D:\misXfotos\b.jpg")  # "_" como comodín coincidiría con esto
     photos(r"D:\100%\c.jpg")
-    photos(r"D:\100abc\d.jpg")         # "%" como comodín coincidiría con esto
+    photos(r"D:\100abc\d.jpg")  # "%" como comodín coincidiría con esto
     assert _paths(folder=r"D:\mis_fotos") == {r"D:\mis_fotos\a.jpg"}
     assert _paths(folder=r"D:\100%") == {r"D:\100%\c.jpg"}
 
@@ -72,18 +73,21 @@ def test_deindex_folder_no_toca_hermanas(photos):
 
 # ── Archivos faltantes (#1) ───────────────────────────────────────────────────
 
+
 def test_find_missing_no_borra_nada(tmp_path, photos):
-    real = tmp_path / "existe.jpg"; real.write_bytes(b"x")
+    real = tmp_path / "existe.jpg"
+    real.write_bytes(b"x")
     photos(str(real))
     photos(str(tmp_path / "borrada.jpg"))
 
     report = services.find_missing_files()
     assert report.count == 1
-    assert db.get_photo_count() == 2          # Solo buscar no borra
+    assert db.get_photo_count() == 2  # Solo buscar no borra
 
 
 def test_delete_missing_borra_solo_los_faltantes(tmp_path, photos):
-    real = tmp_path / "existe.jpg"; real.write_bytes(b"x")
+    real = tmp_path / "existe.jpg"
+    real.write_bytes(b"x")
     keep = photos(str(real))
     gone = photos(str(tmp_path / "borrada.jpg"))
     db.add_tag_to_photo(gone, db.create_tag("perdida"))
@@ -95,14 +99,16 @@ def test_delete_missing_borra_solo_los_faltantes(tmp_path, photos):
 
 
 def test_unidad_desconectada_se_protege(tmp_path, photos, monkeypatch):
-    real = tmp_path / "existe.jpg"; real.write_bytes(b"x")
+    real = tmp_path / "existe.jpg"
+    real.write_bytes(b"x")
     photos(str(real))
     for i in range(30):
-        photos(rf"Q:\Fotos\{i}.jpg")         # Unidad que no existe
+        photos(rf"Q:\Fotos\{i}.jpg")  # Unidad que no existe
 
     real_exists = Path.exists
-    monkeypatch.setattr(Path, "exists",
-                        lambda self: False if str(self).upper().startswith("Q:") else real_exists(self))
+    monkeypatch.setattr(
+        Path, "exists", lambda self: False if str(self).upper().startswith("Q:") else real_exists(self)
+    )
 
     report = services.find_missing_files()
     assert report.count == 0
@@ -140,6 +146,7 @@ def test_busqueda_cancelada_no_borra(tmp_path, photos):
 
 # ── Duplicados (#2, #12) ──────────────────────────────────────────────────────
 
+
 def test_duplicados_agrupa_por_md5(tmp_path, photos):
     for name in ("a.jpg", "b.jpg", "c.jpg"):
         (tmp_path / name).write_bytes(b"mismo contenido" if name != "c.jpg" else b"otro")
@@ -167,7 +174,8 @@ def test_md5_cancelable(tmp_path, photos):
 
 
 def test_borrar_duplicado_va_a_la_papelera(tmp_path, photos, monkeypatch):
-    f = tmp_path / "copia.jpg"; f.write_bytes(b"x")
+    f = tmp_path / "copia.jpg"
+    f.write_bytes(b"x")
     pid = photos(str(f))
     trashed = []
     monkeypatch.setattr(services, "send2trash", lambda p: trashed.append(p))
@@ -178,7 +186,8 @@ def test_borrar_duplicado_va_a_la_papelera(tmp_path, photos, monkeypatch):
 
 
 def test_si_la_papelera_falla_no_se_borra_el_registro(tmp_path, photos, monkeypatch):
-    f = tmp_path / "copia.jpg"; f.write_bytes(b"x")
+    f = tmp_path / "copia.jpg"
+    f.write_bytes(b"x")
     pid = photos(str(f))
 
     def falla(p):

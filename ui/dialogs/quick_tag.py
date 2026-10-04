@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 # ─── Dialog: Configuración del modo etiquetado rápido ────────────────────────
 
+
 class QuickTagSetupDialog(QDialog):
     """
     Permite al usuario elegir qué fotos incluir en el modo etiquetado rápido:
@@ -60,11 +61,13 @@ class QuickTagSetupDialog(QDialog):
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
 
-        layout.addWidget(QLabel(
-            "<b>¿Qué fotos quieres etiquetar?</b><br>"
-            "<span style='color:#888;font-size:11px;'>"
-            "Combina los filtros para acotar el conjunto.</span>"
-        ))
+        layout.addWidget(
+            QLabel(
+                "<b>¿Qué fotos quieres etiquetar?</b><br>"
+                "<span style='color:#888;font-size:11px;'>"
+                "Combina los filtros para acotar el conjunto.</span>"
+            )
+        )
 
         # ── Filtro por carpeta ─────────────────────────────────────────────
         box_folder = QGroupBox("Carpeta indexada (opcional)")
@@ -88,7 +91,7 @@ class QuickTagSetupDialog(QDialog):
         tag_scroll.setFixedHeight(100)
         tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         tag_inner = QWidget()
-        tag_grid  = QVBoxLayout(tag_inner)
+        tag_grid = QVBoxLayout(tag_inner)
         tag_grid.setContentsMargins(4, 4, 4, 4)
         tag_grid.setSpacing(2)
 
@@ -124,34 +127,29 @@ class QuickTagSetupDialog(QDialog):
         btn_cancel.clicked.connect(self.reject)
 
         self.btn_start = QPushButton("▶  Iniciar etiquetado")
-        self.btn_start.setStyleSheet(
-            "background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;"
-        )
+        self.btn_start.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
         self.btn_start.clicked.connect(self._start)
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(self.btn_start)
         layout.addLayout(btn_row)
 
     def _refresh_count(self):
-        folder   = self.folder_combo.currentData()
-        tag_ids  = [tid for chk, tid in self._tag_checks if chk.isChecked()]
+        folder = self.folder_combo.currentData()
+        tag_ids = [tid for chk, tid in self._tag_checks if chk.isChecked()]
         untagged = self.chk_untagged.isChecked()
-        n = services.count_photos_for_tagging(
-            folder=folder, tag_ids=tag_ids or None, untagged_only=untagged
-        )
-        self.count_lbl.setText(
-            f"{n:,} foto{'s' if n != 1 else ''} coinciden con este filtro"
-        )
+        n = services.count_photos_for_tagging(folder=folder, tag_ids=tag_ids or None, untagged_only=untagged)
+        self.count_lbl.setText(f"{n:,} foto{'s' if n != 1 else ''} coinciden con este filtro")
         self.btn_start.setEnabled(n > 0)
 
     def _start(self):
-        self.selected_folder   = self.folder_combo.currentData()
-        self.selected_tag_ids  = [tid for chk, tid in self._tag_checks if chk.isChecked()]
-        self.untagged_only     = self.chk_untagged.isChecked()
+        self.selected_folder = self.folder_combo.currentData()
+        self.selected_tag_ids = [tid for chk, tid in self._tag_checks if chk.isChecked()]
+        self.untagged_only = self.chk_untagged.isChecked()
         self.accept()
 
 
 # ─── Ventana: Modo etiquetado rápido ─────────────────────────────────────────
+
 
 class QuickTagWindow(QDialog):
     """
@@ -165,14 +163,14 @@ class QuickTagWindow(QDialog):
       Esc        salir y volver a la galería
     """
 
-    done_signal = pyqtSignal()   # emitido al cerrar para que galería recargue
+    done_signal = pyqtSignal()  # emitido al cerrar para que galería recargue
 
     def __init__(self, photos: list[Photo], parent=None):
         super().__init__(parent)
-        self.photos   = photos
-        self.index    = 0
+        self.photos = photos
+        self.index = 0
         self._history: list[tuple[int, int, bool]] = []  # (photo_id, tag_id, was_added)
-        self._tag_shortcuts: dict[int, Tag] = {}          # tecla 1-9 → Tag
+        self._tag_shortcuts: dict[int, Tag] = {}  # tecla 1-9 → Tag
 
         self.setWindowTitle("Etiquetado rápido")
         self.setMinimumSize(1000, 640)
@@ -197,10 +195,16 @@ class QuickTagWindow(QDialog):
         title.setStyleSheet("color:#4A9EFF;font-size:13px;font-weight:bold;")
         tb.addWidget(title)
 
-        for key, desc in [("←→", "navegar"), ("1–9", "etiqueta"), ("Space", "saltar"),
-                           ("Ctrl+Z", "deshacer"), ("Esc", "salir")]:
+        for key, desc in [
+            ("←→", "navegar"),
+            ("1–9", "etiqueta"),
+            ("Space", "saltar"),
+            ("Ctrl+Z", "deshacer"),
+            ("Esc", "salir"),
+        ]:
             tb.addWidget(self._kbd(key))
-            lbl = QLabel(desc); lbl.setStyleSheet("color:#555;font-size:11px;")
+            lbl = QLabel(desc)
+            lbl.setStyleSheet("color:#555;font-size:11px;")
             tb.addWidget(lbl)
             tb.addSpacing(10)
 
@@ -217,7 +221,7 @@ class QuickTagWindow(QDialog):
 
         # Cuerpo principal
         body = QWidget()
-        bl   = QHBoxLayout(body)
+        bl = QHBoxLayout(body)
         bl.setContentsMargins(0, 0, 0, 0)
         bl.setSpacing(0)
 
@@ -294,15 +298,17 @@ class QuickTagWindow(QDialog):
         sl.addWidget(self.tag_search)
         pl.addWidget(search_bar)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;"); pl.addWidget(sep)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("color:#2D2D3F;")
+        pl.addWidget(sep)
 
         # Lista de etiquetas
         self.tag_scroll = QScrollArea()
         self.tag_scroll.setWidgetResizable(True)
         self.tag_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tag_container = QWidget()
-        self.tag_vbox      = QVBoxLayout(self.tag_container)
+        self.tag_vbox = QVBoxLayout(self.tag_container)
         self.tag_vbox.setContentsMargins(8, 4, 8, 4)
         self.tag_vbox.setSpacing(1)
         self.tag_scroll.setWidget(self.tag_container)
@@ -317,8 +323,10 @@ class QuickTagWindow(QDialog):
         for key, desc in [("Space", "saltar sin cambios"), ("Ctrl+Z", "deshacer")]:
             row = QHBoxLayout()
             row.addWidget(self._kbd(key))
-            lbl = QLabel(desc); lbl.setStyleSheet("color:#8888AA;font-size:11px;")
-            row.addWidget(lbl); row.addStretch()
+            lbl = QLabel(desc)
+            lbl.setStyleSheet("color:#8888AA;font-size:11px;")
+            row.addWidget(lbl)
+            row.addStretch()
             fl.addLayout(row)
         pl.addWidget(footer)
 
@@ -346,6 +354,7 @@ class QuickTagWindow(QDialog):
 
         # Agrupar por categoría
         from collections import OrderedDict
+
         groups: OrderedDict[str, list[Tag]] = OrderedDict()
         for tag in all_tags:
             groups.setdefault(tag.category or "general", []).append(tag)
@@ -353,8 +362,7 @@ class QuickTagWindow(QDialog):
         for category, tags in groups.items():
             cat_lbl = QLabel(category.upper())
             cat_lbl.setStyleSheet(
-                "color:#4A6A88;font-size:10px;font-weight:500;"
-                "padding:8px 4px 2px;letter-spacing:1px;"
+                "color:#4A6A88;font-size:10px;font-weight:500;padding:8px 4px 2px;letter-spacing:1px;"
             )
             cat_lbl.setProperty("cat_label", True)
             self.tag_vbox.addWidget(cat_lbl)
@@ -362,7 +370,7 @@ class QuickTagWindow(QDialog):
             for tag in tags:
                 row = ClickableRow()
                 row.setStyleSheet("border-radius:5px;")
-                hl  = QHBoxLayout(row)
+                hl = QHBoxLayout(row)
                 hl.setContentsMargins(4, 3, 6, 3)
                 hl.setSpacing(7)
 
@@ -433,9 +441,9 @@ class QuickTagWindow(QDialog):
             pix = QPixmap()
             pix.loadFromData(jpeg)
             if not pix.isNull():
-                pix = pix.scaled(520, 520,
-                                 Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
+                pix = pix.scaled(
+                    520, 520, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+                )
                 self.img_label.setPixmap(pix)
         else:
             self.img_label.setText("No se pudo cargar la imagen")
@@ -449,17 +457,15 @@ class QuickTagWindow(QDialog):
         for row, tag, _name_lbl, check_lbl in self._tag_rows:
             active = tag.id in self._current_tag_ids
             check_lbl.setVisible(active)
-            row.setStyleSheet(
-                "border-radius:5px;background:#1E2E4E;" if active
-                else "border-radius:5px;"
-            )
+            row.setStyleSheet("border-radius:5px;background:#1E2E4E;" if active else "border-radius:5px;")
 
         # Chips bajo la imagen
         clear_layout(self.chips_layout)
 
         for tag_id in self._current_tag_ids:
             chip_tag = self._tags_by_id.get(tag_id)
-            if chip_tag is None: continue
+            if chip_tag is None:
+                continue
             chip = QLabel(chip_tag.name)
             chip.setTextFormat(Qt.TextFormat.PlainText)
             chip.setStyleSheet(
@@ -499,7 +505,7 @@ class QuickTagWindow(QDialog):
         else:
             services.add_tag_by_id(photo.id, tag.id)
             self._current_tag_ids.add(tag.id)
-            self._history.append((photo.id, tag.id, True))   # True = se agregó
+            self._history.append((photo.id, tag.id, True))  # True = se agregó
         self._refresh_tag_ui()
 
     def _undo(self):
@@ -531,15 +537,14 @@ class QuickTagWindow(QDialog):
 
     def _finish(self):
         QMessageBox.information(
-            self, "¡Listo!",
-            f"Etiquetado completado.\n{len(self.photos):,} fotos procesadas."
+            self, "¡Listo!", f"Etiquetado completado.\n{len(self.photos):,} fotos procesadas."
         )
         self.close()
 
     # ── Teclado ───────────────────────────────────────────────────────────────
 
     def keyPressEvent(self, event):
-        key  = event.key()
+        key = event.key()
         mods = event.modifiers()
 
         if key == Qt.Key.Key_Escape:
@@ -551,7 +556,7 @@ class QuickTagWindow(QDialog):
         elif mods == Qt.KeyboardModifier.ControlModifier and key == Qt.Key.Key_Z:
             self._undo()
         elif Qt.Key.Key_1 <= key <= Qt.Key.Key_9:
-            n   = key - Qt.Key.Key_0
+            n = key - Qt.Key.Key_0
             tag = self._tag_shortcuts.get(n)
             if tag:
                 self._toggle_tag(tag)

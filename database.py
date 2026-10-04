@@ -11,7 +11,6 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional
 
 import backup
 import config
@@ -84,8 +83,7 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
 
 
-def _add_column_if_missing(conn: sqlite3.Connection, table: str,
-                           column: str, typedef: str) -> None:
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, typedef: str) -> None:
     if column not in _columns(conn, table):
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
 
@@ -141,10 +139,10 @@ def _m001_baseline(conn: sqlite3.Connection) -> None:
     # Columnas agregadas en versiones anteriores — DBs viejas pueden no tenerlas.
     # Deben existir ANTES de crear índices que las usen.
     _add_column_if_missing(conn, "photos", "media_type", "TEXT DEFAULT 'image'")
-    _add_column_if_missing(conn, "photos", "duration",   "REAL")
-    _add_column_if_missing(conn, "photos", "md5",        "TEXT")
-    _add_column_if_missing(conn, "tags",   "hidden",         "INTEGER DEFAULT 0")
-    _add_column_if_missing(conn, "tags",   "sidebar_hidden", "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "photos", "duration", "REAL")
+    _add_column_if_missing(conn, "photos", "md5", "TEXT")
+    _add_column_if_missing(conn, "tags", "hidden", "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "tags", "sidebar_hidden", "INTEGER DEFAULT 0")
 
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_year      ON photos(year)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_month     ON photos(month)")
@@ -193,8 +191,9 @@ def get_schema_version() -> int:
     return get_connection().execute("PRAGMA user_version").fetchone()[0]
 
 
-def _apply_migration(conn: sqlite3.Connection, version: int,
-                     migration: Callable[[sqlite3.Connection], None]) -> None:
+def _apply_migration(
+    conn: sqlite3.Connection, version: int, migration: Callable[[sqlite3.Connection], None]
+) -> None:
     doc = (migration.__doc__ or migration.__name__).strip().splitlines()[0]
     logger.info("Aplicando migración %d: %s", version, doc)
     if conn.in_transaction:
@@ -207,8 +206,7 @@ def _apply_migration(conn: sqlite3.Connection, version: int,
         conn.commit()
     except Exception:
         conn.rollback()
-        logger.exception("Falló la migración %d; la DB quedó en la versión %d",
-                         version, version - 1)
+        logger.exception("Falló la migración %d; la DB quedó en la versión %d", version, version - 1)
         raise
 
 
@@ -217,7 +215,7 @@ def init_db() -> None:
     Corre en cada arranque. Aplica las migraciones pendientes (con backup
     previo si la DB ya existía) y el seed inicial si nunca se hizo.
     """
-    conn    = get_connection()
+    conn = get_connection()
     current = get_schema_version()
 
     if current > SCHEMA_VERSION:
@@ -228,9 +226,7 @@ def init_db() -> None:
         )
 
     if current < SCHEMA_VERSION:
-        has_tables = conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
-        ).fetchone()[0] > 0
+        has_tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'").fetchone()[0] > 0
         if has_tables:
             # Si el backup falla se lanza la excepción y no se migra
             backup.pre_migration_backup(DB_PATH, SCHEMA_VERSION)
@@ -247,6 +243,7 @@ def init_db() -> None:
 
 # ── Seed inicial ─────────────────────────────────────────────────────────────
 
+
 def _seed_initial_data(conn):
     """
     Inserta etiquetas y categorías predefinidas la primera vez que se crea
@@ -254,11 +251,9 @@ def _seed_initial_data(conn):
     los cambios del usuario (borrar/renombrar) se respetan completamente.
     """
     # Verificar si el seed ya corrió
-    row = conn.execute(
-        "SELECT value FROM app_settings WHERE key = 'seeded'"
-    ).fetchone()
+    row = conn.execute("SELECT value FROM app_settings WHERE key = 'seeded'").fetchone()
     if row:
-        return   # Ya se sembró — respetar el estado actual del usuario
+        return  # Ya se sembró — respetar el estado actual del usuario
 
     conn.executescript("""
         INSERT OR IGNORE INTO tags (name, category, color) VALUES
@@ -322,10 +317,7 @@ def _seed_initial_data(conn):
     """)
 
     # Marcar como completado — nunca más volverá a correr
-    conn.execute(
-        "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
-        ('seeded', '1')
-    )
+    conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", ("seeded", "1"))
     conn.commit()
 
 
@@ -354,11 +346,20 @@ def photo_exists(path: str) -> bool:
     return conn.execute("SELECT 1 FROM photos WHERE path = ?", (path,)).fetchone() is not None
 
 
-def upsert_photo(path: str, filename: str, year: int | None, month: int | None,
-                 filesize: int, width: int | None = None, height: int | None = None,
-                 media_type: str = "image", duration: float | None = None) -> int:
+def upsert_photo(
+    path: str,
+    filename: str,
+    year: int | None,
+    month: int | None,
+    filesize: int,
+    width: int | None = None,
+    height: int | None = None,
+    media_type: str = "image",
+    duration: float | None = None,
+) -> int:
     with transaction() as conn:
-        cur = conn.execute("""
+        cur = conn.execute(
+            """
             INSERT INTO photos (path, filename, media_type, year, month,
                                 filesize, width, height, duration)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -372,7 +373,9 @@ def upsert_photo(path: str, filename: str, year: int | None, month: int | None,
                 height     = excluded.height,
                 duration   = excluded.duration
             RETURNING id
-        """, (path, filename, media_type, year, month, filesize, width, height, duration))
+        """,
+            (path, filename, media_type, year, month, filesize, width, height, duration),
+        )
         row = cur.fetchone()
         return row[0]
 
@@ -385,41 +388,40 @@ def update_photo_md5(photo_id: int, md5: str):
 def _row_to_photo(row: sqlite3.Row) -> Photo:
     keys = row.keys()
     return Photo(
-        id         = row["id"],
-        path       = row["path"],
-        filename   = row["filename"],
-        year       = row["year"],
-        month      = row["month"],
-        media_type = row["media_type"] or "image",
-        duration   = row["duration"],
-        filesize   = row["filesize"] if "filesize" in keys else None,
-        width      = row["width"]    if "width"    in keys else None,
-        height     = row["height"]   if "height"   in keys else None,
-        added_at   = row["added_at"] if "added_at" in keys else None,
-        md5        = row["md5"]      if "md5"      in keys else None,
+        id=row["id"],
+        path=row["path"],
+        filename=row["filename"],
+        year=row["year"],
+        month=row["month"],
+        media_type=row["media_type"] or "image",
+        duration=row["duration"],
+        filesize=row["filesize"] if "filesize" in keys else None,
+        width=row["width"] if "width" in keys else None,
+        height=row["height"] if "height" in keys else None,
+        added_at=row["added_at"] if "added_at" in keys else None,
+        md5=row["md5"] if "md5" in keys else None,
     )
 
 
 @dataclass(frozen=True)
 class PhotoFilter:
     """Filtros de la galería. Todos opcionales; se combinan con AND."""
-    tag_ids:        list[int] | None = None   # la foto debe tener TODAS
-    hidden_tag_ids: set[int] | None  = None   # excluir fotos con alguna
-    search:         str | None       = None   # LIKE en filename
-    folder:         str | None       = None   # carpeta y subcarpetas
-    untagged_only:  bool             = False
+
+    tag_ids: list[int] | None = None  # la foto debe tener TODAS
+    hidden_tag_ids: set[int] | None = None  # excluir fotos con alguna
+    search: str | None = None  # LIKE en filename
+    folder: str | None = None  # carpeta y subcarpetas
+    untagged_only: bool = False
 
 
 def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
     """WHERE parametrizado para un PhotoFilter (alias de photos: `p`)."""
-    clauses: list[str]   = []
-    params:  list[object] = []
+    clauses: list[str] = []
+    params: list[object] = []
 
     if f.hidden_tag_ids:
         placeholders = ",".join("?" * len(f.hidden_tag_ids))
-        clauses.append(
-            f"p.id NOT IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders}))"
-        )
+        clauses.append(f"p.id NOT IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders}))")
         params.extend(f.hidden_tag_ids)
 
     for tid in f.tag_ids or []:
@@ -440,32 +442,60 @@ def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
     return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
 
 
-def get_photos(tag_ids: list[int] | None = None, hidden_tag_ids: set[int] | None = None,
-               search: str | None = None, limit: int = 200, offset: int = 0,
-               sort_field: SortField = SortField.DATE,
-               sort_order: SortOrder = SortOrder.DESC,
-               folder: str | None = None,
-               untagged_only: bool = False) -> list[Photo]:
-    where_sql, params = _build_where(PhotoFilter(
-        tag_ids, hidden_tag_ids, search, folder, untagged_only,
-    ))
+def get_photos(
+    tag_ids: list[int] | None = None,
+    hidden_tag_ids: set[int] | None = None,
+    search: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+    sort_field: SortField = SortField.DATE,
+    sort_order: SortOrder = SortOrder.DESC,
+    folder: str | None = None,
+    untagged_only: bool = False,
+) -> list[Photo]:
+    where_sql, params = _build_where(
+        PhotoFilter(
+            tag_ids,
+            hidden_tag_ids,
+            search,
+            folder,
+            untagged_only,
+        )
+    )
     order_sql = sort_to_sql(sort_field, sort_order)
-    rows = get_connection().execute(f"""
+    rows = (
+        get_connection()
+        .execute(
+            f"""
         SELECT {_PHOTO_COLUMNS}
         FROM photos p
         {where_sql}
         ORDER BY {order_sql}
         LIMIT ? OFFSET ?
-    """, [*params, limit, offset]).fetchall()
+    """,
+            [*params, limit, offset],
+        )
+        .fetchall()
+    )
     return [_row_to_photo(r) for r in rows]
 
 
-def get_photo_count(tag_ids: list[int] | None = None, hidden_tag_ids: set[int] | None = None,
-                    search: str | None = None, folder: str | None = None,
-                    untagged_only: bool = False) -> int:
-    where_sql, params = _build_where(PhotoFilter(
-        tag_ids, hidden_tag_ids, search, folder, untagged_only,
-    ))
+def get_photo_count(
+    tag_ids: list[int] | None = None,
+    hidden_tag_ids: set[int] | None = None,
+    search: str | None = None,
+    folder: str | None = None,
+    untagged_only: bool = False,
+) -> int:
+    where_sql, params = _build_where(
+        PhotoFilter(
+            tag_ids,
+            hidden_tag_ids,
+            search,
+            folder,
+            untagged_only,
+        )
+    )
     row = get_connection().execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
     return row[0]
 
@@ -479,12 +509,9 @@ def get_folder_counts() -> list[tuple[str, int]]:
     return sorted(counts.items())
 
 
-def get_photo_by_id(photo_id: int) -> Optional[Photo]:
+def get_photo_by_id(photo_id: int) -> Photo | None:
     conn = get_connection()
-    row  = conn.execute(
-        f"SELECT {_PHOTO_COLUMNS}, p.md5 FROM photos p WHERE p.id = ?",
-        (photo_id,)
-    ).fetchone()
+    row = conn.execute(f"SELECT {_PHOTO_COLUMNS}, p.md5 FROM photos p WHERE p.id = ?", (photo_id,)).fetchone()
     return _row_to_photo(row) if row else None
 
 
@@ -502,15 +529,24 @@ def get_all_photo_paths() -> list[tuple[int, str]]:
 
 # Columnas de photos que se guardan en la papelera (todas menos id)
 _TRASH_PHOTO_FIELDS = (
-    "path", "filename", "media_type", "year", "month", "filesize",
-    "width", "height", "duration", "md5", "added_at",
+    "path",
+    "filename",
+    "media_type",
+    "year",
+    "month",
+    "filesize",
+    "width",
+    "height",
+    "duration",
+    "md5",
+    "added_at",
 )
 
 
 def _chunks(items: list, size: int = 500):
     # SQLite limita la cantidad de parámetros por consulta
     for i in range(0, len(items), size):
-        yield items[i:i + size]
+        yield items[i : i + size]
 
 
 def delete_photos(photo_ids: list[int], reason: str = "Eliminado") -> int:
@@ -526,54 +562,68 @@ def delete_photos(photo_ids: list[int], reason: str = "Eliminado") -> int:
     with transaction() as conn:
         for chunk in _chunks(photo_ids):
             ph = ",".join("?" * len(chunk))
-            photos = conn.execute(
-                f"SELECT id, {cols} FROM photos WHERE id IN ({ph})", chunk
-            ).fetchall()
+            photos = conn.execute(f"SELECT id, {cols} FROM photos WHERE id IN ({ph})", chunk).fetchall()
             tags: dict[int, list[dict]] = {}
-            for r in conn.execute(f"""
+            for r in conn.execute(
+                f"""
                 SELECT pt.photo_id, t.name, t.category, t.color
                 FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id
                 WHERE pt.photo_id IN ({ph})
-            """, chunk):
-                tags.setdefault(r[0], []).append(
-                    {"name": r[1], "category": r[2], "color": r[3]}
-                )
+            """,
+                chunk,
+            ):
+                tags.setdefault(r[0], []).append({"name": r[1], "category": r[2], "color": r[3]})
             conn.executemany(
                 "INSERT INTO deleted_photos (batch_id, reason, path, photo_json, tags_json) "
                 "VALUES (?, ?, ?, ?, ?)",
                 [
-                    (batch_id, reason, r["path"],
-                     json.dumps({k: r[k] for k in _TRASH_PHOTO_FIELDS}, ensure_ascii=False),
-                     json.dumps(tags.get(r["id"], []), ensure_ascii=False))
+                    (
+                        batch_id,
+                        reason,
+                        r["path"],
+                        json.dumps({k: r[k] for k in _TRASH_PHOTO_FIELDS}, ensure_ascii=False),
+                        json.dumps(tags.get(r["id"], []), ensure_ascii=False),
+                    )
                     for r in photos
                 ],
             )
             conn.execute(f"DELETE FROM photos WHERE id IN ({ph})", chunk)
-    logger.info("%d registros a la papelera interna (lote %s, %s)",
-                len(photo_ids), batch_id, reason)
+    logger.info("%d registros a la papelera interna (lote %s, %s)", len(photo_ids), batch_id, reason)
     return len(photo_ids)
 
 
 # ── Papelera interna ──────────────────────────────────────────────────────────
 
+
 def list_trash_batches() -> list[TrashBatch]:
-    rows = get_connection().execute("""
+    rows = (
+        get_connection()
+        .execute("""
         SELECT batch_id, reason, MIN(deleted_at) AS deleted_at, COUNT(*) AS n,
                SUM(CASE WHEN tags_json != '[]' THEN 1 ELSE 0 END) AS tagged
         FROM deleted_photos
         GROUP BY batch_id
         ORDER BY deleted_at DESC, MIN(id) DESC
-    """).fetchall()
-    return [TrashBatch(batch_id=r["batch_id"], reason=r["reason"], deleted_at=r["deleted_at"],
-                       count=r["n"], tagged=r["tagged"]) for r in rows]
+    """)
+        .fetchall()
+    )
+    return [
+        TrashBatch(
+            batch_id=r["batch_id"],
+            reason=r["reason"],
+            deleted_at=r["deleted_at"],
+            count=r["n"],
+            tagged=r["tagged"],
+        )
+        for r in rows
+    ]
 
 
 def count_trash() -> int:
     return get_connection().execute("SELECT COUNT(*) FROM deleted_photos").fetchone()[0]
 
 
-def _get_or_create_tag(conn: sqlite3.Connection, name: str,
-                       category: str | None, color: str | None) -> int:
+def _get_or_create_tag(conn: sqlite3.Connection, name: str, category: str | None, color: str | None) -> int:
     row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
     if row:
         return row[0]
@@ -598,9 +648,7 @@ def restore_trash_batch(batch_id: str) -> tuple[int, int]:
         ).fetchall()
         for e in entries:
             data = json.loads(e["photo_json"])
-            existing = conn.execute(
-                "SELECT id FROM photos WHERE path = ?", (data["path"],)
-            ).fetchone()
+            existing = conn.execute("SELECT id FROM photos WHERE path = ?", (data["path"],)).fetchone()
             if existing:
                 photo_id = existing[0]
                 merged += 1
@@ -641,6 +689,7 @@ def purge_trash(older_than_days: int | None = None) -> int:
 
 # ── Reubicar carpetas / unidades ──────────────────────────────────────────────
 
+
 def _strip_seps(folder: str) -> str:
     return os.path.normpath(folder).rstrip("/\\")
 
@@ -657,7 +706,7 @@ def get_relocation_plan(old_folder: str, new_folder: str) -> list[tuple[int, str
     ).fetchall()
     plan = []
     for pid, path in rows:
-        new_path = new_n + path[len(old_n):]
+        new_path = new_n + path[len(old_n) :]
         existing = conn.execute("SELECT id FROM photos WHERE path = ?", (new_path,)).fetchone()
         plan.append((pid, new_path, existing[0] if existing else None))
     return plan
@@ -691,15 +740,20 @@ def apply_relocation(plan: list[tuple[int, str, int | None]]) -> tuple[int, int]
 
 # ── Asignaciones foto ↔ etiqueta (exportar / importar) ───────────────────────
 
+
 def get_all_assignments() -> list[tuple[str, str, int | None, list[str]]]:
     """[(ruta, nombre, tamaño, [etiquetas])] de todas las fotos con etiquetas."""
-    rows = get_connection().execute("""
+    rows = (
+        get_connection()
+        .execute("""
         SELECT p.path, p.filename, p.filesize, t.name
         FROM photo_tags pt
         JOIN photos p ON p.id = pt.photo_id
         JOIN tags   t ON t.id = pt.tag_id
         ORDER BY p.path, t.name
-    """).fetchall()
+    """)
+        .fetchall()
+    )
     out: list[tuple[str, str, int | None, list[str]]] = []
     for path, filename, filesize, tag in rows:
         if out and out[-1][0] == path:
@@ -725,9 +779,7 @@ def add_assignments(pairs: list[tuple[int, int]]) -> int:
     """Agrega pares (photo_id, tag_id). Devuelve cuántos eran nuevos."""
     with transaction() as conn:
         before = conn.total_changes
-        conn.executemany(
-            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)", pairs
-        )
+        conn.executemany("INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)", pairs)
         return conn.total_changes - before
 
 
@@ -736,9 +788,9 @@ def get_tag_ids_by_name() -> dict[str, int]:
 
 
 def get_photo_ids_with_tag(tag_id: int) -> list[int]:
-    return [r[0] for r in get_connection().execute(
-        "SELECT photo_id FROM photo_tags WHERE tag_id = ?", (tag_id,)
-    )]
+    return [
+        r[0] for r in get_connection().execute("SELECT photo_id FROM photo_tags WHERE tag_id = ?", (tag_id,))
+    ]
 
 
 def get_tagged_photo_ids() -> list[int]:
@@ -749,7 +801,7 @@ def count_tagged(photo_ids: list[int]) -> int:
     """Cuántas de estas fotos tienen al menos una etiqueta."""
     if not photo_ids:
         return 0
-    conn  = get_connection()
+    conn = get_connection()
     total = 0
     for chunk in _chunks(photo_ids):
         placeholders = ",".join("?" * len(chunk))
@@ -771,10 +823,9 @@ def get_folder_photo_ids(folder: str) -> list[int]:
 
 # ── Configuración del usuario ─────────────────────────────────────────────────
 
+
 def get_setting(key: str, default: str | None = None) -> str | None:
-    row = get_connection().execute(
-        "SELECT value FROM app_settings WHERE key = ?", (key,)
-    ).fetchone()
+    row = get_connection().execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
     return row[0] if row else default
 
 
@@ -789,26 +840,30 @@ def set_setting(key: str, value: str) -> None:
 
 # ── Etiquetas de una foto ─────────────────────────────────────────────────────
 
+
 def _row_to_tag(row: sqlite3.Row) -> Tag:
     keys = row.keys()
     return Tag(
-        id             = row["id"],
-        name           = row["name"],
-        category       = row["category"] or "general",
-        color          = row["color"] or "#4A9EFF",
-        hidden         = bool(row["hidden"]) if "hidden" in keys else False,
-        sidebar_hidden = bool(row["sidebar_hidden"]) if "sidebar_hidden" in keys else False,
+        id=row["id"],
+        name=row["name"],
+        category=row["category"] or "general",
+        color=row["color"] or "#4A9EFF",
+        hidden=bool(row["hidden"]) if "hidden" in keys else False,
+        sidebar_hidden=bool(row["sidebar_hidden"]) if "sidebar_hidden" in keys else False,
     )
 
 
 def get_photo_tags(photo_id: int) -> list[Tag]:
     conn = get_connection()
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT t.id, t.name, t.category, t.color, t.hidden, t.sidebar_hidden
         FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
         WHERE pt.photo_id = ?
         ORDER BY t.category, t.name
-    """, (photo_id,)).fetchall()
+    """,
+        (photo_id,),
+    ).fetchall()
     return [_row_to_tag(r) for r in rows]
 
 
@@ -817,16 +872,13 @@ def set_photo_tags(photo_id: int, tag_ids: list[int]):
         conn.execute("DELETE FROM photo_tags WHERE photo_id = ?", (photo_id,))
         conn.executemany(
             "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)",
-            [(photo_id, tid) for tid in tag_ids]
+            [(photo_id, tid) for tid in tag_ids],
         )
 
 
 def add_tag_to_photo(photo_id: int, tag_id: int):
     with transaction() as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)",
-            (photo_id, tag_id)
-        )
+        conn.execute("INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)", (photo_id, tag_id))
 
 
 def add_tag_to_photos(photo_ids: list[int], tag_id: int):
@@ -834,28 +886,25 @@ def add_tag_to_photos(photo_ids: list[int], tag_id: int):
     with transaction() as conn:
         conn.executemany(
             "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)",
-            [(pid, tag_id) for pid in photo_ids]
+            [(pid, tag_id) for pid in photo_ids],
         )
 
 
 def remove_tag_from_photo(photo_id: int, tag_id: int):
     with transaction() as conn:
-        conn.execute(
-            "DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?",
-            (photo_id, tag_id)
-        )
+        conn.execute("DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?", (photo_id, tag_id))
 
 
 def remove_tag_from_photos(photo_ids: list[int], tag_id: int):
     """Quita una etiqueta de múltiples fotos de una vez."""
     with transaction() as conn:
         conn.executemany(
-            "DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?",
-            [(pid, tag_id) for pid in photo_ids]
+            "DELETE FROM photo_tags WHERE photo_id = ? AND tag_id = ?", [(pid, tag_id) for pid in photo_ids]
         )
 
 
 # ── Etiquetas globales ────────────────────────────────────────────────────────
+
 
 def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
     conn = get_connection()
@@ -881,14 +930,12 @@ def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> 
     with transaction() as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO tags (name, category, color) VALUES (?, ?, ?) RETURNING id",
-            (name.strip().lower(), category, color)
+            (name.strip().lower(), category, color),
         )
         row = cur.fetchone()
         if row:
             return row[0]
-        return conn.execute(
-            "SELECT id FROM tags WHERE name = ?", (name.strip().lower(),)
-        ).fetchone()[0]
+        return conn.execute("SELECT id FROM tags WHERE name = ?", (name.strip().lower(),)).fetchone()[0]
 
 
 class TagNameConflictError(ValueError):
@@ -897,14 +944,12 @@ class TagNameConflictError(ValueError):
 
 def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
     """Cambia nombre, categoría y color de una etiqueta existente."""
-    name     = name.strip().lower()
+    name = name.strip().lower()
     category = category.strip().lower() or "general"
     if not name:
         raise ValueError("El nombre de etiqueta no puede estar vacío.")
     with transaction() as conn:
-        clash = conn.execute(
-            "SELECT id FROM tags WHERE name = ? AND id != ?", (name, tag_id)
-        ).fetchone()
+        clash = conn.execute("SELECT id FROM tags WHERE name = ? AND id != ?", (name, tag_id)).fetchone()
         if clash:
             raise TagNameConflictError(f"Ya existe una etiqueta llamada '{name}'.")
         conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
@@ -915,16 +960,20 @@ def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
 
 
 def count_photos_with_tag(tag_id: int) -> int:
-    return get_connection().execute(
-        "SELECT COUNT(*) FROM photo_tags WHERE tag_id = ?", (tag_id,)
-    ).fetchone()[0]
+    return (
+        get_connection().execute("SELECT COUNT(*) FROM photo_tags WHERE tag_id = ?", (tag_id,)).fetchone()[0]
+    )
 
 
-def get_tag(tag_id: int) -> Optional[Tag]:
-    row = get_connection().execute(
-        "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags WHERE id = ?",
-        (tag_id,),
-    ).fetchone()
+def get_tag(tag_id: int) -> Tag | None:
+    row = (
+        get_connection()
+        .execute(
+            "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags WHERE id = ?",
+            (tag_id,),
+        )
+        .fetchone()
+    )
     return _row_to_tag(row) if row else None
 
 
@@ -947,12 +996,13 @@ def get_tags_by_category(category: str) -> list[Tag]:
     conn = get_connection()
     rows = conn.execute(
         "SELECT id, name, color, category, hidden, sidebar_hidden FROM tags WHERE category = ? ORDER BY name",
-        (category,)
+        (category,),
     ).fetchall()
     return [_row_to_tag(r) for r in rows]
 
 
 # ── Categorías ────────────────────────────────────────────────────────────────
+
 
 def get_all_categories() -> list[str]:
     conn = get_connection()
@@ -988,10 +1038,11 @@ def delete_category(name: str, move_to: str = "general"):
 
 # ── Estadísticas ──────────────────────────────────────────────────────────────
 
+
 def get_stats() -> Stats:
     conn = get_connection()
     total_photos = conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0]
-    total_tags   = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+    total_tags = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
 
     years = [
         (r["year"], r["c"])
@@ -1021,10 +1072,10 @@ def get_stats() -> Stats:
     ]
 
     return Stats(
-        total_photos = total_photos,
-        total_tags   = total_tags,
-        years        = years,
-        by_month     = by_month,
-        by_type      = by_type,
-        top_tags     = top_tags,
+        total_photos=total_photos,
+        total_tags=total_tags,
+        years=years,
+        by_month=by_month,
+        by_type=by_type,
+        top_tags=top_tags,
     )

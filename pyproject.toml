@@ -27,13 +27,11 @@ select = [
     "UP",       # sintaxis moderna de Python
 ]
 ignore = [
-    # Estilo compacto existente en la UI (varias sentencias por línea).
-    # Se revisará al dividir main.py en la fase 3.
-    "E701", "E702", "E741",
-    "E221", "E241", "E251", "E272",  # alineación de "=" en columnas, usada a propósito
-    "UP006", "UP035",                # list[...] vs typing.List: el código ya es mixto
-    "UP045",                         # Optional[X] → X | None: migrar en la fase 3
+    "E501",   # el formateador ya maneja el largo; quedan solo strings largos
 ]
+
+[tool.ruff.format]
+# Comillas dobles, sangría de 4 espacios (estilo por defecto, como Black)
 
 [tool.ruff.lint.isort]
 known-first-party = [
