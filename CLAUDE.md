@@ -11,7 +11,7 @@
 PhotoVault es una app de escritorio (Windows) para **indexar, navegar, etiquetar y filtrar** una colección personal de fotos y videos muy grande (~172.000 archivos en la DB real, y creciendo). La idea es tener algo rápido y local que no tenga las limitaciones de los gestores genéricos.
 
 - **Usuario / dueño:** Jose. Comunícate en **español**.
-- **Entorno:** Windows, VS Code, se ejecuta con `python main.py` desde la terminal integrada.
+- **Entorno:** Windows, VS Code, se ejecuta con `py main.py` desde la terminal integrada.
 - **Python:** 3.14, instalado en `%LOCALAPPDATA%\Python\pythoncore-3.14-64\` (**no está en el PATH**; usa `py`). `python3` en Windows es un alias de la Microsoft Store que se queda colgado: **no usarlo**.
 - **Entorno virtual de desarrollo:** `.venv\` (creado con `--system-site-packages`, reutiliza PyQt6/Pillow/opencv globales; agrega pytest, ruff, mypy).
 - **Repo:** GitHub `Z4MU/Photo-vault`, rama `main`. La raíz de este directorio es el repo.
@@ -44,7 +44,8 @@ Datos del usuario (fuera del repo, nunca commitear):
 ## 3. Estructura de archivos
 
 ```
-main.py             UI completa (ventana principal + todos los diálogos) + arranque (_startup)
+main.py             Solo el arranque: main() + _startup() (backup, migraciones, papelera)
+config.py           Rutas de datos, versión, tamaños de miniatura, paleta (COLORS)
 services.py         Lógica de negocio. La UI SOLO habla con esta capa.
 database.py         Acceso a SQLite: conexiones, migraciones versionadas, queries
 models.py           Dataclasses tipadas + enums de ordenamiento
@@ -53,30 +54,48 @@ thumbnail_cache.py  Caché persistente de miniaturas en disco
 backup.py           Backups rotativos de la DB (diario + pre-migración)
 xmp_sidecar.py      Leer/escribir etiquetas en archivos .xmp junto a las fotos
 logging_setup.py    Logging a archivo + captura global de excepciones
+ui/
+  style.py + dark.qss   Tema oscuro (el QSS es un archivo aparte, va en `datas` del .spec)
+  workers.py            QThreads, retire_thread, TaskWorker, run_with_progress
+  widgets.py            PhotoThumbnail, ClickableRow, clear_layout, layout_widgets
+  images.py             load_preview_pixmap
+  charts.py             build_bar_chart_svg (sin Qt, testeable)
+  main_window.py        MainWindow
+  dialogs/
+    photo.py            PhotoDetailDialog, BulkTagDialog
+    stats.py            StatsDialog
+    duplicates.py       DuplicatesDialog
+    quick_tag.py        QuickTagSetupDialog, QuickTagWindow
+    settings.py         SettingsDialog
+    tags.py             CategoryManagerDialog, EditTagDialog, TagManagerDialog
+    folders.py          IndexDialog, DeindexDialog, RelocateDialog, TrashDialog
 tests/              Suite de pytest (conftest.py aísla DB, backups y caché en tmp)
-pyproject.toml      Config de pytest, ruff y mypy
+pyproject.toml      Config de pytest, ruff (lint + format) y mypy
 requirements.txt    Dependencias de la app
-requirements-dev.txt Dependencias de desarrollo
+requirements-dev.txt Dependencias de desarrollo (pytest, pytest-cov, ruff, mypy)
 PhotoVault.spec     Configuración de PyInstaller
 build.bat           Script de build para Windows (autodetecta Python)
 ROADMAP.md          Plan por fases con casillas
 ```
 
+Al agregar UI nueva: un diálogo por archivo/área en `ui/dialogs/`; widgets reutilizables en `ui/widgets.py`; nada de lógica de negocio ni SQL en `ui/`. Ningún archivo debería pasar de ~600 líneas.
+
 ### Flujo de capas (respetar siempre)
 
 ```
-main.py (UI)  →  services.py  →  database.py  →  SQLite
-                     ↓                ↓
-              thumbnail_cache.py   backup.py
+main.py → ui/ → services.py → database.py → SQLite
+                     ↓              ↓
+              thumbnail_cache   backup.py
               indexer.py
               xmp_sidecar.py
+(config.py lo usan todos; no importa nada del proyecto)
 ```
 
 **Reglas:**
-- La UI **no** escribe SQL ni llama a `database` directamente. Excepciones existentes y permitidas: `db.init_db()`, `db.close_connection()`, `db.DB_PATH`, `db.SCHEMA_VERSION` y `db.DatabaseTooNewError` (en `_startup`).
+- La UI **no** escribe SQL ni llama a `database` directamente. Excepciones existentes y permitidas: `db.init_db()`, `db.close_connection()` (workers), `db.DB_PATH`, `db.SCHEMA_VERSION` y `db.DatabaseTooNewError` (en `main.py`).
 - `database.py` devuelve **modelos** (`Photo`, `Tag`, `Stats`…), nunca `sqlite3.Row` hacia afuera.
-- La lógica que combina varias queries (p. ej. obtener tags ocultos + contar + paginar) vive en `services.py`.
-- ⚠️ Hoy `services.py` todavía tiene SQL directo en `get_indexed_folders` y `purge_cache_orphans` → se mueve a `database.py` en la fase 3.
+- La lógica que combina varias queries (p. ej. obtener tags ocultos + contar + paginar) vive en `services.py`. `services.py` no tiene SQL.
+- `main.py` importa arriba **solo** `logging_setup` (que solo importa `config`). Todo lo demás se importa dentro de `main()`/`_startup()`, después de `setup_logging()`, para que un fallo al importar quede en el log (test: `test_startup.py`).
 
 ---
 
@@ -135,7 +154,7 @@ Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`.
 - Si la ruta nueva ya estaba indexada (se re-indexó), se fusionan: etiquetas al registro existente y el viejo se quita.
 
 ### Filtros de consulta
-`get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (carpeta y subcarpetas), `untagged_only`, más `limit/offset/sort_field/sort_order`.
+`get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (carpeta y subcarpetas), `untagged_only`, más `limit/offset/sort_field/sort_order`. Ambas arman el WHERE con **`_build_where(PhotoFilter(...))`**: un filtro nuevo se agrega ahí (una sola vez) y en `PhotoFilter`.
 
 **Filtro de carpeta:** siempre con `folder_like_pattern(folder)` + `LIKE ? ESCAPE '!'`. Normaliza la ruta, agrega el separador final (`D:\Fotos` no incluye `D:\Fotos2`) y escapa `%`/`_`. El escape es `!` porque `\` es el separador de Windows. Nunca volver a `LIKE folder + '%'`.
 
@@ -213,10 +232,16 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 
 ---
 
-## 10. UI (`main.py`)
+## 10. UI (`ui/`)
 
-### Arranque
-`__main__` → `setup_logging()` → `QApplication` → `install_qt_handlers()` → `_startup()` (backup diario + `init_db()`; si falla muestra el error y sale con código 1) → `MainWindow`.
+### Arranque (`main.py`)
+`main()` → `setup_logging()` → imports (si fallan: log + código 2) → `QApplication` → `install_qt_handlers()` → `_startup()` (backup diario + `init_db()` + purgar papelera; si falla muestra el error y sale con código 1) → `MainWindow`.
+
+### Helpers de `ui/widgets.py` (usar siempre)
+- `clear_layout(layout)`: vacía un layout **incluidos los espaciadores** (antes se acumulaban los `addStretch()` en cada refresco). No escribir el bucle `reversed(range(count()))` a mano.
+- `layout_widgets(layout)`: widgets directos de un layout, sin `None`.
+- `ClickableRow`: `QWidget` con señal `clicked`. No reasignar `mousePressEvent` con lambdas.
+- No llamar `self.scroll` a un atributo de un widget: tapa `QWidget.scroll()`. Los diálogos usan `self.scroll_box`.
 
 ### Hilos
 Todos heredan de `StoppableThread` (`stop()`, `is_stopping()`):
@@ -228,11 +253,12 @@ Todos heredan de `StoppableThread` (`stop()`, `is_stopping()`):
 **Reglas de hilos (causaron crashes `QThread: Destroyed while thread is still running`):**
 - Un worker **nunca** crea `QPixmap` ni widgets: emite `QImage`/datos y el `QPixmap` se crea en el slot (hilo de UI).
 - **Nunca** redefinir la señal `finished` de `QThread` (tapa la original); para resultados usar `completed`.
-- Para descartar un worker que sigue corriendo: `_disconnect_all(señales…)` → `retire_thread(w)`. Pide que pare y guarda la referencia en `_retired_threads` hasta que emita `finished`: no bloquea la UI y Python nunca destruye un hilo vivo. `_stop_loader()` hace esto con el loader de la galería.
+- Para descartar un worker que sigue corriendo: `disconnect_all(señales…)` → `retire_thread(w)`. Pide que pare y guarda la referencia en `_retired_threads` hasta que emita `finished`: no bloquea la UI y Python nunca destruye un hilo vivo. `_stop_loader()` hace esto con el loader de la galería.
 - Los diálogos con workers (`DuplicatesDialog`, `IndexDialog`, `DeindexDialog`) sobreescriben `done()` (se llama al cerrar por cualquier vía: botón, Esc, X) para retirar su worker. `IndexDialog` pregunta antes de cancelar.
 - `MainWindow.closeEvent` detiene timers, retira el loader y llama `wait_all_threads()`.
 - Las funciones lentas de `services`/`indexer` aceptan `should_stop` para que el worker pueda cancelarlas.
 - No llamar una señal propia `done` en una subclase de `QDialog` (choca con `QDialog.done`). Por eso `QuickTagWindow` usa `done_signal`.
+- Conectar señales de workers a **métodos** (`_on_progress`, `_on_error`…), no a lambdas que devuelven tuplas `(a(), b())`.
 
 ### Imágenes grandes
 `load_preview_pixmap(path, max_side)`: `QImageReader` con `setAutoTransform(True)` (orientación EXIF) y `setScaledSize` (no carga el original completo). Si Qt no puede leer el formato (HEIC), usa la miniatura de Pillow. Usarla en vez de `QPixmap(path)`.
@@ -277,9 +303,9 @@ Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML u
 Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existen, se quitan con "Eliminar" en su carpeta. `delete_missing(report)` solo borra `report.missing_ids`. Nunca volver a un "buscar y borrar" en un solo paso.
 
 ### Estilo visual
-- Tema oscuro único definido en la constante `DARK_STYLE` (al final de `main.py`).
-- Paleta: fondo `#0D0D1A`, paneles `#13131F` / `#1E1E2E`, bordes `#2D2D3F` / `#3A3A5A`, acento `#4A9EFF`, peligro `#FF4A4A`, advertencia `#FFD700`.
-- Mantener esta paleta en cualquier UI nueva.
+- Tema oscuro único: `ui/dark.qss`, cargado por `ui/style.py` como `DARK_STYLE` (si el archivo faltara, la app abre sin estilos y lo registra en el log).
+- Paleta en `config.COLORS`: fondo `#0D0D1A`, paneles `#13131F` / `#1E1E2E`, bordes `#2D2D3F` / `#3A3A5A`, acento `#4A9EFF`, peligro `#FF4A4A`, advertencia `#FFD700`, éxito `#4AFF9E`.
+- Mantener esta paleta en cualquier UI nueva. (Los estilos en línea existentes todavía usan los hex literales.)
 
 ### Formato de exportación de tags (JSON, versión 2)
 ```json
@@ -316,16 +342,22 @@ py main.py
 py -m venv --system-site-packages .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
 
-# Verificación (correr SIEMPRE antes de commitear)
+# Verificación (correr SIEMPRE antes de commitear; todo debe dar 0 errores)
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\ruff.exe check
-.\.venv\Scripts\mypy.exe            # informativo por ahora (ver línea base abajo)
+.\.venv\Scripts\ruff.exe format --check
+.\.venv\Scripts\mypy.exe
+
+# Cobertura (opcional)
+.\.venv\Scripts\python.exe -m pytest -q --cov=database --cov=services --cov-report=term-missing
 
 # Generar el .exe (o doble clic en build.bat)
 py -m PyInstaller PhotoVault.spec --noconfirm
 ```
 
-- Salida: `dist\PhotoVault.exe` (un solo archivo, `console=False`, UPX activado, ~148 MB).
+- Salida: `dist\PhotoVault.exe` (un solo archivo, `console=False`, UPX activado, ~150 MB).
+- Archivos que no son `.py` (hoy: `ui/dark.qss`) van en `datas` del `.spec`; si no, el `.exe` no los encuentra.
+- ⚠️ Al probar el `.exe` desde un script: en modo un-solo-archivo el `.exe` lanza un **proceso hijo**. Matar solo el padre deja el hijo vivo (y bloquea `dist\PhotoVault.exe` para la próxima compilación). Cerrar con `taskkill /PID <pid> /T /F`.
 - `build.bat` busca Python en: PATH → `py` → `%LOCALAPPDATA%\Python\pythoncore-*` → instalaciones típicas.
 - Si el `.exe` abre y se cierra: revisar `~/.photovault/logs/photovault.log`. Si no hay nada, poner `console=True` en el `.spec`, recompilar y ver el traceback.
 - `hiddenimports` incluye `PyQt6.QtSvg`, `PyQt6.QtSvgWidgets`, `cv2`, `pillow_heif`, `send2trash.win(.legacy)`. Si agregas un import dinámico nuevo, añádelo ahí.
@@ -336,14 +368,16 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - `make_legacy_db(path)` simula una DB de V1 para probar migraciones.
 - Para probar contra datos reales: copiar la DB real con la API de backup (abriéndola `?mode=ro`) a un directorio temporal y apuntar `DB_PATH` ahí. Nunca contra la DB real.
 - Si tocas `DATE_PATTERNS`: agregar casos válidos y falsos positivos en `tests/test_dates.py`.
-- `tests/test_ui_helpers.py` usa `QT_QPA_PLATFORM=offscreen` para probar funciones de `main.py` sin ventanas.
+- `tests/test_ui_helpers.py` usa `QT_QPA_PLATFORM=offscreen` para probar la UI sin ventanas; incluye un test que importa **todos** los módulos de `ui/` (detecta imports rotos o circulares).
 - Archivos de prueba (JPEG con EXIF, orientación, etc.) se generan con Pillow dentro del test; no hay fixtures binarios en el repo.
 - Al arreglar un bug, agregar un test que falle sin el arreglo.
+- `ResourceWarning` (archivo o conexión SQLite sin cerrar) en un test = **error** (`filterwarnings` en `pyproject.toml`).
+- Cobertura actual: `database` 97 %, `services` 92 %.
 
-### Lint
-- `ruff` con reglas E, W, F, B, I, UP. Se ignoran a propósito las reglas del estilo compacto de la UI (`E701/E702`, alineación de `=`) hasta la fase 3.
-- **No correr `ruff format`** todavía: reformatearía todo `main.py`. Se hará al dividirlo en la fase 3.
-- `mypy`: línea base de **24 errores**, todos de `Optional` implícito (parámetros `= None` tipados como `str`/`list[int]`) y la lista `params` sin anotar en `get_photos`/`get_photo_count`. Se corrigen en la fase 3; no agregar errores nuevos.
+### Lint y formato
+- `ruff check` con reglas E, W, F, B, I, UP (solo se ignora E501: el formateador maneja el largo).
+- `ruff format` (estilo Black, línea de 110). Todo el código ya está formateado: una sentencia por línea, sin alineación manual de `=`.
+- `mypy` con `check_untyped_defs` y `no_implicit_optional`: **0 errores**. No agregar errores nuevos; usar `X | None` (no `Optional`).
 
 ---
 
@@ -355,7 +389,8 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - Toda operación lenta (I/O masivo, hashing, escaneo) va en un `QThread`, nunca en el hilo de UI.
 - Acciones destructivas sobre archivos del disco siempre con `QMessageBox.question` de confirmación.
 - Logging en lugar de `print`; nada de `except: pass` silencioso.
-- Commits pequeños, un tema por commit, mensaje en español. Correr tests + ruff antes.
+- Commits pequeños, un tema por commit, mensaje en español. Correr tests + ruff + mypy antes. Movimientos de código y formato van en commits propios (sin cambios de lógica).
+- Constantes (rutas, tamaños, colores) en `config.py`, no repetidas en los módulos.
 
 ---
 
@@ -365,7 +400,9 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-3. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces (EXIF + tamaño); `get_photos_for_tagging` con `limit=99_999`; `get_indexed_folders` carga todas las rutas en Python → fase 4.
+3. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces (EXIF + tamaño); `get_photos_for_tagging` con `limit=99_999`; `get_folder_counts` carga todas las rutas en Python → fase 4.
+8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
+9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
 4. `QuickTagWindow` y `PhotoDetailDialog` cargan imágenes en el hilo de UI (con `load_preview_pixmap` ya es rápido, pero un HEIC grande sin caché tarda) → fase 5/7.
 5. `SettingsDialog._clear_cache` borra el caché con `shutil.rmtree` en el hilo de UI y sin confirmar (es regenerable, pero con 170k miniaturas tarda).
 6. El caché de miniaturas de antes de la fase 1 (formato sin tamaño) queda como huérfano hasta pulsar **Purgar huérfanos** en Configuración.
@@ -398,3 +435,8 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - Cambiar la letra de la unidad obligaba a re-indexar y perder etiquetas → Reubicar.
 - El JSON exportado no incluía las asignaciones foto↔etiqueta → formato v2.
 - `preview_relocation("")` no fallaba porque `normpath("")` es `"."` → validar antes de normalizar.
+- `main.py` de 2.800 líneas → paquete `ui/`.
+- Borrar layouts dejaba acumulados los `addStretch()` → `clear_layout`.
+- `self.scroll` en diálogos tapaba `QWidget.scroll()` → `self.scroll_box`.
+- Un fallo al importar la UI cerraba el `.exe` sin dejar log → imports después de `setup_logging()`.
+- Error del cálculo de MD5 dejaba visible la barra de progreso.

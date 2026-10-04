@@ -64,18 +64,20 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 3 — Reestructuración del código
+## Fase 3 — Reestructuración del código ✅
 *Objetivo: dejar el código listo para crecer. No cambia nada de lo que se ve en la app.*
 
-- [ ] #71 ⭐ [M] Dividir `main.py` en `ui/widgets`, `ui/dialogs`, `ui/workers`
-- [ ] #72 [B] Un solo constructor de filtros SQL (hoy duplicado en `get_photos`/`get_photo_count`)
-- [ ] #73 [B] Todo el SQL dentro de `database.py`
-- [ ] #77 [B] `config.py` + QSS en archivo aparte
-- [ ] #79 [M] Tests de `database` y `services`
-- [ ] Corregir los 24 errores de `mypy` y endurecer la config
-- [ ] `ruff format` sobre el código ya dividido
+- [x] #71 ⭐ [M] `main.py` (2.800 líneas) → paquete `ui/` con 13 módulos (el más grande: `folders.py`, ~590 líneas tras el formato)
+- [x] #72 [B] Un solo constructor de filtros SQL (`PhotoFilter` + `_build_where`)
+- [x] #73 [B] Todo el SQL dentro de `database.py`
+- [x] #77 [B] `config.py` + QSS en `ui/dark.qss`
+- [x] #79 [M] Tests de `database` (97 %) y `services` (92 %); 151 tests en total
+- [x] `mypy` estricto (`check_untyped_defs`): de 24 errores a 0
+- [x] `ruff format` + todas las reglas de lint activas
+- [x] *(extra)* `clear_layout` (los layouts acumulaban espaciadores), `self.scroll` ya no tapa `QWidget.scroll()`, `ClickableRow`
+- [x] *(extra)* `main.py` importa la UI después de configurar el logging; el `.exe` se compiló y probó
 
-**Hecho cuando:** la app se comporta igual, ningún archivo pasa de ~500 líneas y hay buena cobertura en `database`/`services`.
+**Hecho cuando:** la app se comporta igual (23 pruebas de humo con copia de la DB real ✓), los archivos son chicos y hay buena cobertura ✓.
 
 ---
 
