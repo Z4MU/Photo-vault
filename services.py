@@ -29,14 +29,14 @@ StopCheck        = Callable[[], bool]
 # ── Galería ───────────────────────────────────────────────────────────────────
 
 def get_gallery_page(
-    tag_ids:      list[int]  = None,
-    search:       str        = None,
-    limit:        int        = 100,
-    offset:       int        = 0,
-    sort_field:   SortField  = SortField.DATE,
-    sort_order:   SortOrder  = SortOrder.DESC,
-    folder:       str        = None,
-    untagged_only: bool      = False,
+    tag_ids:       list[int] | None = None,
+    search:        str | None       = None,
+    limit:         int              = 100,
+    offset:        int              = 0,
+    sort_field:    SortField        = SortField.DATE,
+    sort_order:    SortOrder        = SortOrder.DESC,
+    folder:        str | None       = None,
+    untagged_only: bool             = False,
 ) -> GalleryPage:
     hidden = db.get_hidden_tag_ids()
     total  = db.get_photo_count(
@@ -55,9 +55,9 @@ def get_gallery_page(
 
 
 def get_photos_for_tagging(
-    folder:       str       = None,
-    tag_ids:      list[int] = None,
-    untagged_only: bool     = False,
+    folder:        str | None       = None,
+    tag_ids:       list[int] | None = None,
+    untagged_only: bool             = False,
 ) -> list[Photo]:
     """
     Devuelve la lista completa de fotos para el modo etiquetado rápido.
@@ -760,11 +760,8 @@ def deindex_folder(folder: str) -> int:
 
 
 def get_indexed_folders() -> list[tuple[str, int]]:
-    from collections import Counter
-    conn   = db.get_connection()
-    rows   = conn.execute("SELECT path FROM photos ORDER BY path").fetchall()
-    counts: Counter = Counter(str(Path(r[0]).parent) for r in rows)
-    return sorted(counts.items(), key=lambda x: x[0])
+    """[(carpeta, n.º de archivos directamente en ella)] ordenado por carpeta."""
+    return db.get_folder_counts()
 
 
 def purge_cache_orphans() -> int:
@@ -772,6 +769,4 @@ def purge_cache_orphans() -> int:
     Elimina del caché de miniaturas los archivos que ya no tienen registro en la DB.
     Devuelve la cantidad de archivos eliminados.
     """
-    conn  = db.get_connection()
-    paths = [r[0] for r in conn.execute("SELECT path FROM photos").fetchall()]
-    return thumbnail_cache.purge_orphans(paths)
+    return thumbnail_cache.purge_orphans([path for _pid, path in db.get_all_photo_paths()])

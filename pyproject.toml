@@ -9,6 +9,8 @@ requires-python = ">=3.12"
 testpaths = ["tests"]
 pythonpath = ["."]
 addopts = "-ra"
+# Archivos o conexiones sin cerrar en los tests = error
+filterwarnings = ["error::ResourceWarning", "error::pytest.PytestUnraisableExceptionWarning"]
 
 # ── ruff ──────────────────────────────────────────────────────────────────────
 [tool.ruff]
@@ -46,6 +48,8 @@ files = ["*.py", "tests"]
 exclude = ["^Fotos V", "^build/", "^dist/"]
 ignore_missing_imports = true
 warn_unused_ignores = true
-# Arranque gradual: se irá endureciendo en la fase 3
-check_untyped_defs = false
+no_implicit_optional = true
+# Se revisan también los cuerpos de funciones sin anotar (la UI tiene muchas)
+check_untyped_defs = true
+# Funciones nuevas con type hints (CLAUDE.md §12), pero no se exige en todo
 disallow_untyped_defs = false

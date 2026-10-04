@@ -21,11 +21,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import config
 import services
 import thumbnail_cache
 from models import Photo, Tag
 from ui.images import load_preview_pixmap
 from ui.style import DARK_STYLE
+from ui.widgets import clear_layout
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,7 @@ class PhotoDetailDialog(QDialog):
             left = QWidget(); left.setMinimumWidth(500)
             ll   = QVBoxLayout(left)
             ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = thumbnail_cache.get_video_thumbnail(self.photo.path, size=480)
+            thumb = thumbnail_cache.get_video_thumbnail(self.photo.path, size=config.THUMB_SIZE_LARGE)
             lbl   = QLabel(); lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             if thumb:
                 pix = QPixmap(); pix.loadFromData(thumb); lbl.setPixmap(pix)
@@ -72,9 +74,9 @@ class PhotoDetailDialog(QDialog):
         else:
             img = QLabel(); img.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img.setMinimumWidth(500)
-            pix = load_preview_pixmap(self.photo.path, 560)
-            if pix is not None:
-                img.setPixmap(pix)
+            preview = load_preview_pixmap(self.photo.path, 560)
+            if preview is not None:
+                img.setPixmap(preview)
             else:
                 img.setText("No se pudo cargar la imagen")
             layout.addWidget(img)
@@ -105,8 +107,7 @@ class PhotoDetailDialog(QDialog):
         layout.addLayout(right)
 
     def _load_tags(self):
-        for i in reversed(range(self.tags_layout.count())):
-            self.tags_layout.itemAt(i).widget().deleteLater()
+        clear_layout(self.tags_layout)
         for tag in services.get_photo_tags(self.photo.id):
             self.tags_layout.addWidget(self._chip(tag))
         self.tag_combo.clear()

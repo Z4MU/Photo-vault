@@ -10,15 +10,16 @@ import sqlite3
 import threading
 import uuid
 from collections.abc import Callable
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Optional
 
 import backup
+import config
 from models import Photo, SortField, SortOrder, Stats, Tag, TrashBatch, sort_to_sql
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path.home() / ".photovault" / "photovault.db"
+DB_PATH = config.DB_PATH
 
 _local = threading.local()
 
@@ -399,90 +400,83 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
     )
 
 
-def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
-               search: str = None, limit: int = 200, offset: int = 0,
+@dataclass(frozen=True)
+class PhotoFilter:
+    """Filtros de la galería. Todos opcionales; se combinan con AND."""
+    tag_ids:        list[int] | None = None   # la foto debe tener TODAS
+    hidden_tag_ids: set[int] | None  = None   # excluir fotos con alguna
+    search:         str | None       = None   # LIKE en filename
+    folder:         str | None       = None   # carpeta y subcarpetas
+    untagged_only:  bool             = False
+
+
+def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
+    """WHERE parametrizado para un PhotoFilter (alias de photos: `p`)."""
+    clauses: list[str]   = []
+    params:  list[object] = []
+
+    if f.hidden_tag_ids:
+        placeholders = ",".join("?" * len(f.hidden_tag_ids))
+        clauses.append(
+            f"p.id NOT IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders}))"
+        )
+        params.extend(f.hidden_tag_ids)
+
+    for tid in f.tag_ids or []:
+        clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
+        params.append(tid)
+
+    if f.search:
+        clauses.append("p.filename LIKE ?")
+        params.append(f"%{f.search}%")
+
+    if f.folder:
+        clauses.append("p.path LIKE ? ESCAPE '!'")
+        params.append(folder_like_pattern(f.folder))
+
+    if f.untagged_only:
+        clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
+
+    return ("WHERE " + " AND ".join(clauses)) if clauses else "", params
+
+
+def get_photos(tag_ids: list[int] | None = None, hidden_tag_ids: set[int] | None = None,
+               search: str | None = None, limit: int = 200, offset: int = 0,
                sort_field: SortField = SortField.DATE,
                sort_order: SortOrder = SortOrder.DESC,
-               folder: str = None,
+               folder: str | None = None,
                untagged_only: bool = False) -> list[Photo]:
-    params = []
-    where_clauses = []
-
-    if hidden_tag_ids:
-        placeholders = ",".join("?" * len(hidden_tag_ids))
-        where_clauses.append(f"""
-            p.id NOT IN (
-                SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders})
-            )
-        """)
-        params.extend(hidden_tag_ids)
-
-    if tag_ids:
-        for tid in tag_ids:
-            where_clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
-            params.append(tid)
-
-    if search:
-        where_clauses.append("p.filename LIKE ?")
-        params.append(f"%{search}%")
-
-    if folder:
-        where_clauses.append("p.path LIKE ? ESCAPE '!'")
-        params.append(folder_like_pattern(folder))
-
-    if untagged_only:
-        where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
-
-    where_sql  = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-    order_sql  = sort_to_sql(sort_field, sort_order)
-
-    conn = get_connection()
-    rows = conn.execute(f"""
+    where_sql, params = _build_where(PhotoFilter(
+        tag_ids, hidden_tag_ids, search, folder, untagged_only,
+    ))
+    order_sql = sort_to_sql(sort_field, sort_order)
+    rows = get_connection().execute(f"""
         SELECT {_PHOTO_COLUMNS}
         FROM photos p
         {where_sql}
         ORDER BY {order_sql}
         LIMIT ? OFFSET ?
-    """, params + [limit, offset]).fetchall()
-
+    """, [*params, limit, offset]).fetchall()
     return [_row_to_photo(r) for r in rows]
 
 
-def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
-                    search: str = None, folder: str = None,
+def get_photo_count(tag_ids: list[int] | None = None, hidden_tag_ids: set[int] | None = None,
+                    search: str | None = None, folder: str | None = None,
                     untagged_only: bool = False) -> int:
-    params = []
-    where_clauses = []
-
-    if hidden_tag_ids:
-        placeholders = ",".join("?" * len(hidden_tag_ids))
-        where_clauses.append(f"""
-            p.id NOT IN (
-                SELECT photo_id FROM photo_tags WHERE tag_id IN ({placeholders})
-            )
-        """)
-        params.extend(hidden_tag_ids)
-
-    if tag_ids:
-        for tid in tag_ids:
-            where_clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
-            params.append(tid)
-
-    if search:
-        where_clauses.append("p.filename LIKE ?")
-        params.append(f"%{search}%")
-
-    if folder:
-        where_clauses.append("p.path LIKE ? ESCAPE '!'")
-        params.append(folder_like_pattern(folder))
-
-    if untagged_only:
-        where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
-
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-    conn = get_connection()
-    row  = conn.execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
+    where_sql, params = _build_where(PhotoFilter(
+        tag_ids, hidden_tag_ids, search, folder, untagged_only,
+    ))
+    row = get_connection().execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
     return row[0]
+
+
+def get_folder_counts() -> list[tuple[str, int]]:
+    """[(carpeta, n.º de archivos directamente en ella)] ordenado por carpeta."""
+    counts: dict[str, int] = {}
+    for (path,) in get_connection().execute("SELECT path FROM photos"):
+        parent = os.path.dirname(path)
+        counts[parent] = counts.get(parent, 0) + 1
+    return sorted(counts.items())
 
 
 def get_photo_by_id(photo_id: int) -> Optional[Photo]:

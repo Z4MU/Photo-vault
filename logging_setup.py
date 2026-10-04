@@ -11,10 +11,11 @@ import logging
 import sys
 import threading
 from logging.handlers import RotatingFileHandler
-from pathlib import Path
 from types import TracebackType
 
-LOG_DIR  = Path.home() / ".photovault" / "logs"
+import config
+
+LOG_DIR  = config.LOG_DIR
 LOG_FILE = LOG_DIR / "photovault.log"
 
 _FORMAT = "%(asctime)s [%(levelname)s] %(name)s (%(threadName)s): %(message)s"

@@ -35,7 +35,7 @@ from ui.dialogs.settings import SettingsDialog
 from ui.dialogs.stats import StatsDialog
 from ui.dialogs.tags import TagManagerDialog
 from ui.style import DARK_STYLE
-from ui.widgets import PhotoThumbnail
+from ui.widgets import PhotoThumbnail, clear_layout, layout_widgets
 from ui.workers import (
     ThumbnailLoader,
     disconnect_all,
@@ -210,9 +210,7 @@ class MainWindow(QMainWindow):
     # ── Sidebar de etiquetas ──────────────────────────────────────────────────
 
     def _refresh_tags(self):
-        for i in reversed(range(self.tag_vbox.count())):
-            w = self.tag_vbox.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.tag_vbox)
 
         n_hidden = services.count_sidebar_hidden_tags()
         self.btn_show_hidden.setVisible(n_hidden > 0 or self._show_sidebar_hidden)
@@ -276,23 +274,19 @@ class MainWindow(QMainWindow):
         self._show_sidebar_hidden = checked
         self._refresh_tags()
 
+    def _sidebar_checkboxes(self) -> list[QCheckBox]:
+        return [chk for w in layout_widgets(self.tag_vbox) for chk in w.findChildren(QCheckBox)
+                if chk.property("tag_id") is not None]
+
     def _on_tag_filter_changed(self):
-        self._active_tags = []
-        for i in range(self.tag_vbox.count()):
-            w = self.tag_vbox.itemAt(i).widget()
-            if not w: continue
-            for chk in w.findChildren(QCheckBox):
-                if chk.isChecked() and chk.property("tag_id") is not None:
-                    self._active_tags.append(chk.property("tag_id"))
+        self._active_tags = [chk.property("tag_id") for chk in self._sidebar_checkboxes()
+                             if chk.isChecked()]
         self._offset = 0; self._load_photos()
 
     def _clear_filters(self):
         self._active_tags = []
-        for i in range(self.tag_vbox.count()):
-            w = self.tag_vbox.itemAt(i).widget()
-            if not w: continue
-            for chk in w.findChildren(QCheckBox):
-                chk.blockSignals(True); chk.setChecked(False); chk.blockSignals(False)
+        for chk in self._sidebar_checkboxes():
+            chk.blockSignals(True); chk.setChecked(False); chk.blockSignals(False)
         self._offset = 0; self._load_photos()
 
     # ── Ordenamiento ──────────────────────────────────────────────────────────
@@ -340,9 +334,7 @@ class MainWindow(QMainWindow):
 
     def _load_photos(self):
         self._build_timer.stop(); self._stop_loader()
-        for i in reversed(range(self.grid_layout.count())):
-            w = self.grid_layout.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.grid_layout)
         self._thumbnails.clear()
 
         search = self.search_edit.text().strip() or None
@@ -377,7 +369,7 @@ class MainWindow(QMainWindow):
             self.grid_layout.addWidget(thumb, idx // self._grid_cols, idx % self._grid_cols)
             self._thumbnails[photo.id] = thumb
 
-        if not self._pending_photos:
+        if not self._pending_photos and self._current_page is not None:
             self._build_timer.stop()
             loader = ThumbnailLoader(self._current_page.photos)
             loader.loaded.connect(self._on_thumb_loaded)

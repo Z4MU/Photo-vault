@@ -29,6 +29,7 @@ from PyQt6.QtWidgets import (
 import services
 from models import Tag
 from ui.style import DARK_STYLE
+from ui.widgets import clear_layout
 
 logger = logging.getLogger(__name__)
 
@@ -52,17 +53,15 @@ class CategoryManagerDialog(QDialog):
         btn = QPushButton("＋ Crear"); btn.clicked.connect(self._create)
         form.addWidget(self.new_cat_edit); form.addWidget(btn)
         layout.addWidget(box)
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll_box = QScrollArea(); self.scroll_box.setWidgetResizable(True)
         self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(6); self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, stretch=1)
+        self.vbox.setSpacing(6); self.scroll_box.setWidget(self.container)
+        layout.addWidget(self.scroll_box, stretch=1)
         info = QLabel("💡 Al eliminar una categoría sus etiquetas se mueven a 'general'.")
         info.setStyleSheet("color:#666;font-size:10px;"); layout.addWidget(info)
 
     def _refresh(self):
-        for i in reversed(range(self.vbox.count())):
-            w = self.vbox.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.vbox)
         for cat in services.get_all_categories():
             tags  = services.get_tags_by_category(cat)
             count = len(tags)
@@ -204,10 +203,10 @@ class TagManagerDialog(QDialog):
         btns_row.addWidget(btn_imp)
         layout.addLayout(btns_row)
 
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll_box = QScrollArea(); self.scroll_box.setWidgetResizable(True)
         self.container = QWidget(); self.grid = QVBoxLayout(self.container)
-        self.grid.setSpacing(4); self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll)
+        self.grid.setSpacing(4); self.scroll_box.setWidget(self.container)
+        layout.addWidget(self.scroll_box)
 
     def _pick_color(self):
         c = QColorDialog.getColor(QColor(self._color), self)
@@ -225,9 +224,7 @@ class TagManagerDialog(QDialog):
         self._refresh()
 
     def _refresh(self):
-        for i in reversed(range(self.grid.count())):
-            w = self.grid.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.grid)
         for tag in services.get_all_tags():
             row = QWidget(); hl = QHBoxLayout(row); hl.setContentsMargins(4,2,4,2)
             dot = QLabel("●"); dot.setStyleSheet(f"color:{tag.color};font-size:16px;")

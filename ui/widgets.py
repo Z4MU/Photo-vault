@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QFrame,
     QLabel,
+    QLayout,
     QVBoxLayout,
     QWidget,
 )
@@ -18,6 +19,41 @@ from PyQt6.QtWidgets import (
 from models import Photo
 
 logger = logging.getLogger(__name__)
+
+
+def clear_layout(layout: QLayout) -> None:
+    """
+    Quita todos los elementos de un layout (widgets y espaciadores) y destruye
+    los widgets. A diferencia de borrar solo los widgets, no deja acumulados
+    los `addStretch()` de refrescos anteriores.
+    """
+    while layout.count():
+        item = layout.takeAt(0)
+        if item is None:
+            break
+        widget = item.widget()
+        if widget is not None:
+            widget.deleteLater()
+
+
+def layout_widgets(layout: QLayout) -> list[QWidget]:
+    """Widgets directos de un layout, en orden (sin espaciadores)."""
+    widgets = []
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        widget = item.widget() if item is not None else None
+        if widget is not None:
+            widgets.append(widget)
+    return widgets
+
+
+class ClickableRow(QWidget):
+    """QWidget que emite `clicked` al hacer clic (en vez de reasignar mousePressEvent)."""
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────

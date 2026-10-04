@@ -19,11 +19,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import config
 import logging_setup
 import services
 import thumbnail_cache
 from models import DuplicateGroup
 from ui.style import DARK_STYLE
+from ui.widgets import clear_layout
 from ui.workers import (
     MD5Worker,
     disconnect_all,
@@ -81,12 +83,12 @@ class DuplicatesDialog(QDialog):
         layout.addWidget(self.status_lbl)
 
         # Lista de grupos
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll_box = QScrollArea(); self.scroll_box.setWidgetResizable(True)
         self.container = QWidget()
         self.vbox = QVBoxLayout(self.container)
         self.vbox.setSpacing(8)
-        self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, stretch=1)
+        self.scroll_box.setWidget(self.container)
+        layout.addWidget(self.scroll_box, stretch=1)
 
         btn_close = QPushButton("Cerrar"); btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
@@ -101,11 +103,14 @@ class DuplicatesDialog(QDialog):
             lambda c, t: self.md5_progress.setValue(int(c / t * 100) if t else 0)
         )
         self._worker.completed.connect(self._on_scan_done)
-        self._worker.error.connect(lambda e: (
-            QMessageBox.critical(self, "Error", e),
-            self.btn_scan.setEnabled(True),
-        ))
+        self._worker.error.connect(self._on_scan_error)
         self._worker.start()
+
+    def _on_scan_error(self, message: str):
+        self._worker = None
+        self.md5_progress.setVisible(False)
+        self.btn_scan.setEnabled(True)
+        QMessageBox.critical(self, "Error", message)
 
     def _on_scan_done(self, n: int):
         self._worker = None
@@ -115,9 +120,7 @@ class DuplicatesDialog(QDialog):
         self._render_groups()
 
     def _render_groups(self):
-        for i in reversed(range(self.vbox.count())):
-            w = self.vbox.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.vbox)
 
         if not self._groups:
             self.status_lbl.setText("✓ No se encontraron duplicados.")
@@ -152,9 +155,9 @@ class DuplicatesDialog(QDialog):
                 img_lbl.setFixedSize(100, 100)
                 img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 img_lbl.setStyleSheet("background:#13131F;border-radius:4px;")
-                jpeg = (thumbnail_cache.get_video_thumbnail(photo.path, size=100)
+                jpeg = (thumbnail_cache.get_video_thumbnail(photo.path, size=config.THUMB_SIZE_SMALL)
                         if photo.is_video
-                        else thumbnail_cache.get_thumbnail(photo.path, size=100))
+                        else thumbnail_cache.get_thumbnail(photo.path, size=config.THUMB_SIZE_SMALL))
                 if jpeg:
                     pix = QPixmap(); pix.loadFromData(jpeg)
                     img_lbl.setPixmap(pix.scaled(100, 100,

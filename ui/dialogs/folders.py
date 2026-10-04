@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 import services
 from models import TrashBatch
 from ui.style import DARK_STYLE
+from ui.widgets import clear_layout
 from ui.workers import (
     IndexWorker,
     MissingFilesWorker,
@@ -86,22 +87,26 @@ class IndexDialog(QDialog):
             QMessageBox.warning(self, "Error", "Selecciona una carpeta válida."); return
         self.btn_start.setEnabled(False)
         self.worker = IndexWorker(folder)
-        self.worker.progress.connect(lambda c,t,p: (
-            self.progress.setValue(int(c/t*100)),
-            self.status.setText(f"[{c}/{t}] {Path(p).name}")
-        ))
-        self.worker.completed.connect(lambda a,u,e: (
-            self.status.setText(
-                f"✓ Listo: {a:,} nuevas, {u:,} actualizadas, {e:,} errores."
-                + ("  (detalles en el log)" if e else "")
-            ),
-            self.btn_start.setEnabled(True),
-            self.indexing_done.emit()
-        ))
-        self.worker.error.connect(lambda m: (
-            QMessageBox.critical(self,"Error",m), self.btn_start.setEnabled(True)
-        ))
+        self.worker.progress.connect(self._on_progress)
+        self.worker.completed.connect(self._on_completed)
+        self.worker.error.connect(self._on_error)
         self.worker.start()
+
+    def _on_progress(self, current: int, total: int, path: str):
+        self.progress.setValue(int(current / total * 100) if total else 0)
+        self.status.setText(f"[{current}/{total}] {Path(path).name}")
+
+    def _on_completed(self, added: int, updated: int, errors: int):
+        self.status.setText(
+            f"✓ Listo: {added:,} nuevas, {updated:,} actualizadas, {errors:,} errores."
+            + ("  (detalles en el log)" if errors else "")
+        )
+        self.btn_start.setEnabled(True)
+        self.indexing_done.emit()
+
+    def _on_error(self, message: str):
+        QMessageBox.critical(self, "Error", message)
+        self.btn_start.setEnabled(True)
 
 
 # ─── Dialog: Des-indexar carpetas ─────────────────────────────────────────────
@@ -126,10 +131,10 @@ class DeindexDialog(QDialog):
         layout = QVBoxLayout(self); layout.setContentsMargins(16,16,16,16); layout.setSpacing(10)
         layout.addWidget(QLabel("<b>Carpetas indexadas</b>"))
         layout.addWidget(QLabel("Los archivos originales NO se borran del disco."))
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll_box = QScrollArea(); self.scroll_box.setWidgetResizable(True)
         self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(4); self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, stretch=1)
+        self.vbox.setSpacing(4); self.scroll_box.setWidget(self.container)
+        layout.addWidget(self.scroll_box, stretch=1)
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep)
         self.btn_missing = QPushButton("🧹  Buscar registros de archivos que ya no existen en disco")
@@ -161,9 +166,7 @@ class DeindexDialog(QDialog):
 
     def _refresh(self):
         self.btn_trash.setText(f"♻  Papelera de PhotoVault ({services.count_trash():,})")
-        for i in reversed(range(self.vbox.count())):
-            w = self.vbox.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.vbox)
         folders = services.get_indexed_folders()
         if not folders:
             lbl = QLabel("No hay carpetas indexadas.")
@@ -399,10 +402,10 @@ class TrashDialog(QDialog):
         info.setWordWrap(True); info.setStyleSheet("color:#8888AA;font-size:11px;")
         layout.addWidget(info)
 
-        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.scroll_box = QScrollArea(); self.scroll_box.setWidgetResizable(True)
         self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
-        self.vbox.setSpacing(4); self.scroll.setWidget(self.container)
-        layout.addWidget(self.scroll, stretch=1)
+        self.vbox.setSpacing(4); self.scroll_box.setWidget(self.container)
+        layout.addWidget(self.scroll_box, stretch=1)
 
         btns = QHBoxLayout()
         btn_empty = QPushButton("🗑  Vaciar papelera")
@@ -414,9 +417,7 @@ class TrashDialog(QDialog):
         self._refresh()
 
     def _refresh(self):
-        for i in reversed(range(self.vbox.count())):
-            w = self.vbox.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.vbox)
         batches = services.list_trash()
         if not batches:
             lbl = QLabel("La papelera está vacía."); lbl.setStyleSheet("color:#666;")

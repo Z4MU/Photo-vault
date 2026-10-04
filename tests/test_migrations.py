@@ -123,7 +123,11 @@ def test_migrar_db_existente_crea_backup_previo(db_path, backup_dir):
     assert len(backups) == 1
     # El backup es la DB ANTES de migrar
     assert _user_version(backups[0]) == 0
-    assert "md5" not in {r[1] for r in sqlite3.connect(backups[0]).execute("PRAGMA table_info(photos)")}
+    conn = sqlite3.connect(backups[0])
+    try:
+        assert "md5" not in {r[1] for r in conn.execute("PRAGMA table_info(photos)")}
+    finally:
+        conn.close()
 
 
 def test_si_el_backup_falla_no_se_migra(db_path, monkeypatch):

@@ -24,10 +24,12 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import config
 import services
 import thumbnail_cache
 from models import Photo, Tag
 from ui.style import DARK_STYLE
+from ui.widgets import ClickableRow, clear_layout, layout_widgets
 
 logger = logging.getLogger(__name__)
 
@@ -358,7 +360,7 @@ class QuickTagWindow(QDialog):
             self.tag_vbox.addWidget(cat_lbl)
 
             for tag in tags:
-                row = QWidget()
+                row = ClickableRow()
                 row.setStyleSheet("border-radius:5px;")
                 hl  = QHBoxLayout(row)
                 hl.setContentsMargins(4, 3, 6, 3)
@@ -394,7 +396,7 @@ class QuickTagWindow(QDialog):
                 check_lbl.setVisible(False)
                 hl.addWidget(check_lbl)
 
-                row.mousePressEvent = lambda e, t=tag: self._toggle_tag(t)
+                row.clicked.connect(lambda t=tag: self._toggle_tag(t))
                 row.setCursor(Qt.CursorShape.PointingHandCursor)
 
                 self.tag_vbox.addWidget(row)
@@ -422,10 +424,10 @@ class QuickTagWindow(QDialog):
         # Imagen
         self.img_label.clear()
         if photo.is_video:
-            jpeg = thumbnail_cache.get_video_thumbnail(photo.path, size=480)
+            jpeg = thumbnail_cache.get_video_thumbnail(photo.path, size=config.THUMB_SIZE_LARGE)
         else:
             # Para el modo rápido mostramos imagen a mayor resolución
-            jpeg = thumbnail_cache.get_thumbnail(photo.path, size=480)
+            jpeg = thumbnail_cache.get_thumbnail(photo.path, size=config.THUMB_SIZE_LARGE)
 
         if jpeg:
             pix = QPixmap()
@@ -453,18 +455,16 @@ class QuickTagWindow(QDialog):
             )
 
         # Chips bajo la imagen
-        for i in reversed(range(self.chips_layout.count())):
-            w = self.chips_layout.itemAt(i).widget()
-            if w: w.deleteLater()
+        clear_layout(self.chips_layout)
 
         for tag_id in self._current_tag_ids:
-            tag = self._tags_by_id.get(tag_id)
-            if not tag: continue
-            chip = QLabel(tag.name)
+            chip_tag = self._tags_by_id.get(tag_id)
+            if chip_tag is None: continue
+            chip = QLabel(chip_tag.name)
             chip.setTextFormat(Qt.TextFormat.PlainText)
             chip.setStyleSheet(
-                f"background:{tag.color}22;color:{tag.color};"
-                f"border:1px solid {tag.color};border-radius:10px;"
+                f"background:{chip_tag.color}22;color:{chip_tag.color};"
+                f"border:1px solid {chip_tag.color};border-radius:10px;"
                 f"padding:2px 8px;font-size:11px;"
             )
             self.chips_layout.addWidget(chip)
@@ -474,20 +474,19 @@ class QuickTagWindow(QDialog):
         text = text.lower()
         for row, tag, _name_lbl, _check_lbl in self._tag_rows:
             row.setVisible(not text or text in tag.name)
-        # Ocultar headers de categoría si todos sus tags están ocultos
-        for i in range(self.tag_vbox.count()):
-            w = self.tag_vbox.itemAt(i).widget()
-            if w and w.property("cat_label"):
-                # Buscar siguiente widget que sea una fila de tag
-                any_visible = False
-                for j in range(i + 1, self.tag_vbox.count()):
-                    nw = self.tag_vbox.itemAt(j).widget()
-                    if nw and not nw.property("cat_label") and nw.isVisible():
-                        any_visible = True
-                        break
-                    if nw and nw.property("cat_label"):
-                        break
-                w.setVisible(any_visible)
+        # Ocultar headers de categoría si todos sus tags están ocultos.
+        # isHidden() (no isVisible()) para que funcione aunque la ventana aún no se muestre.
+        header: QWidget | None = None
+        header_has_rows = False
+        for w in layout_widgets(self.tag_vbox):
+            if w.property("cat_label"):
+                if header is not None:
+                    header.setVisible(header_has_rows)
+                header, header_has_rows = w, False
+            elif not w.isHidden():
+                header_has_rows = True
+        if header is not None:
+            header.setVisible(header_has_rows)
 
     # ── Acciones ──────────────────────────────────────────────────────────────
 

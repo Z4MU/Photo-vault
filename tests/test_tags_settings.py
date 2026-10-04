@@ -25,6 +25,7 @@ def test_editar_tag_conserva_asignaciones():
     services.update_tag(tag.id, "  Memes ", "humor", "#123456")
 
     edited = db.get_tag(tag.id)
+    assert edited is not None
     assert (edited.name, edited.category, edited.color) == ("memes", "humor", "#123456")
     assert "humor" in db.get_all_categories()
     assert [t.id for t in db.get_photo_tags(pid)] == [tag.id]
@@ -38,7 +39,8 @@ def test_editar_tag_nombre_duplicado():
 def test_editar_tag_mismo_nombre_otro_color():
     tag = _tag("meme")
     services.update_tag(tag.id, "meme", tag.category, "#000000")
-    assert db.get_tag(tag.id).color == "#000000"
+    edited = db.get_tag(tag.id)
+    assert edited is not None and edited.color == "#000000"
 
 
 def test_editar_tag_nombre_vacio():

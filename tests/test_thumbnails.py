@@ -14,7 +14,8 @@ def _jpeg_with_orientation(path, w: int, h: int, orientation: int) -> None:
     img.save(path, format="JPEG", exif=exif)
 
 
-def _size_of(jpeg: bytes) -> tuple[int, int]:
+def _size_of(jpeg: bytes | None) -> tuple[int, int]:
+    assert jpeg is not None, "no se generó la miniatura"
     with Image.open(io.BytesIO(jpeg)) as img:
         return img.size
 

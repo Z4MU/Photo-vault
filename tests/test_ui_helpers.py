@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
 from PyQt6.QtGui import QImage, QImageReader  # noqa: E402
-from PyQt6.QtWidgets import QApplication  # noqa: E402
+from PyQt6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 import ui  # noqa: E402
 from ui import images, workers  # noqa: E402
@@ -70,6 +70,54 @@ def test_preview_formato_que_qt_no_lee_usa_pillow(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(QImageReader, "read", lambda self: QImage())
     pix = images.load_preview_pixmap(str(src), 100)
     assert pix is not None and pix.width() == 100
+
+
+def test_clear_layout_quita_tambien_espaciadores(qapp):
+    from PyQt6.QtWidgets import QVBoxLayout, QWidget
+
+    from ui.widgets import clear_layout, layout_widgets
+    host = QWidget(); lay = QVBoxLayout(host)
+    for _ in range(3):                      # Tres "refrescos" seguidos
+        clear_layout(lay)
+        lay.addWidget(QLabel("a")); lay.addWidget(QLabel("b")); lay.addStretch()
+    assert lay.count() == 3                 # Antes se acumulaban los addStretch()
+    labels = layout_widgets(lay)
+    assert all(isinstance(w, QLabel) for w in labels)
+    assert [w.text() for w in labels if isinstance(w, QLabel)] == ["a", "b"]
+
+
+def test_clickable_row_emite_clicked(qapp):
+    from PyQt6.QtCore import QPoint, QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    from ui.widgets import ClickableRow
+    row = ClickableRow()
+    hits = []
+    row.clicked.connect(lambda: hits.append(1))
+    ev = QMouseEvent(QMouseEvent.Type.MouseButtonPress, QPointF(QPoint(1, 1)),
+                     Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier)
+    row.mousePressEvent(ev)
+    assert hits == [1]
+
+
+def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
+    import database as db
+    from ui.dialogs.quick_tag import QuickTagWindow
+    db.init_db()
+    pid = db.upsert_photo(r"C:\no\existe.jpg", "existe.jpg", 2020, 1, 1)
+    win = QuickTagWindow([p for p in db.get_photos() if p.id == pid])
+
+    def headers() -> dict[str, bool]:
+        return {w.text(): not w.isHidden() for w in win.tag_container.findChildren(QLabel)
+                if w.property("cat_label")}
+
+    win._filter_tags("meme")                # solo la categoría "tipo" tiene un tag así
+    assert headers()["TIPO"] is True
+    assert headers()["EMOCION"] is False
+    win._filter_tags("")
+    assert all(headers().values())
+    win.close()
 
 
 def test_retire_thread_mantiene_vivo_hasta_terminar(qapp):

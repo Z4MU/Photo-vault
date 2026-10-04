@@ -16,9 +16,11 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import config
+
 logger = logging.getLogger(__name__)
 
-BACKUP_DIR     = Path.home() / ".photovault" / "backups"
+BACKUP_DIR     = config.BACKUP_DIR
 DAILY_KEEP     = 7
 MIGRATION_KEEP = 3
 

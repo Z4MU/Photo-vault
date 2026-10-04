@@ -23,6 +23,8 @@ from pathlib import Path
 
 from PIL import Image, ImageOps
 
+import config
+
 logger = logging.getLogger(__name__)
 
 # Soporte HEIC/HEIF (fotos de iPhone). Se registra aquí también y no solo en
@@ -34,8 +36,8 @@ except ImportError:
     logger.warning("pillow-heif no está instalado: los .heic no tendrán miniatura")
 
 # Directorio donde se guardan las miniaturas
-CACHE_DIR = Path.home() / ".photovault" / "thumbs"
-THUMB_SIZE = 200          # píxeles (lado máximo)
+CACHE_DIR = config.THUMBS_DIR
+THUMB_SIZE = config.THUMB_SIZE_GALLERY   # píxeles (lado máximo)
 THUMB_QUALITY = 85        # calidad JPEG
 THUMB_VERSION = 2         # v2: orientación EXIF + tamaño en el nombre
 

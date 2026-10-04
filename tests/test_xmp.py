@@ -1,5 +1,7 @@
 """Sidecars XMP (#16)."""
 
+from pathlib import Path
+
 import pytest
 
 import database as db
@@ -62,7 +64,7 @@ def test_nunca_toca_xmp_ajeno(tmp_path):
 def test_lee_convencion_lightroom(tmp_path):
     foto = tmp_path / "IMG_3.CR2"; foto.write_bytes(b"x")
     (tmp_path / "IMG_3.xmp").write_text(FOREIGN_XMP, encoding="utf-8")
-    assert ("perro", "animales") in xmp.read_sidecar(str(foto))
+    assert ("perro", "animales") in (xmp.read_sidecar(str(foto)) or [])
 
 
 def test_carpeta_inexistente_no_crea_nada(tmp_path):
@@ -108,10 +110,10 @@ def test_activado_sigue_cada_cambio(photo):
     assert xmp.read_sidecar(path) == [("costa", "lugar")]
 
     services.bulk_add_tag([pid], "verano")
-    assert {n for n, _ in xmp.read_sidecar(path)} == {"costa", "verano"}
+    assert {n for n, _ in xmp.read_sidecar(path) or []} == {"costa", "verano"}
 
     services.delete_tag(tag.id)
-    assert [n for n, _ in xmp.read_sidecar(path)] == ["verano"]
+    assert [n for n, _ in xmp.read_sidecar(path) or []] == ["verano"]
 
     services.remove_tag(pid, db.get_tag_ids_by_name()["verano"])
     assert xmp.read_sidecar(path) is None        # sin etiquetas → sidecar eliminado
@@ -126,7 +128,7 @@ def test_sync_all_e_importar_desde_sidecars(db_path, photo):
     assert r.written == 1
 
     # Un .xmp de otro programa junto a la segunda foto
-    (path2 + ".xmp") and open(path2 + ".xmp", "w", encoding="utf-8").write(FOREIGN_XMP)
+    Path(path2 + ".xmp").write_text(FOREIGN_XMP, encoding="utf-8")
 
     # Perder las etiquetas en la DB y recuperarlas desde los .xmp
     db.remove_tag_from_photo(pid, db.get_tag_ids_by_name()["playa"])
