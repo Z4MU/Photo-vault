@@ -3,10 +3,9 @@ PhotoVault - models.py
 Dataclasses que representan las entidades del dominio.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from enum import Enum
-
+from typing import Optional
 
 # ── Ordenamiento ──────────────────────────────────────────────────────────────
 

@@ -15,15 +15,18 @@ Correcciones aplicadas:
      lo duplica; se importa desde allí para el caso de uso de indexación.
 """
 
+import logging
 import re
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
 from PIL import Image
 from PIL.ExifTags import TAGS
 
 import database as db
+
+logger = logging.getLogger(__name__)
 
 # ── Soporte HEIC/HEIF opcional ────────────────────────────────────────────────
 # Requiere: pip install pillow-heif
@@ -94,8 +97,9 @@ def _extract_date_from_exif(path: str):
                 if tag in ("DateTime", "DateTimeOriginal", "DateTimeDigitized"):
                     dt = datetime.strptime(value[:10], "%Y:%m:%d")
                     return dt.year, dt.month
-    except Exception:
-        pass
+    except Exception as e:
+        # Muy común (sin EXIF, formato raro): no es un error real
+        logger.debug("Sin fecha EXIF en %s: %s", path, e)
     return None, None
 
 
@@ -130,7 +134,8 @@ def _get_image_size(path: str):
     try:
         with Image.open(path) as img:
             return img.width, img.height
-    except Exception:
+    except Exception as e:
+        logger.warning("No se pudo leer el tamaño de %s: %s", path, e)
         return None, None
 
 
@@ -148,7 +153,8 @@ def _get_video_info(path: str):
         duration    = (frame_count / fps) if fps > 0 else None
         cap.release()
         return duration, width or None, height or None
-    except Exception:
+    except Exception as e:
+        logger.warning("No se pudo leer la info del video %s: %s", path, e)
         return None, None, None
 
 
@@ -218,6 +224,6 @@ def index_folder(folder: str, progress_callback: Callable[[int, int, str], None]
 
         except Exception as e:
             errors += 1
-            print(f"[ERROR] {filepath}: {e}")
+            logger.error("Error indexando %s: %s", filepath, e, exc_info=True)
 
     return added, skipped, errors

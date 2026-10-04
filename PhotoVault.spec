@@ -23,6 +23,8 @@ src_files = [
     'services.py',
     'indexer.py',
     'thumbnail_cache.py',
+    'backup.py',
+    'logging_setup.py',
 ]
 
 # ── Datos extra a empaquetar (recursos no-.py) ────────────────────────────────

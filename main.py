@@ -10,25 +10,45 @@ Features nuevos en esta versión:
   6. Vista de duplicados         → DuplicatesDialog con hash MD5
 """
 
+import logging
 import sys
 from pathlib import Path
 
-from PyQt6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QLineEdit, QScrollArea, QGridLayout,
-    QFileDialog, QDialog, QCheckBox, QFrame, QProgressBar,
-    QMessageBox, QComboBox, QColorDialog, QGroupBox, QSplitter,
-    QSizePolicy, QSpinBox,
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
-from PyQt6.QtGui import QPixmap, QColor, QDesktopServices
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QColor, QDesktopServices, QPixmap
 from PyQt6.QtSvgWidgets import QSvgWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QColorDialog,
+    QComboBox,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QProgressBar,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
+import backup
 import database as db
-import services
 import indexer
+import logging_setup
+import services
 import thumbnail_cache
-from models import Photo, Tag, GalleryPage, SortField, SortOrder, DuplicateGroup
+from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Tag
+
+logger = logging.getLogger(__name__)
 
 
 # ─── Hilo para indexación ─────────────────────────────────────────────────────
@@ -50,6 +70,7 @@ class IndexWorker(QThread):
             )
             self.finished.emit(added, skipped, errors)
         except Exception as e:
+            logger.exception("Error indexando %s", self.folder)
             self.error.emit(str(e))
         finally:
             db.close_connection()
@@ -86,7 +107,7 @@ class ThumbnailLoader(QThread):
                                              Qt.TransformationMode.SmoothTransformation)
                         self.loaded.emit(photo.id, pix)
             except Exception:
-                pass
+                logger.exception("Error cargando miniatura de %s", photo.path)
             if not self._stop_flag:
                 self.msleep(5)
         db.close_connection()
@@ -106,6 +127,7 @@ class MD5Worker(QThread):
             )
             self.finished.emit(n)
         except Exception as e:
+            logger.exception("Error calculando MD5s")
             self.error.emit(str(e))
         finally:
             db.close_connection()
@@ -1051,7 +1073,7 @@ class QuickTagWindow(QDialog):
 
     def _refresh_tag_ui(self):
         """Actualiza checkmarks y chips sin recargar toda la lista."""
-        for row, tag, name_lbl, check_lbl in self._tag_rows:
+        for row, tag, _name_lbl, check_lbl in self._tag_rows:
             active = tag.id in self._current_tag_ids
             check_lbl.setVisible(active)
             row.setStyleSheet(
@@ -1079,7 +1101,7 @@ class QuickTagWindow(QDialog):
     def _filter_tags(self, text: str):
         """Muestra/oculta filas según búsqueda."""
         text = text.lower()
-        for row, tag, name_lbl, check_lbl in self._tag_rows:
+        for row, tag, _name_lbl, _check_lbl in self._tag_rows:
             row.setVisible(not text or text in tag.name)
         # Ocultar headers de categoría si todos sus tags están ocultos
         for i in range(self.tag_vbox.count()):
@@ -1293,7 +1315,9 @@ class CategoryManagerDialog(QDialog):
             row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
             hl = QHBoxLayout(row); hl.setContentsMargins(8,6,8,6); hl.setSpacing(6)
             edit = QLineEdit(cat)
-            edit.setStyleSheet("background:#13131F;border:1px solid #3A3A5A;border-radius:4px;padding:3px 6px;")
+            edit.setStyleSheet(
+                "background:#13131F;border:1px solid #3A3A5A;border-radius:4px;padding:3px 6px;"
+            )
             edit.setFixedWidth(140); hl.addWidget(edit)
             hl.addWidget(QLabel(f"{count} etiq."), stretch=1)
             btn_r = QPushButton("✎"); btn_r.setFixedSize(28,28)
@@ -1427,6 +1451,7 @@ class TagManagerDialog(QDialog):
             n = services.export_tags(path)
             QMessageBox.information(self, "Exportado", f"Se exportaron {n} etiquetas a:\n{path}")
         except Exception as e:
+            logger.exception("Error exportando etiquetas a %s", path)
             QMessageBox.critical(self, "Error", str(e))
 
     def _import(self):
@@ -1440,6 +1465,7 @@ class TagManagerDialog(QDialog):
                 f"Etiquetas creadas: {created}\nYa existían (omitidas): {skipped}")
             self._refresh()
         except Exception as e:
+            logger.exception("Error importando etiquetas desde %s", path)
             QMessageBox.critical(self, "Error al importar", str(e))
 
 
@@ -1581,7 +1607,7 @@ class MainWindow(QMainWindow):
         self._resize_timer.timeout.connect(self._on_resize_settled)
         self._last_grid_cols = 0
 
-        db.init_db()
+        # db.init_db() corre antes, en _startup()
         self._build_ui()
         self._refresh_tags()
         QTimer.singleShot(100, self._load_photos)
@@ -1810,7 +1836,7 @@ class MainWindow(QMainWindow):
         if self._loader is not None:
             self._loader.loaded.disconnect()
             try: self._loader.finished.disconnect()
-            except Exception: pass
+            except TypeError: pass  # No tenía conexiones
             self._loader.stop(); self._loader.wait(500)
             self._loader = None
 
@@ -1984,9 +2010,39 @@ DARK_STYLE = """
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
+def _startup() -> bool:
+    """
+    Backup diario + migraciones de la DB. Devuelve False si la app no debe
+    abrirse (el error ya se mostró al usuario).
+    """
+    backup.daily_backup(db.DB_PATH)
+    try:
+        db.init_db()
+    except db.DatabaseTooNewError as e:
+        logger.error("%s", e)
+        QMessageBox.critical(None, "Versión de base de datos no compatible", str(e))
+        return False
+    except Exception as e:
+        logger.exception("No se pudo inicializar la base de datos")
+        QMessageBox.critical(
+            None, "Error al abrir la base de datos",
+            f"No se pudo preparar la base de datos:\n\n{e}\n\n"
+            f"No se hicieron cambios. Detalles en:\n{logging_setup.LOG_FILE}",
+        )
+        return False
+    return True
+
+
 if __name__ == "__main__":
+    logging_setup.setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName("PhotoVault")
+    logging_setup.install_qt_handlers()
+    logger.info("PhotoVault iniciando (esquema DB v%d)", db.SCHEMA_VERSION)
+    if not _startup():
+        sys.exit(1)
     window = MainWindow()
     window.show()
-    sys.exit(app.exec())
+    code = app.exec()
+    logger.info("PhotoVault cerrado (código %d)", code)
+    sys.exit(code)

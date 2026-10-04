@@ -12,10 +12,23 @@ Uso:
 
 import hashlib
 import io
+import logging
 import os
 from pathlib import Path
 
 from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+# Rutas cuyo fallo ya se registró en esta sesión (evita repetir el mismo
+# warning cada vez que se vuelve a mostrar la página)
+_logged_failures: set[str] = set()
+
+
+def _log_failure(filepath: str, what: str, exc: BaseException) -> None:
+    if filepath not in _logged_failures:
+        _logged_failures.add(filepath)
+        logger.warning("No se pudo %s %s: %s", what, filepath, exc)
 
 # Directorio donde se guardan las miniaturas
 CACHE_DIR = Path.home() / ".photovault" / "thumbs"
@@ -60,8 +73,9 @@ def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
     if path.exists():
         try:
             return path.read_bytes()
-        except OSError:
-            pass  # Si falla la lectura, regeneramos
+        except OSError as e:
+            # Si falla la lectura, regeneramos
+            logger.warning("No se pudo leer la miniatura en caché %s: %s", path, e)
 
     # ── Caché miss: generar miniatura ──────────────────────────────────────
     data = _generate(filepath, size)
@@ -69,8 +83,9 @@ def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
         try:
             _ensure_cache_dir(path)
             path.write_bytes(data)
-        except OSError:
-            pass  # Si no se puede guardar, igual devolvemos los bytes
+        except OSError as e:
+            # Si no se puede guardar, igual devolvemos los bytes
+            logger.warning("No se pudo guardar la miniatura %s: %s", path, e)
     return data
 
 
@@ -86,16 +101,16 @@ def get_video_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
     if path.exists():
         try:
             return path.read_bytes()
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("No se pudo leer la miniatura en caché %s: %s", path, e)
 
     data = _generate_video(filepath, size)
     if data:
         try:
             _ensure_cache_dir(path)
             path.write_bytes(data)
-        except OSError:
-            pass
+        except OSError as e:
+            logger.warning("No se pudo guardar la miniatura %s: %s", path, e)
     return data
 
 
@@ -110,7 +125,8 @@ def _generate(filepath: str, size: int) -> bytes | None:
             buf = io.BytesIO()
             img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
             return buf.getvalue()
-    except Exception:
+    except Exception as e:
+        _log_failure(filepath, "generar la miniatura de", e)
         return None
 
 
@@ -136,7 +152,8 @@ def _generate_video(filepath: str, size: int) -> bytes | None:
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
         return buf.getvalue()
-    except Exception:
+    except Exception as e:
+        _log_failure(filepath, "generar la miniatura del video", e)
         return None
 
 
@@ -161,8 +178,8 @@ def purge_orphans(known_paths: list[str]) -> int:
             try:
                 thumb.unlink()
                 removed += 1
-            except OSError:
-                pass
+            except OSError as e:
+                logger.warning("No se pudo eliminar la miniatura huérfana %s: %s", thumb, e)
     return removed
 
 

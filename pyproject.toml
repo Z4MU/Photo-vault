@@ -1,0 +1,51 @@
+[project]
+name = "photovault"
+version = "1.0.0"
+description = "Indexar, navegar, etiquetar y filtrar colecciones grandes de fotos y videos"
+requires-python = ">=3.12"
+
+# ── pytest ────────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-ra"
+
+# ── ruff ──────────────────────────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+extend-exclude = ["Fotos V*", "build", "dist", "PhotoVault.spec"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes (imports sin usar, nombres indefinidos…)
+    "B",        # bugbear (errores comunes)
+    "I",        # orden de imports
+    "UP",       # sintaxis moderna de Python
+]
+ignore = [
+    # Estilo compacto existente en la UI (varias sentencias por línea).
+    # Se revisará al dividir main.py en la fase 3.
+    "E701", "E702", "E741",
+    "E221", "E241", "E251", "E272",  # alineación de "=" en columnas, usada a propósito
+    "UP006", "UP035",                # list[...] vs typing.List: el código ya es mixto
+    "UP045",                         # Optional[X] → X | None: migrar en la fase 3
+]
+
+[tool.ruff.lint.isort]
+known-first-party = [
+    "backup", "database", "indexer", "logging_setup",
+    "models", "services", "thumbnail_cache",
+]
+
+# ── mypy ──────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.12"
+files = ["*.py", "tests"]
+exclude = ["^Fotos V", "^build/", "^dist/"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+# Arranque gradual: se irá endureciendo en la fase 3
+check_untyped_defs = false
+disallow_untyped_defs = false

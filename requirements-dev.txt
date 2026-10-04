@@ -1,0 +1,5 @@
+# Herramientas de desarrollo (no van en el .exe)
+-r requirements.txt
+pytest>=8.0
+ruff>=0.6
+mypy>=1.10

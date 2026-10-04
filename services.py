@@ -3,15 +3,14 @@ PhotoVault - services.py
 Capa de lógica de negocio entre la UI y la base de datos.
 """
 
-import json
 import hashlib
+import json
 from pathlib import Path
 from typing import Optional
 
 import database as db
 import thumbnail_cache
-from models import GalleryPage, Photo, Tag, Stats, SortField, SortOrder, DuplicateGroup
-
+from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag
 
 # ── Galería ───────────────────────────────────────────────────────────────────
 

@@ -3,12 +3,17 @@ PhotoVault - database.py
 Maneja toda la interacción con SQLite.
 """
 
+import logging
 import sqlite3
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
-from models import Photo, Tag, Stats, SortField, SortOrder, sort_to_sql
+import backup
+from models import Photo, SortField, SortOrder, Stats, Tag, sort_to_sql
+
+logger = logging.getLogger(__name__)
 
 DB_PATH = Path.home() / ".photovault" / "photovault.db"
 
@@ -33,8 +38,8 @@ def close_connection():
     if conn is not None:
         try:
             conn.close()
-        except Exception:
-            pass
+        except sqlite3.Error:
+            logger.warning("Error al cerrar la conexión SQLite", exc_info=True)
         _local.conn = None
 
 
@@ -55,121 +60,166 @@ def transaction() -> "_Transaction":
     return _Transaction()
 
 
-# ── Inicialización ────────────────────────────────────────────────────────────
+# ── Inicialización y migraciones ──────────────────────────────────────────────
+#
+# La versión del esquema se guarda en PRAGMA user_version.
+#   - Cada migración es una función _mNNN_* agregada al final de _MIGRATIONS.
+#   - La versión N corresponde a _MIGRATIONS[N - 1].
+#   - Cada migración corre en su propia transacción junto con el cambio de
+#     user_version: o se aplica completa o no se aplica.
+#   - Dentro de una migración NO usar executescript (hace COMMIT implícito).
+#   - Nunca modificar una migración ya publicada: agregar una nueva.
+#   - Antes de migrar una DB existente se crea un backup obligatorio.
 
-def init_db():
+
+class DatabaseTooNewError(RuntimeError):
+    """La DB fue creada por una versión más nueva de PhotoVault."""
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str,
+                           column: str, typedef: str) -> None:
+    if column not in _columns(conn, table):
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
+
+
+def _m001_baseline(conn: sqlite3.Connection) -> None:
+    """Esquema base: equivale a todo lo que hacía init_db() hasta V11."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS photos (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            path        TEXT UNIQUE NOT NULL,
+            filename    TEXT NOT NULL,
+            media_type  TEXT DEFAULT 'image',
+            year        INTEGER,
+            month       INTEGER,
+            filesize    INTEGER,
+            width       INTEGER,
+            height      INTEGER,
+            duration    REAL,
+            md5         TEXT,
+            added_at    TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tags (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            name           TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            category       TEXT DEFAULT 'general',
+            color          TEXT DEFAULT '#4A9EFF',
+            hidden         INTEGER DEFAULT 0,
+            sidebar_hidden INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS photo_tags (
+            photo_id    INTEGER REFERENCES photos(id) ON DELETE CASCADE,
+            tag_id      INTEGER REFERENCES tags(id) ON DELETE CASCADE,
+            PRIMARY KEY (photo_id, tag_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            name  TEXT PRIMARY KEY NOT NULL COLLATE NOCASE
+        )
+    """)
+    # Configuración interna (ej: flag 'seeded' del seed inicial)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY NOT NULL,
+            value TEXT NOT NULL
+        )
+    """)
+
+    # Columnas agregadas en versiones anteriores — DBs viejas pueden no tenerlas.
+    # Deben existir ANTES de crear índices que las usen.
+    _add_column_if_missing(conn, "photos", "media_type", "TEXT DEFAULT 'image'")
+    _add_column_if_missing(conn, "photos", "duration",   "REAL")
+    _add_column_if_missing(conn, "photos", "md5",        "TEXT")
+    _add_column_if_missing(conn, "tags",   "hidden",         "INTEGER DEFAULT 0")
+    _add_column_if_missing(conn, "tags",   "sidebar_hidden", "INTEGER DEFAULT 0")
+
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_year      ON photos(year)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_month     ON photos(month)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_md5       ON photos(md5)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photo_tags_photo ON photo_tags(photo_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photo_tags_tag   ON photo_tags(tag_id)")
+
+    # DB vieja con etiquetas pero sin registro de seed: marcarla como
+    # sembrada para no volver a insertar lo que el usuario borró.
+    tag_count = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
+    if tag_count > 0:
+        conn.execute("INSERT OR IGNORE INTO app_settings (key, value) VALUES ('seeded', '1')")
+
+    conn.execute(
+        "INSERT OR IGNORE INTO categories (name) "
+        "SELECT DISTINCT category FROM tags WHERE category IS NOT NULL"
+    )
+
+
+_MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
+    _m001_baseline,
+]
+
+SCHEMA_VERSION = len(_MIGRATIONS)
+
+
+def get_schema_version() -> int:
+    return get_connection().execute("PRAGMA user_version").fetchone()[0]
+
+
+def _apply_migration(conn: sqlite3.Connection, version: int,
+                     migration: Callable[[sqlite3.Connection], None]) -> None:
+    doc = (migration.__doc__ or migration.__name__).strip().splitlines()[0]
+    logger.info("Aplicando migración %d: %s", version, doc)
+    if conn.in_transaction:
+        conn.commit()
+    conn.execute("BEGIN")
+    try:
+        migration(conn)
+        # PRAGMA no acepta parámetros; version es un int controlado por nosotros
+        conn.execute(f"PRAGMA user_version = {int(version)}")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Falló la migración %d; la DB quedó en la versión %d",
+                         version, version - 1)
+        raise
+
+
+def init_db() -> None:
+    """
+    Corre en cada arranque. Aplica las migraciones pendientes (con backup
+    previo si la DB ya existía) y el seed inicial si nunca se hizo.
+    """
+    conn    = get_connection()
+    current = get_schema_version()
+
+    if current > SCHEMA_VERSION:
+        raise DatabaseTooNewError(
+            f"La base de datos está en la versión {current} del esquema, pero esta "
+            f"versión de PhotoVault solo conoce hasta la {SCHEMA_VERSION}.\n"
+            f"Actualiza PhotoVault para abrirla. No se modificó nada."
+        )
+
+    if current < SCHEMA_VERSION:
+        has_tables = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+        ).fetchone()[0] > 0
+        if has_tables:
+            # Si el backup falla se lanza la excepción y no se migra
+            backup.pre_migration_backup(DB_PATH, SCHEMA_VERSION)
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            _apply_migration(conn, version, _MIGRATIONS[version - 1])
+
+    # ── Seed de datos iniciales ────────────────────────────────────────
+    # Solo se ejecuta UNA VEZ en la vida de la base de datos.
+    # Si el usuario borra o modifica etiquetas/categorías, esos cambios
+    # se respetan en reinicios posteriores.
     with transaction() as conn:
-        conn.executescript("""
-            CREATE TABLE IF NOT EXISTS photos (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                path        TEXT UNIQUE NOT NULL,
-                filename    TEXT NOT NULL,
-                media_type  TEXT DEFAULT 'image',
-                year        INTEGER,
-                month       INTEGER,
-                filesize    INTEGER,
-                width       INTEGER,
-                height      INTEGER,
-                duration    REAL,
-                md5         TEXT,
-                added_at    TEXT DEFAULT (datetime('now'))
-            );
-
-            CREATE TABLE IF NOT EXISTS tags (
-                id             INTEGER PRIMARY KEY AUTOINCREMENT,
-                name           TEXT UNIQUE NOT NULL COLLATE NOCASE,
-                category       TEXT DEFAULT 'general',
-                color          TEXT DEFAULT '#4A9EFF',
-                hidden         INTEGER DEFAULT 0,
-                sidebar_hidden INTEGER DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS photo_tags (
-                photo_id    INTEGER REFERENCES photos(id) ON DELETE CASCADE,
-                tag_id      INTEGER REFERENCES tags(id) ON DELETE CASCADE,
-                PRIMARY KEY (photo_id, tag_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS categories (
-                name  TEXT PRIMARY KEY NOT NULL COLLATE NOCASE
-            );
-
-            -- Tabla de configuración interna de la app
-            -- Usada para registrar acciones que solo deben ocurrir una vez
-            -- (ej: seed inicial de etiquetas).
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key   TEXT PRIMARY KEY NOT NULL,
-                value TEXT NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_photos_year       ON photos(year);
-            CREATE INDEX IF NOT EXISTS idx_photos_month      ON photos(month);
-            CREATE INDEX IF NOT EXISTS idx_photo_tags_photo  ON photo_tags(photo_id);
-            CREATE INDEX IF NOT EXISTS idx_photo_tags_tag    ON photo_tags(tag_id);
-        """)
-
-        # Migraciones — deben correr ANTES de crear índices que las usen
-        for col, typedef in [
-            ("media_type", "TEXT DEFAULT 'image'"),
-            ("duration",   "REAL"),
-            ("md5",        "TEXT"),
-        ]:
-            try:
-                conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {typedef}")
-                conn.commit()
-            except Exception:
-                pass
-
-        for col, typedef in [("sidebar_hidden", "INTEGER DEFAULT 0")]:
-            try:
-                conn.execute(f"ALTER TABLE tags ADD COLUMN {col} {typedef}")
-                conn.commit()
-            except Exception:
-                pass
-
-        # Migración: marcar DBs existentes como ya sembradas
-        # (tienen las etiquetas de versiones anteriores; no re-sembrar)
-        try:
-            has_settings = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='app_settings'"
-            ).fetchone()
-            if has_settings:
-                already = conn.execute(
-                    "SELECT value FROM app_settings WHERE key='seeded'"
-                ).fetchone()
-                if not already:
-                    # DB vieja con etiquetas pero sin registro de seed
-                    # La marcamos como sembrada para no volver a insertar
-                    tag_count = conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0]
-                    if tag_count > 0:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO app_settings (key, value) VALUES ('seeded', '1')"
-                        )
-                        conn.commit()
-        except Exception:
-            pass
-
-        # Crear índice md5 aquí, después de asegurar que la columna existe
-        try:
-            conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_photos_md5 ON photos(md5)"
-            )
-            conn.commit()
-        except Exception:
-            pass
-
-        try:
-            conn.execute(
-                "INSERT OR IGNORE INTO categories (name) "
-                "SELECT DISTINCT category FROM tags WHERE category IS NOT NULL"
-            )
-        except Exception:
-            pass
-
-        # ── Seed de datos iniciales ────────────────────────────────────────
-        # Solo se ejecuta UNA VEZ en la vida de la base de datos.
-        # Si el usuario borra o modifica etiquetas/categorías, esos cambios
-        # se respetan en reinicios posteriores.
         _seed_initial_data(conn)
 
 
