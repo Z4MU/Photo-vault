@@ -57,8 +57,11 @@ hidden_imports = [
     # SQLite (incluido en stdlib pero a veces necesita ayuda)
     'sqlite3',
     '_sqlite3',
-    # pillow-heif (opcional)
+    # pillow-heif (archivos .heic/.heif)
     'pillow_heif',
+    # send2trash: elige la implementación según la plataforma en tiempo de ejecución
+    'send2trash.win',
+    'send2trash.win.legacy',
 ]
 
 # ── Análisis ──────────────────────────────────────────────────────────────────

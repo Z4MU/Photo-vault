@@ -5,12 +5,23 @@ Capa de lógica de negocio entre la UI y la base de datos.
 
 import hashlib
 import json
+import logging
+from collections import defaultdict
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from send2trash import send2trash
 
 import database as db
 import thumbnail_cache
 from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag
+
+logger = logging.getLogger(__name__)
+
+ProgressCallback = Callable[[int, int], None]
+StopCheck        = Callable[[], bool]
 
 # ── Galería ───────────────────────────────────────────────────────────────────
 
@@ -63,6 +74,20 @@ def get_photos_for_tagging(
     )
 
 
+def count_photos_for_tagging(
+    folder:        str | None       = None,
+    tag_ids:       list[int] | None = None,
+    untagged_only: bool             = False,
+) -> int:
+    """Cuántas fotos devolvería get_photos_for_tagging (sin cargarlas)."""
+    return db.get_photo_count(
+        tag_ids=tag_ids or None,
+        hidden_tag_ids=db.get_hidden_tag_ids(),
+        folder=folder,
+        untagged_only=untagged_only,
+    )
+
+
 def get_photo(photo_id: int) -> Optional[Photo]:
     return db.get_photo_by_id(photo_id)
 
@@ -79,7 +104,14 @@ def add_tag(photo_id: int, tag_name: str) -> Tag:
         raise ValueError("El nombre de etiqueta no puede estar vacío.")
     tag_id = db.create_tag(tag_name)
     db.add_tag_to_photo(photo_id, tag_id)
-    return next(t for t in db.get_all_tags() if t.id == tag_id)
+    tag = db.get_tag(tag_id)
+    assert tag is not None
+    return tag
+
+
+def add_tag_by_id(photo_id: int, tag_id: int) -> None:
+    """Asigna una etiqueta existente (sin buscarla por nombre)."""
+    db.add_tag_to_photo(photo_id, tag_id)
 
 
 def remove_tag(photo_id: int, tag_id: int):
@@ -114,16 +146,33 @@ def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
     return db.get_all_tags(include_sidebar_hidden=include_sidebar_hidden)
 
 
-def get_sidebar_tags() -> dict[str, list[Tag]]:
-    tags   = db.get_all_tags(include_sidebar_hidden=False)
+def get_sidebar_tags(include_hidden: bool = False) -> dict[str, list[Tag]]:
+    tags   = db.get_all_tags(include_sidebar_hidden=include_hidden)
     groups: dict[str, list[Tag]] = {}
     for tag in tags:
         groups.setdefault(tag.category or "general", []).append(tag)
     return groups
 
 
+def count_sidebar_hidden_tags() -> int:
+    return sum(1 for t in db.get_all_tags() if t.sidebar_hidden)
+
+
 def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> int:
     return db.create_tag(name, category, color)
+
+
+def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
+    """Lanza db.TagNameConflictError si el nombre ya lo usa otra etiqueta."""
+    db.update_tag(tag_id, name, category, color)
+
+
+def get_tag(tag_id: int) -> Optional[Tag]:
+    return db.get_tag(tag_id)
+
+
+def count_photos_with_tag(tag_id: int) -> int:
+    return db.count_photos_with_tag(tag_id)
 
 
 def delete_tag(tag_id: int):
@@ -164,6 +213,26 @@ def delete_category(name: str):
 
 def get_stats() -> Stats:
     return db.get_stats()
+
+
+# ── Preferencias ──────────────────────────────────────────────────────────────
+
+PAGE_SIZE_DEFAULT = 100
+PAGE_SIZE_MIN     = 10
+PAGE_SIZE_MAX     = 500
+
+
+def get_page_size() -> int:
+    raw = db.get_setting("page_size")
+    try:
+        value = int(raw) if raw is not None else PAGE_SIZE_DEFAULT
+    except ValueError:
+        value = PAGE_SIZE_DEFAULT
+    return max(PAGE_SIZE_MIN, min(PAGE_SIZE_MAX, value))
+
+
+def set_page_size(value: int) -> None:
+    db.set_setting("page_size", str(max(PAGE_SIZE_MIN, min(PAGE_SIZE_MAX, int(value)))))
 
 
 # ── Exportar / importar etiquetas ─────────────────────────────────────────────
@@ -233,17 +302,21 @@ def _md5_of_file(path: str, chunk: int = 65536) -> str | None:
         return None
 
 
-def compute_missing_md5s(progress_callback=None) -> int:
+def compute_missing_md5s(progress_callback: ProgressCallback | None = None,
+                         should_stop: StopCheck | None = None) -> int:
     """
     Calcula el MD5 de las fotos que aún no lo tienen en la DB.
     progress_callback(current, total) se llama por cada archivo procesado.
-    Devuelve la cantidad de hashes calculados.
+    should_stop() se consulta antes de cada archivo para poder cancelar.
+    Devuelve la cantidad de archivos procesados.
     """
-    rows = db.get_all_photos_for_duplicates()
-    pending = [(p, md5) for p, md5 in rows if not md5]
+    pending = [p for p in db.get_all_photos_for_duplicates() if not p.md5]
     total   = len(pending)
 
-    for i, (photo, _) in enumerate(pending):
+    for i, photo in enumerate(pending):
+        if should_stop and should_stop():
+            logger.info("Cálculo de MD5 cancelado en %d/%d", i, total)
+            return i
         if progress_callback:
             progress_callback(i + 1, total)
         md5 = _md5_of_file(photo.path)
@@ -258,13 +331,10 @@ def get_duplicate_groups() -> list[DuplicateGroup]:
     Devuelve grupos de fotos que comparten el mismo MD5.
     Solo incluye grupos con 2+ fotos. Requiere que los MD5s estén calculados.
     """
-    rows = db.get_all_photos_for_duplicates()
-
-    from collections import defaultdict
     buckets: dict[str, list[Photo]] = defaultdict(list)
-    for photo, md5 in rows:
-        if md5:
-            buckets[md5].append(photo)
+    for photo in db.get_all_photos_for_duplicates():
+        if photo.md5:
+            buckets[photo.md5].append(photo)
 
     groups = [
         DuplicateGroup(md5=md5, photos=photos)
@@ -278,37 +348,130 @@ def get_duplicate_groups() -> list[DuplicateGroup]:
 
 def delete_photo_file(photo_id: int) -> bool:
     """
-    Elimina el archivo físico y el registro de la DB.
+    Manda el archivo a la Papelera de reciclaje y borra su registro.
+    Si el archivo ya no existe, solo borra el registro.
     Devuelve True si tuvo éxito.
     """
     photo = db.get_photo_by_id(photo_id)
     if not photo:
         return False
-    try:
-        Path(photo.path).unlink(missing_ok=True)
-    except OSError:
-        return False
-    with db.transaction() as conn:
-        conn.execute("DELETE FROM photos WHERE id = ?", (photo_id,))
+    if Path(photo.path).exists():
+        try:
+            send2trash(photo.path)
+        except OSError:
+            logger.exception("No se pudo mandar a la Papelera: %s", photo.path)
+            return False
+        logger.info("Enviado a la Papelera: %s", photo.path)
+    db.delete_photos([photo_id])
     return True
 
 
 # ── Mantenimiento ─────────────────────────────────────────────────────────────
 
-def remove_missing_files() -> int:
-    conn = db.get_connection()
-    rows = conn.execute("SELECT id, path FROM photos").fetchall()
-    missing_ids = [row[0] for row in rows if not Path(row[1]).exists()]
-    if missing_ids:
-        with db.transaction() as c:
-            c.executemany("DELETE FROM photos WHERE id = ?", [(i,) for i in missing_ids])
-    return len(missing_ids)
+# Si en una unidad disponible faltan TODOS los archivos y son al menos esta
+# cantidad, se asume que es otro disco con la misma letra (o una carpeta
+# desmontada) y no se borra nada de esa unidad.
+SUSPICIOUS_ROOT_MIN = 20
+
+
+@dataclass
+class SkippedRoot:
+    root:   str   # p. ej. "G:\\"
+    count:  int   # registros en esa unidad
+    reason: str
+
+
+@dataclass
+class MissingReport:
+    """Resultado de buscar registros cuyo archivo ya no existe."""
+    missing_ids: list[int]          = field(default_factory=list)
+    tagged:      int                = 0     # cuántas de ellas tienen etiquetas
+    checked:     int                = 0
+    skipped:     list[SkippedRoot]  = field(default_factory=list)
+    cancelled:   bool               = False
+
+    @property
+    def count(self) -> int:
+        return len(self.missing_ids)
+
+
+def _root_of(path: str) -> str:
+    return Path(path).anchor or "(sin unidad)"
+
+
+def find_missing_files(progress_callback: ProgressCallback | None = None,
+                       should_stop: StopCheck | None = None) -> MissingReport:
+    """
+    Busca registros cuyo archivo no existe. NO borra nada (ver delete_missing).
+
+    Protección contra pérdida de datos: los registros de unidades no
+    disponibles (disco desconectado) o donde faltan TODOS los archivos no se
+    incluyen; se informan en `skipped`.
+    """
+    rows = db.get_all_photo_paths()
+    by_root: dict[str, list[tuple[int, str]]] = defaultdict(list)
+    for pid, path in rows:
+        by_root[_root_of(path)].append((pid, path))
+
+    report = MissingReport()
+    total  = len(rows)
+    done   = 0
+
+    for root, items in by_root.items():
+        if not Path(root).exists():
+            report.skipped.append(SkippedRoot(root, len(items), "la unidad no está disponible"))
+            done += len(items)
+            if progress_callback:
+                progress_callback(done, total)
+            continue
+
+        missing_here: list[int] = []
+        for pid, path in items:
+            if should_stop and should_stop():
+                report.cancelled = True
+                report.missing_ids = []
+                return report
+            if not Path(path).exists():
+                missing_here.append(pid)
+            done += 1
+            if progress_callback and (done % 200 == 0 or done == total):
+                progress_callback(done, total)
+
+        if len(missing_here) == len(items) and len(items) >= SUSPICIOUS_ROOT_MIN:
+            report.skipped.append(SkippedRoot(
+                root, len(items),
+                "faltan todos sus archivos (¿es otro disco con la misma letra?)",
+            ))
+        else:
+            report.missing_ids.extend(missing_here)
+
+    report.checked = done
+    report.tagged  = db.count_tagged(report.missing_ids)
+    logger.info("Búsqueda de faltantes: %d de %d; unidades omitidas: %s",
+                report.count, total, [(s.root, s.count) for s in report.skipped])
+    return report
+
+
+def delete_missing(report: MissingReport) -> int:
+    """Borra los registros encontrados por find_missing_files()."""
+    if report.cancelled:
+        return 0
+    n = db.delete_photos(report.missing_ids)
+    logger.info("Eliminados %d registros de archivos faltantes", n)
+    return n
+
+
+def preview_deindex_folder(folder: str) -> tuple[int, int]:
+    """(cantidad de registros, cuántos tienen etiquetas) que borraría deindex_folder."""
+    ids = db.get_folder_photo_ids(folder)
+    return len(ids), db.count_tagged(ids)
 
 
 def deindex_folder(folder: str) -> int:
-    with db.transaction() as conn:
-        cur = conn.execute("DELETE FROM photos WHERE path LIKE ?", (folder + "%",))
-        return cur.rowcount
+    """Quita los registros de `folder` y sus subcarpetas. No toca el disco."""
+    n = db.delete_photos(db.get_folder_photo_ids(folder))
+    logger.info("Des-indexada %s: %d registros", folder, n)
+    return n
 
 
 def get_indexed_folders() -> list[tuple[str, int]]:

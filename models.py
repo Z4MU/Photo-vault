@@ -50,6 +50,7 @@ class Photo:
     width:      Optional[int]   = None
     height:     Optional[int]   = None
     added_at:   Optional[str]   = None
+    md5:        Optional[str]   = None   # Solo se carga donde hace falta (duplicados)
 
     @property
     def is_video(self) -> bool:

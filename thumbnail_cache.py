@@ -2,9 +2,14 @@
 PhotoVault - thumbnail_cache.py
 Caché persistente de miniaturas en disco.
 
-Guarda cada miniatura como JPEG en ~/.photovault/thumbs/<hash>.jpg
-El hash se calcula a partir de la ruta del archivo + su fecha de modificación,
-por lo que si el archivo original cambia, la miniatura se regenera automáticamente.
+Guarda cada miniatura como JPEG en ~/.photovault/thumbs/<2 chars>/<nombre>.jpg
+
+Nombre del archivo:  [v_]<sha1(ruta::mtime::versión)>_<tamaño>.jpg
+  - mtime: si el original cambia, la miniatura se regenera sola.
+  - tamaño: la de 200 px y la de 480 px de la misma foto son archivos distintos.
+  - versión (THUMB_VERSION): subirla invalida todo el caché cuando cambia la
+    forma de generar miniaturas (p. ej. al empezar a aplicar la orientación EXIF).
+  - "v_": prefijo para videos.
 
 Uso:
     from thumbnail_cache import get_thumbnail   # devuelve bytes o None
@@ -16,9 +21,25 @@ import logging
 import os
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageOps
 
 logger = logging.getLogger(__name__)
+
+# Soporte HEIC/HEIF (fotos de iPhone). Se registra aquí también y no solo en
+# indexer.py: este módulo no debe depender de que otro se haya importado antes.
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()
+except ImportError:
+    logger.warning("pillow-heif no está instalado: los .heic no tendrán miniatura")
+
+# Directorio donde se guardan las miniaturas
+CACHE_DIR = Path.home() / ".photovault" / "thumbs"
+THUMB_SIZE = 200          # píxeles (lado máximo)
+THUMB_QUALITY = 85        # calidad JPEG
+THUMB_VERSION = 2         # v2: orientación EXIF + tamaño en el nombre
+
+_VIDEO_PREFIX = "v_"
 
 # Rutas cuyo fallo ya se registró en esta sesión (evita repetir el mismo
 # warning cada vez que se vuelve a mostrar la página)
@@ -30,44 +51,31 @@ def _log_failure(filepath: str, what: str, exc: BaseException) -> None:
         _logged_failures.add(filepath)
         logger.warning("No se pudo %s %s: %s", what, filepath, exc)
 
-# Directorio donde se guardan las miniaturas
-CACHE_DIR = Path.home() / ".photovault" / "thumbs"
-THUMB_SIZE = 200          # píxeles (lado máximo)
-THUMB_QUALITY = 85        # calidad JPEG
 
-
-def _cache_key(filepath: str) -> str:
-    """
-    Genera un nombre de archivo único para la miniatura.
-    Incluye la ruta y el mtime del archivo para invalidar automáticamente
-    cuando el original cambia.
-    """
+def _source_hash(filepath: str) -> str:
+    """Hash que identifica la versión actual del archivo original."""
     try:
         mtime = str(os.path.getmtime(filepath))
     except OSError:
         mtime = "0"
-    raw = f"{filepath}::{mtime}".encode()
-    return hashlib.sha1(raw).hexdigest() + ".jpg"
+    raw = f"{filepath}::{mtime}::{THUMB_VERSION}".encode()
+    return hashlib.sha1(raw).hexdigest()
 
 
-def _cache_path(key: str) -> Path:
-    # Subdirectorios de 2 caracteres para no saturar un solo directorio
-    return CACHE_DIR / key[:2] / key
+def _cache_name(filepath: str, size: int, video: bool) -> str:
+    prefix = _VIDEO_PREFIX if video else ""
+    return f"{prefix}{_source_hash(filepath)}_{size}.jpg"
 
 
-def _ensure_cache_dir(path: Path):
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _cache_path(name: str) -> Path:
+    # Subdirectorios por los 2 primeros caracteres del hash (sin el prefijo de
+    # video) para no saturar un solo directorio
+    h = name.removeprefix(_VIDEO_PREFIX)
+    return CACHE_DIR / h[:2] / name
 
 
-def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
-    """
-    Devuelve la miniatura en bytes (JPEG).
-    - Si existe en caché y el archivo no cambió, la lee del disco.
-    - Si no existe o el original cambió, la genera y la guarda.
-    - Devuelve None si no se puede procesar el archivo.
-    """
-    key  = _cache_key(filepath)
-    path = _cache_path(key)
+def _get_cached(filepath: str, size: int, video: bool) -> bytes | None:
+    path = _cache_path(_cache_name(filepath, size, video))
 
     # ── Caché hit ──────────────────────────────────────────────────────────
     if path.exists():
@@ -78,10 +86,10 @@ def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
             logger.warning("No se pudo leer la miniatura en caché %s: %s", path, e)
 
     # ── Caché miss: generar miniatura ──────────────────────────────────────
-    data = _generate(filepath, size)
+    data = _generate_video(filepath, size) if video else _generate(filepath, size)
     if data:
         try:
-            _ensure_cache_dir(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         except OSError as e:
             # Si no se puede guardar, igual devolvemos los bytes
@@ -89,42 +97,39 @@ def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
     return data
 
 
+def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
+    """
+    Devuelve la miniatura en bytes (JPEG), con la orientación EXIF aplicada.
+    - Si existe en caché y el archivo no cambió, la lee del disco.
+    - Si no existe o el original cambió, la genera y la guarda.
+    - Devuelve None si no se puede procesar el archivo.
+    """
+    return _get_cached(filepath, size, video=False)
+
+
 def get_video_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
-    """
-    Igual que get_thumbnail pero para videos (usa opencv).
-    """
-    key  = _cache_key(filepath)
-    # Prefijo distinto para no colisionar con imágenes que tengan mismo hash
-    key  = "v_" + key
-    path = _cache_path(key)
+    """Igual que get_thumbnail pero para videos (usa opencv)."""
+    return _get_cached(filepath, size, video=True)
 
-    if path.exists():
-        try:
-            return path.read_bytes()
-        except OSError as e:
-            logger.warning("No se pudo leer la miniatura en caché %s: %s", path, e)
 
-    data = _generate_video(filepath, size)
-    if data:
-        try:
-            _ensure_cache_dir(path)
-            path.write_bytes(data)
-        except OSError as e:
-            logger.warning("No se pudo guardar la miniatura %s: %s", path, e)
-    return data
+def _to_jpeg(img: Image.Image, size: int) -> bytes:
+    # Convertir a RGB para evitar problemas con RGBA/P al guardar JPEG
+    if img.mode not in ("RGB", "L"):
+        img = img.convert("RGB")
+    img.thumbnail((size, size), Image.Resampling.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
+    return buf.getvalue()
 
 
 def _generate(filepath: str, size: int) -> bytes | None:
     """Genera miniatura de imagen con Pillow."""
     try:
         with Image.open(filepath) as img:
-            # Convertir a RGB para evitar problemas con RGBA/P al guardar JPEG
-            if img.mode not in ("RGB", "L"):
-                img = img.convert("RGB")
-            img.thumbnail((size, size), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
-            return buf.getvalue()
+            # Fotos de celular: los píxeles vienen "acostados" y el EXIF
+            # dice cómo rotarlos. Sin esto la miniatura sale girada.
+            rotated = ImageOps.exif_transpose(img)
+            return _to_jpeg(rotated if rotated is not None else img, size)
     except Exception as e:
         _log_failure(filepath, "generar la miniatura de", e)
         return None
@@ -145,13 +150,7 @@ def _generate_video(filepath: str, size: int) -> bytes | None:
         if not ret:
             return None
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = Image.fromarray(frame_rgb)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-        img.thumbnail((size, size), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
-        return buf.getvalue()
+        return _to_jpeg(Image.fromarray(frame_rgb), size)
     except Exception as e:
         _log_failure(filepath, "generar la miniatura del video", e)
         return None
@@ -159,27 +158,27 @@ def _generate_video(filepath: str, size: int) -> bytes | None:
 
 def purge_orphans(known_paths: list[str]) -> int:
     """
-    Elimina del caché las miniaturas cuyos archivos originales ya no existen.
+    Elimina del caché las miniaturas que no corresponden a la versión actual
+    de un archivo indexado (archivo des-indexado, modificado, o miniatura de
+    un formato de caché anterior).
     Devuelve la cantidad de archivos eliminados.
-    Útil para llamar periódicamente o desde la opción de mantenimiento.
     """
     if not CACHE_DIR.exists():
         return 0
 
-    # Construir set de claves válidas
-    valid_keys = set()
-    for p in known_paths:
-        valid_keys.add(_cache_key(p))
-        valid_keys.add("v_" + _cache_key(p))
+    valid_hashes = {_source_hash(p) for p in known_paths}
 
     removed = 0
     for thumb in CACHE_DIR.rglob("*.jpg"):
-        if thumb.name not in valid_keys:
-            try:
-                thumb.unlink()
-                removed += 1
-            except OSError as e:
-                logger.warning("No se pudo eliminar la miniatura huérfana %s: %s", thumb, e)
+        stem = thumb.stem.removeprefix(_VIDEO_PREFIX)
+        h, sep, _size = stem.partition("_")
+        if sep and h in valid_hashes:
+            continue
+        try:
+            thumb.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("No se pudo eliminar la miniatura huérfana %s: %s", thumb, e)
     return removed
 
 

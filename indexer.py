@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Callable
 
 from PIL import Image
-from PIL.ExifTags import TAGS
 
 import database as db
 
@@ -86,17 +85,43 @@ DATE_PATTERNS = [
 _COMPILED_PATTERNS = [re.compile(p) for p in DATE_PATTERNS]
 
 
-def _extract_date_from_exif(path: str):
+# Tags EXIF de fecha, en orden de prioridad:
+#   DateTimeOriginal  (36867, IFD Exif) — cuándo se tomó la foto
+#   DateTimeDigitized (36868, IFD Exif) — cuándo se digitalizó (escaneos)
+#   DateTime          (306,   IFD0)     — última MODIFICACIÓN: solo como último recurso
+_EXIF_IFD = 0x8769
+_TAG_DATETIME_ORIGINAL  = 36867
+_TAG_DATETIME_DIGITIZED = 36868
+_TAG_DATETIME           = 306
+
+
+def _parse_exif_date(value) -> tuple[int, int] | None:
+    if isinstance(value, bytes):
+        value = value.decode("ascii", errors="ignore")
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.strptime(value.strip()[:10], "%Y:%m:%d")
+    except ValueError:
+        return None  # "0000:00:00 00:00:00", vacío, formato raro…
+    if not (1900 <= dt.year <= datetime.now().year + 1):
+        return None
+    return dt.year, dt.month
+
+
+def _extract_date_from_exif(path: str) -> tuple[int | None, int | None]:
     try:
         with Image.open(path) as img:
-            exif_data = img._getexif()
-            if not exif_data:
+            exif = img.getexif()
+            if not exif:
                 return None, None
-            for tag_id, value in exif_data.items():
-                tag = TAGS.get(tag_id, tag_id)
-                if tag in ("DateTime", "DateTimeOriginal", "DateTimeDigitized"):
-                    dt = datetime.strptime(value[:10], "%Y:%m:%d")
-                    return dt.year, dt.month
+            exif_ifd = exif.get_ifd(_EXIF_IFD)
+            for value in (exif_ifd.get(_TAG_DATETIME_ORIGINAL),
+                          exif_ifd.get(_TAG_DATETIME_DIGITIZED),
+                          exif.get(_TAG_DATETIME)):
+                parsed = _parse_exif_date(value)
+                if parsed:
+                    return parsed
     except Exception as e:
         # Muy común (sin EXIF, formato raro): no es un error real
         logger.debug("Sin fecha EXIF en %s: %s", path, e)
@@ -167,25 +192,31 @@ def extract_video_thumbnail(path: str, size: int = 200) -> bytes | None:
     return get_video_thumbnail(path, size=size)
 
 
-def index_folder(folder: str, progress_callback: Callable[[int, int, str], None] = None):
+def index_folder(folder: str,
+                 progress_callback: Callable[[int, int, str], None] | None = None,
+                 should_stop: Callable[[], bool] | None = None) -> tuple[int, int, int]:
     """
     Escanea una carpeta recursivamente e indexa imágenes y videos.
     progress_callback(current, total, filepath) se llama por cada archivo.
-    Devuelve (added, skipped, errors).
+    should_stop() se consulta antes de cada archivo para poder cancelar.
+    Devuelve (nuevas, actualizadas, errores).
     """
-    folder = Path(folder)
-    if not folder.exists():
-        raise ValueError(f"La carpeta no existe: {folder}")
+    root = Path(folder)
+    if not root.exists():
+        raise ValueError(f"La carpeta no existe: {root}")
 
     all_files = [
-        p for p in folder.rglob("*")
+        p for p in root.rglob("*")
         if p.suffix.lower() in SUPPORTED_EXTENSIONS and p.is_file()
     ]
 
     total  = len(all_files)
-    added  = skipped = errors = 0
+    added  = updated = errors = 0
 
     for i, filepath in enumerate(all_files):
+        if should_stop and should_stop():
+            logger.info("Indexación de %s cancelada en %d/%d", root, i, total)
+            break
         if progress_callback:
             progress_callback(i + 1, total, str(filepath))
 
@@ -216,14 +247,18 @@ def index_folder(folder: str, progress_callback: Callable[[int, int, str], None]
                 width, height = _get_image_size(path_str)
                 duration = None
 
+            existed = db.photo_exists(path_str)
             db.upsert_photo(
                 path_str, filename, year, month, filesize,
                 width, height, media_type, duration
             )
-            added += 1
+            if existed:
+                updated += 1
+            else:
+                added += 1
 
         except Exception as e:
             errors += 1
             logger.error("Error indexando %s: %s", filepath, e, exc_info=True)
 
-    return added, skipped, errors
+    return added, updated, errors

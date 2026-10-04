@@ -4,6 +4,7 @@ Maneja toda la interacción con SQLite.
 """
 
 import logging
+import os
 import sqlite3
 import threading
 from collections.abc import Callable
@@ -309,9 +310,32 @@ def _seed_initial_data(conn):
 
 # ── Fotos ─────────────────────────────────────────────────────────────────────
 
-def upsert_photo(path: str, filename: str, year: int, month: int,
-                 filesize: int, width: int = None, height: int = None,
-                 media_type: str = "image", duration: float = None) -> int:
+_PHOTO_COLUMNS = (
+    "p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, "
+    "p.filesize, p.width, p.height, p.added_at"
+)
+
+
+def folder_like_pattern(folder: str) -> str:
+    """
+    Patrón LIKE (con ESCAPE '!') que coincide con los archivos dentro de
+    `folder` y sus subcarpetas, pero NO con carpetas hermanas que empiezan
+    igual (D:\\Fotos no incluye D:\\Fotos2). '%' y '_' en la ruta se toman
+    literales.
+    """
+    norm = os.path.normpath(folder).rstrip("/\\")
+    escaped = norm.replace("!", "!!").replace("%", "!%").replace("_", "!_")
+    return escaped + os.sep + "%"
+
+
+def photo_exists(path: str) -> bool:
+    conn = get_connection()
+    return conn.execute("SELECT 1 FROM photos WHERE path = ?", (path,)).fetchone() is not None
+
+
+def upsert_photo(path: str, filename: str, year: int | None, month: int | None,
+                 filesize: int, width: int | None = None, height: int | None = None,
+                 media_type: str = "image", duration: float | None = None) -> int:
     with transaction() as conn:
         cur = conn.execute("""
             INSERT INTO photos (path, filename, media_type, year, month,
@@ -348,6 +372,10 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
         media_type = row["media_type"] or "image",
         duration   = row["duration"],
         filesize   = row["filesize"] if "filesize" in keys else None,
+        width      = row["width"]    if "width"    in keys else None,
+        height     = row["height"]   if "height"   in keys else None,
+        added_at   = row["added_at"] if "added_at" in keys else None,
+        md5        = row["md5"]      if "md5"      in keys else None,
     )
 
 
@@ -379,8 +407,8 @@ def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
         params.append(f"%{search}%")
 
     if folder:
-        where_clauses.append("p.path LIKE ?")
-        params.append(folder.rstrip("/\\") + "%")
+        where_clauses.append("p.path LIKE ? ESCAPE '!'")
+        params.append(folder_like_pattern(folder))
 
     if untagged_only:
         where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
@@ -390,7 +418,7 @@ def get_photos(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
 
     conn = get_connection()
     rows = conn.execute(f"""
-        SELECT p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, p.filesize
+        SELECT {_PHOTO_COLUMNS}
         FROM photos p
         {where_sql}
         ORDER BY {order_sql}
@@ -425,8 +453,8 @@ def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
         params.append(f"%{search}%")
 
     if folder:
-        where_clauses.append("p.path LIKE ?")
-        params.append(folder.rstrip("/\\") + "%")
+        where_clauses.append("p.path LIKE ? ESCAPE '!'")
+        params.append(folder_like_pattern(folder))
 
     if untagged_only:
         where_clauses.append("p.id NOT IN (SELECT DISTINCT photo_id FROM photo_tags)")
@@ -440,25 +468,75 @@ def get_photo_count(tag_ids: list[int] = None, hidden_tag_ids: set[int] = None,
 def get_photo_by_id(photo_id: int) -> Optional[Photo]:
     conn = get_connection()
     row  = conn.execute(
-        "SELECT id, path, filename, year, month, media_type, duration, filesize FROM photos WHERE id = ?",
+        f"SELECT {_PHOTO_COLUMNS}, p.md5 FROM photos p WHERE p.id = ?",
         (photo_id,)
     ).fetchone()
     return _row_to_photo(row) if row else None
 
 
 def get_all_photos_for_duplicates() -> list[Photo]:
-    """Devuelve id, path, filename, filesize, md5 de todas las fotos."""
+    """Todas las fotos, con su md5 (None si aún no se calculó)."""
+    conn = get_connection()
+    rows = conn.execute(f"SELECT {_PHOTO_COLUMNS}, p.md5 FROM photos p").fetchall()
+    return [_row_to_photo(r) for r in rows]
+
+
+def get_all_photo_paths() -> list[tuple[int, str]]:
+    conn = get_connection()
+    return [(r[0], r[1]) for r in conn.execute("SELECT id, path FROM photos").fetchall()]
+
+
+def delete_photos(photo_ids: list[int]) -> int:
+    """Borra registros (y por CASCADE sus etiquetas). No toca archivos del disco."""
+    if not photo_ids:
+        return 0
+    with transaction() as conn:
+        conn.executemany("DELETE FROM photos WHERE id = ?", [(i,) for i in photo_ids])
+    return len(photo_ids)
+
+
+def count_tagged(photo_ids: list[int]) -> int:
+    """Cuántas de estas fotos tienen al menos una etiqueta."""
+    if not photo_ids:
+        return 0
+    conn  = get_connection()
+    total = 0
+    # SQLite limita la cantidad de parámetros por consulta
+    for i in range(0, len(photo_ids), 500):
+        chunk = photo_ids[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        total += conn.execute(
+            f"SELECT COUNT(DISTINCT photo_id) FROM photo_tags WHERE photo_id IN ({placeholders})",
+            chunk,
+        ).fetchone()[0]
+    return total
+
+
+def get_folder_photo_ids(folder: str) -> list[int]:
+    """IDs de las fotos dentro de `folder` y sus subcarpetas."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, path, filename, year, month, media_type, duration, filesize, md5 FROM photos"
+        "SELECT id FROM photos WHERE path LIKE ? ESCAPE '!'", (folder_like_pattern(folder),)
     ).fetchall()
-    photos = []
-    for r in rows:
-        p = _row_to_photo(r)
-        # md5 no está en Photo pero lo necesitamos — lo pegamos como attr extra
-        object.__setattr__(p, '_md5', r["md5"]) if hasattr(p, '__dataclass_fields__') else None
-        photos.append((p, r["md5"]))
-    return photos
+    return [r[0] for r in rows]
+
+
+# ── Configuración del usuario ─────────────────────────────────────────────────
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    row = get_connection().execute(
+        "SELECT value FROM app_settings WHERE key = ?", (key,)
+    ).fetchone()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str) -> None:
+    with transaction() as conn:
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 # ── Etiquetas de una foto ─────────────────────────────────────────────────────
@@ -563,6 +641,43 @@ def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> 
         return conn.execute(
             "SELECT id FROM tags WHERE name = ?", (name.strip().lower(),)
         ).fetchone()[0]
+
+
+class TagNameConflictError(ValueError):
+    """Ya existe otra etiqueta con ese nombre."""
+
+
+def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
+    """Cambia nombre, categoría y color de una etiqueta existente."""
+    name     = name.strip().lower()
+    category = category.strip().lower() or "general"
+    if not name:
+        raise ValueError("El nombre de etiqueta no puede estar vacío.")
+    with transaction() as conn:
+        clash = conn.execute(
+            "SELECT id FROM tags WHERE name = ? AND id != ?", (name, tag_id)
+        ).fetchone()
+        if clash:
+            raise TagNameConflictError(f"Ya existe una etiqueta llamada '{name}'.")
+        conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
+        conn.execute(
+            "UPDATE tags SET name = ?, category = ?, color = ? WHERE id = ?",
+            (name, category, color, tag_id),
+        )
+
+
+def count_photos_with_tag(tag_id: int) -> int:
+    return get_connection().execute(
+        "SELECT COUNT(*) FROM photo_tags WHERE tag_id = ?", (tag_id,)
+    ).fetchone()[0]
+
+
+def get_tag(tag_id: int) -> Optional[Tag]:
+    row = get_connection().execute(
+        "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags WHERE id = ?",
+        (tag_id,),
+    ).fetchone()
+    return _row_to_tag(row) if row else None
 
 
 def set_tag_hidden(tag_id: int, hidden: bool):

@@ -10,12 +10,13 @@ Features nuevos en esta versión:
   6. Vista de duplicados         → DuplicatesDialog con hash MD5
 """
 
+import html
 import logging
 import sys
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QImage, QImageReader, QPixmap
 from PyQt6.QtSvgWidgets import QSvgWidget
 from PyQt6.QtWidgets import (
     QApplication,
@@ -51,12 +52,61 @@ from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Tag
 logger = logging.getLogger(__name__)
 
 
-# ─── Hilo para indexación ─────────────────────────────────────────────────────
+# ─── Hilos ────────────────────────────────────────────────────────────────────
+#
+# Reglas (ver CLAUDE.md §10):
+#   - Los workers NO crean QPixmap ni widgets: solo QImage / datos. El QPixmap
+#     se crea en el hilo de la UI al recibir la señal.
+#   - Ningún worker redefine la señal `finished` de QThread; para resultados
+#     usan `completed`.
+#   - Para descartar un worker que sigue corriendo se usa retire_thread():
+#     pide que pare y guarda una referencia hasta que termine de verdad, así
+#     Python nunca destruye un QThread en ejecución (y la UI no se bloquea).
 
-class IndexWorker(QThread):
-    progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(int, int, int)
-    error    = pyqtSignal(str)
+class StoppableThread(QThread):
+    def __init__(self):
+        super().__init__()
+        self._stop_flag = False
+
+    def stop(self):
+        self._stop_flag = True
+
+    def is_stopping(self) -> bool:
+        return self._stop_flag
+
+
+_retired_threads: set[QThread] = set()
+
+
+def retire_thread(thread: StoppableThread | None) -> None:
+    """Pide a un hilo que pare sin bloquear la UI y lo mantiene vivo hasta que termine."""
+    if thread is None:
+        return
+    thread.stop()
+    if thread.isRunning():
+        _retired_threads.add(thread)
+        thread.finished.connect(lambda t=thread: _retired_threads.discard(t))
+
+
+def wait_all_threads(timeout_ms: int = 5000) -> None:
+    """Al cerrar la app: esperar a que terminen los hilos retirados."""
+    for t in list(_retired_threads):
+        if not t.wait(timeout_ms):
+            logger.warning("Un hilo no terminó a tiempo al cerrar: %r", t)
+
+
+def _disconnect_all(*signals) -> None:
+    for sig in signals:
+        try:
+            sig.disconnect()
+        except TypeError:
+            pass  # No tenía conexiones
+
+
+class IndexWorker(StoppableThread):
+    progress  = pyqtSignal(int, int, str)
+    completed = pyqtSignal(int, int, int)   # nuevas, actualizadas, errores
+    error     = pyqtSignal(str)
 
     def __init__(self, folder: str):
         super().__init__()
@@ -64,11 +114,12 @@ class IndexWorker(QThread):
 
     def run(self):
         try:
-            added, skipped, errors = indexer.index_folder(
+            added, updated, errors = indexer.index_folder(
                 self.folder,
                 progress_callback=lambda c, t, p: self.progress.emit(c, t, p),
+                should_stop=self.is_stopping,
             )
-            self.finished.emit(added, skipped, errors)
+            self.completed.emit(added, updated, errors)
         except Exception as e:
             logger.exception("Error indexando %s", self.folder)
             self.error.emit(str(e))
@@ -76,18 +127,12 @@ class IndexWorker(QThread):
             db.close_connection()
 
 
-# ─── Hilo para cargar miniaturas ──────────────────────────────────────────────
-
-class ThumbnailLoader(QThread):
-    loaded = pyqtSignal(int, QPixmap)
+class ThumbnailLoader(StoppableThread):
+    loaded = pyqtSignal(int, QImage)
 
     def __init__(self, photos: list[Photo]):
         super().__init__()
-        self.photos     = photos
-        self._stop_flag = False
-
-    def stop(self):
-        self._stop_flag = True
+        self.photos = photos
 
     def run(self):
         for photo in self.photos:
@@ -98,14 +143,13 @@ class ThumbnailLoader(QThread):
                         if photo.is_video
                         else thumbnail_cache.get_thumbnail(photo.path))
                 if jpeg:
-                    pix = QPixmap()
-                    pix.loadFromData(jpeg)
-                    if not pix.isNull():
-                        if pix.width() > 200 or pix.height() > 200:
-                            pix = pix.scaled(200, 200,
+                    img = QImage.fromData(jpeg)
+                    if not img.isNull():
+                        if img.width() > 200 or img.height() > 200:
+                            img = img.scaled(200, 200,
                                              Qt.AspectRatioMode.KeepAspectRatio,
                                              Qt.TransformationMode.SmoothTransformation)
-                        self.loaded.emit(photo.id, pix)
+                        self.loaded.emit(photo.id, img)
             except Exception:
                 logger.exception("Error cargando miniatura de %s", photo.path)
             if not self._stop_flag:
@@ -113,24 +157,72 @@ class ThumbnailLoader(QThread):
         db.close_connection()
 
 
-# ─── Hilo para calcular MD5s ──────────────────────────────────────────────────
-
-class MD5Worker(QThread):
-    progress = pyqtSignal(int, int)
-    finished = pyqtSignal(int)
-    error    = pyqtSignal(str)
+class MD5Worker(StoppableThread):
+    progress  = pyqtSignal(int, int)
+    completed = pyqtSignal(int)
+    error     = pyqtSignal(str)
 
     def run(self):
         try:
             n = services.compute_missing_md5s(
-                progress_callback=lambda c, t: self.progress.emit(c, t)
+                progress_callback=lambda c, t: self.progress.emit(c, t),
+                should_stop=self.is_stopping,
             )
-            self.finished.emit(n)
+            self.completed.emit(n)
         except Exception as e:
             logger.exception("Error calculando MD5s")
             self.error.emit(str(e))
         finally:
             db.close_connection()
+
+
+class MissingFilesWorker(StoppableThread):
+    """Busca registros de archivos que ya no existen (no borra nada)."""
+    progress  = pyqtSignal(int, int)
+    completed = pyqtSignal(object)          # services.MissingReport
+    error     = pyqtSignal(str)
+
+    def run(self):
+        try:
+            report = services.find_missing_files(
+                progress_callback=lambda c, t: self.progress.emit(c, t),
+                should_stop=self.is_stopping,
+            )
+            self.completed.emit(report)
+        except Exception as e:
+            logger.exception("Error buscando archivos faltantes")
+            self.error.emit(str(e))
+        finally:
+            db.close_connection()
+
+
+# ─── Utilidades de imagen ─────────────────────────────────────────────────────
+
+def load_preview_pixmap(path: str, max_side: int) -> QPixmap | None:
+    """
+    Carga una imagen grande para mostrarla, ya escalada y con la orientación
+    EXIF aplicada. QImageReader decodifica directo al tamaño pedido (no carga
+    el original completo en memoria). Si Qt no sabe leer el formato (p. ej.
+    HEIC), usa la miniatura de Pillow.
+    """
+    reader = QImageReader(path)
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid() and (size.width() > max_side or size.height() > max_side):
+        # Con autoTransform la imagen puede rotar 90°: calcular sobre el lado mayor
+        scale = max_side / max(size.width(), size.height())
+        reader.setScaledSize(size * scale)
+    img = reader.read()
+    if not img.isNull():
+        return QPixmap.fromImage(img)
+
+    jpeg = thumbnail_cache.get_thumbnail(path, size=max_side)
+    if jpeg:
+        pix = QPixmap()
+        if pix.loadFromData(jpeg):
+            return pix
+    logger.warning("No se pudo cargar la imagen %s: %s", path, reader.errorString())
+    return None
 
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────
@@ -200,6 +292,7 @@ class PhotoThumbnail(QFrame):
 
         layout.addWidget(img_container)
         name_label = QLabel(photo.short_name)
+        name_label.setTextFormat(Qt.TextFormat.PlainText)
         name_label.setStyleSheet("color:#8888AA;font-size:10px;")
         name_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(name_label)
@@ -279,15 +372,15 @@ class PhotoDetailDialog(QDialog):
         else:
             img = QLabel(); img.setAlignment(Qt.AlignmentFlag.AlignCenter)
             img.setMinimumWidth(500)
-            pix = QPixmap(self.photo.path)
-            if not pix.isNull():
-                pix = pix.scaled(560, 560, Qt.AspectRatioMode.KeepAspectRatio,
-                                 Qt.TransformationMode.SmoothTransformation)
+            pix = load_preview_pixmap(self.photo.path, 560)
+            if pix is not None:
                 img.setPixmap(pix)
+            else:
+                img.setText("No se pudo cargar la imagen")
             layout.addWidget(img)
 
         right = QVBoxLayout(); right.setSpacing(10)
-        right.addWidget(QLabel(f"<b>{Path(self.photo.path).name}</b>"))
+        right.addWidget(QLabel(f"<b>{html.escape(Path(self.photo.path).name)}</b>"))
         right.addWidget(QLabel("Etiquetas:"))
 
         self.tags_container = QWidget()
@@ -462,41 +555,46 @@ class StatsDialog(QDialog):
         """Genera un widget SVG con un gráfico de barras horizontal."""
         if not data:
             return QLabel("Sin datos")
-
-        max_val  = max(v for _, v in data)
-        bar_h    = 22
-        gap      = 6
-        label_w  = 80
-        chart_w  = 460
-        height   = len(data) * (bar_h + gap) + 10
-        svg_w    = label_w + chart_w + 60
-
-        bars = []
-        for i, (key, val) in enumerate(data):
-            y    = 5 + i * (bar_h + gap)
-            fill = int(val / max_val * chart_w) if max_val else 0
-            key_str = str(key)[:12]
-            bars.append(
-                f'<text x="{label_w - 6}" y="{y + bar_h - 6}" '
-                f'text-anchor="end" fill="#8888AA" font-size="11">{key_str}</text>'
-                f'<rect x="{label_w}" y="{y}" width="{fill}" height="{bar_h}" '
-                f'rx="4" fill="{color}99"/>'
-                f'<text x="{label_w + fill + 6}" y="{y + bar_h - 6}" '
-                f'fill="#CCC" font-size="11">{val:,}</text>'
-            )
-
-        svg = (
-            f'<svg xmlns="http://www.w3.org/2000/svg" '
-            f'width="{svg_w}" height="{height}">'
-            f'<rect width="{svg_w}" height="{height}" fill="#13131F" rx="8"/>'
-            + "".join(bars) +
-            "</svg>"
-        )
-
+        svg, height = build_bar_chart_svg(data, color)
         widget = QSvgWidget()
         widget.load(svg.encode())
         widget.setFixedHeight(height + 10)
         return widget
+
+
+def build_bar_chart_svg(data: list[tuple], color: str) -> tuple[str, int]:
+    """SVG de barras horizontales; devuelve (svg, alto). Los textos se escapan."""
+    max_val  = max(v for _, v in data)
+    bar_h    = 22
+    gap      = 6
+    label_w  = 80
+    chart_w  = 460
+    height   = len(data) * (bar_h + gap) + 10
+    svg_w    = label_w + chart_w + 60
+
+    bars = []
+    for i, (key, val) in enumerate(data):
+        y    = 5 + i * (bar_h + gap)
+        fill = int(val / max_val * chart_w) if max_val else 0
+        # Recortar ANTES de escapar para no partir una entidad como "&amp;"
+        key_str = html.escape(str(key)[:12])
+        bars.append(
+            f'<text x="{label_w - 6}" y="{y + bar_h - 6}" '
+            f'text-anchor="end" fill="#8888AA" font-size="11">{key_str}</text>'
+            f'<rect x="{label_w}" y="{y}" width="{fill}" height="{bar_h}" '
+            f'rx="4" fill="{color}99"/>'
+            f'<text x="{label_w + fill + 6}" y="{y + bar_h - 6}" '
+            f'fill="#CCC" font-size="11">{val:,}</text>'
+        )
+
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{svg_w}" height="{height}">'
+        f'<rect width="{svg_w}" height="{height}" fill="#13131F" rx="8"/>'
+        + "".join(bars) +
+        "</svg>"
+    )
+    return svg, height
 
 
 # ─── Dialog: Duplicados ───────────────────────────────────────────────────────
@@ -508,7 +606,16 @@ class DuplicatesDialog(QDialog):
         self.setMinimumSize(700, 540)
         self.setStyleSheet(DARK_STYLE)
         self._groups: list[DuplicateGroup] = []
+        self._worker: MD5Worker | None = None
         self._build_ui()
+
+    def done(self, result: int):
+        # Se llama al cerrar por cualquier vía (botón, Esc, X)
+        if self._worker is not None:
+            _disconnect_all(self._worker.progress, self._worker.completed, self._worker.error)
+            retire_thread(self._worker)
+            self._worker = None
+        super().done(result)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -519,7 +626,7 @@ class DuplicatesDialog(QDialog):
             "<b>Duplicados por hash MD5</b><br>"
             "<span style='color:#888;font-size:11px;'>"
             "Los archivos con el mismo contenido aparecen agrupados. "
-            "Puedes eliminar físicamente las copias extra.</span>"
+            "Puedes mandar las copias extra a la Papelera de reciclaje.</span>"
         ))
 
         # Barra de cálculo de MD5
@@ -557,7 +664,7 @@ class DuplicatesDialog(QDialog):
         self._worker.progress.connect(
             lambda c, t: self.md5_progress.setValue(int(c / t * 100) if t else 0)
         )
-        self._worker.finished.connect(self._on_scan_done)
+        self._worker.completed.connect(self._on_scan_done)
         self._worker.error.connect(lambda e: (
             QMessageBox.critical(self, "Error", e),
             self.btn_scan.setEnabled(True),
@@ -565,6 +672,7 @@ class DuplicatesDialog(QDialog):
         self._worker.start()
 
     def _on_scan_done(self, n: int):
+        self._worker = None
         self.md5_progress.setVisible(False)
         self.btn_scan.setEnabled(True)
         self._groups = services.get_duplicate_groups()
@@ -608,15 +716,19 @@ class DuplicatesDialog(QDialog):
                 img_lbl.setFixedSize(100, 100)
                 img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 img_lbl.setStyleSheet("background:#13131F;border-radius:4px;")
-                jpeg = thumbnail_cache.get_thumbnail(photo.path, size=100)
+                jpeg = (thumbnail_cache.get_video_thumbnail(photo.path, size=100)
+                        if photo.is_video
+                        else thumbnail_cache.get_thumbnail(photo.path, size=100))
                 if jpeg:
                     pix = QPixmap(); pix.loadFromData(jpeg)
                     img_lbl.setPixmap(pix.scaled(100, 100,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation))
+                img_lbl.setToolTip(photo.path)
                 col.addWidget(img_lbl)
 
                 name = QLabel(photo.short_name)
+                name.setTextFormat(Qt.TextFormat.PlainText)
                 name.setStyleSheet("font-size:10px;color:#8888AA;")
                 name.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.addWidget(name)
@@ -626,8 +738,8 @@ class DuplicatesDialog(QDialog):
                 size_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.addWidget(size_lbl)
 
-                btn_del = QPushButton("🗑 Eliminar")
-                btn_del.setFixedWidth(90)
+                btn_del = QPushButton("🗑 A la Papelera")
+                btn_del.setFixedWidth(110)
                 btn_del.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;font-size:11px;")
                 btn_del.clicked.connect(
                     lambda _, pid=photo.id, g=group: self._delete_photo(pid, g)
@@ -646,10 +758,14 @@ class DuplicatesDialog(QDialog):
             QMessageBox.warning(self, "Atención",
                 "No puedes eliminar la última copia del archivo.")
             return
+        photo = next((p for p in group.photos if p.id == photo_id), None)
+        if photo is None:
+            return
         reply = QMessageBox.question(
-            self, "Confirmar eliminación",
-            "¿Eliminar este archivo del disco y de la base de datos?\n"
-            "Esta acción no se puede deshacer.",
+            self, "Confirmar",
+            f"¿Mandar este archivo a la Papelera de reciclaje?\n\n{photo.path}\n\n"
+            "También se quitará de PhotoVault (con sus etiquetas). "
+            "Puedes recuperar el archivo desde la Papelera.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -657,9 +773,13 @@ class DuplicatesDialog(QDialog):
         ok = services.delete_photo_file(photo_id)
         if ok:
             group.photos = [p for p in group.photos if p.id != photo_id]
+            # Un grupo con una sola copia ya no es un duplicado
+            self._groups = [g for g in self._groups if g.size >= 2]
             self._render_groups()
         else:
-            QMessageBox.critical(self, "Error", "No se pudo eliminar el archivo.")
+            QMessageBox.critical(self, "Error",
+                f"No se pudo mandar el archivo a la Papelera.\n"
+                f"Detalles en:\n{logging_setup.LOG_FILE}")
 
 
 # ─── Dialog: Configuración del modo etiquetado rápido ────────────────────────
@@ -764,10 +884,9 @@ class QuickTagSetupDialog(QDialog):
         folder   = self.folder_combo.currentData()
         tag_ids  = [tid for chk, tid in self._tag_checks if chk.isChecked()]
         untagged = self.chk_untagged.isChecked()
-        photos   = services.get_photos_for_tagging(
+        n = services.count_photos_for_tagging(
             folder=folder, tag_ids=tag_ids or None, untagged_only=untagged
         )
-        n = len(photos)
         self.count_lbl.setText(
             f"{n:,} foto{'s' if n != 1 else ''} coinciden con este filtro"
         )
@@ -897,6 +1016,7 @@ class QuickTagWindow(QDialog):
 
         # Nombre del archivo
         self.filename_lbl = QLabel("")
+        self.filename_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.filename_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.filename_lbl.setStyleSheet("color:#555;font-size:11px;margin-top:4px;")
         pal.addWidget(self.filename_lbl)
@@ -970,6 +1090,7 @@ class QuickTagWindow(QDialog):
         shortcut_n = 1
 
         all_tags = services.get_all_tags(include_sidebar_hidden=True)
+        self._tags_by_id: dict[int, Tag] = {t.id: t for t in all_tags}
 
         # Agrupar por categoría
         from collections import OrderedDict
@@ -1087,10 +1208,10 @@ class QuickTagWindow(QDialog):
             if w: w.deleteLater()
 
         for tag_id in self._current_tag_ids:
-            all_tags = services.get_all_tags(include_sidebar_hidden=True)
-            tag = next((t for t in all_tags if t.id == tag_id), None)
+            tag = self._tags_by_id.get(tag_id)
             if not tag: continue
             chip = QLabel(tag.name)
+            chip.setTextFormat(Qt.TextFormat.PlainText)
             chip.setStyleSheet(
                 f"background:{tag.color}22;color:{tag.color};"
                 f"border:1px solid {tag.color};border-radius:10px;"
@@ -1127,7 +1248,7 @@ class QuickTagWindow(QDialog):
             self._current_tag_ids.discard(tag.id)
             self._history.append((photo.id, tag.id, False))  # False = se quitó
         else:
-            services.add_tag(photo.id, tag.name)
+            services.add_tag_by_id(photo.id, tag.id)
             self._current_tag_ids.add(tag.id)
             self._history.append((photo.id, tag.id, True))   # True = se agregó
         self._refresh_tag_ui()
@@ -1141,10 +1262,7 @@ class QuickTagWindow(QDialog):
             services.remove_tag(photo_id, tag_id)
         else:
             # Se había quitado → volver a agregar
-            all_tags = services.get_all_tags(include_sidebar_hidden=True)
-            tag = next((t for t in all_tags if t.id == tag_id), None)
-            if tag:
-                services.add_tag(photo_id, tag.name)
+            services.add_tag_by_id(photo_id, tag_id)
         # Si el undo fue en la foto actual, refrescar UI
         if self.photos[self.index].id == photo_id:
             self._current_tag_ids = {t.id for t in services.get_photo_tags(photo_id)}
@@ -1216,7 +1334,7 @@ class SettingsDialog(QDialog):
         r1 = QHBoxLayout()
         r1.addWidget(QLabel("Fotos por página:"))
         self.spin = QSpinBox()
-        self.spin.setRange(10, 500); self.spin.setSingleStep(10)
+        self.spin.setRange(services.PAGE_SIZE_MIN, services.PAGE_SIZE_MAX); self.spin.setSingleStep(10)
         self.spin.setValue(self.page_size); self.spin.setFixedWidth(80)
         r1.addWidget(self.spin); r1.addStretch()
         layout.addLayout(r1)
@@ -1353,6 +1471,61 @@ class CategoryManagerDialog(QDialog):
 
 # ─── Dialog: Gestionar etiquetas ─────────────────────────────────────────────
 
+class EditTagDialog(QDialog):
+    """Editar nombre, categoría y color de una etiqueta existente."""
+
+    def __init__(self, tag: Tag, parent=None):
+        super().__init__(parent)
+        self.tag    = tag
+        self._color = tag.color
+        self.setWindowTitle(f"Editar etiqueta: {tag.name}")
+        self.setFixedSize(420, 220)
+        self.setStyleSheet(DARK_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20); layout.setSpacing(10)
+
+        layout.addWidget(QLabel("Nombre:"))
+        self.name_edit = QLineEdit(tag.name)
+        layout.addWidget(self.name_edit)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Categoría:"))
+        self.cat_combo = QComboBox(); self.cat_combo.setEditable(True)
+        self.cat_combo.addItems(services.get_all_categories())
+        self.cat_combo.setCurrentText(tag.category)
+        row.addWidget(self.cat_combo, stretch=1)
+        self.color_btn = QPushButton("Color"); self.color_btn.setFixedWidth(70)
+        self.color_btn.setStyleSheet(f"background:{self._color};")
+        self.color_btn.clicked.connect(self._pick_color)
+        row.addWidget(self.color_btn)
+        layout.addLayout(row)
+
+        layout.addStretch()
+        btns = QHBoxLayout()
+        btn_cancel = QPushButton("Cancelar"); btn_cancel.clicked.connect(self.reject)
+        btn_save = QPushButton("Guardar")
+        btn_save.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
+        btn_save.clicked.connect(self._save)
+        btns.addWidget(btn_cancel); btns.addWidget(btn_save)
+        layout.addLayout(btns)
+
+    def _pick_color(self):
+        c = QColorDialog.getColor(QColor(self._color), self)
+        if c.isValid():
+            self._color = c.name()
+            self.color_btn.setStyleSheet(f"background:{self._color};")
+
+    def _save(self):
+        try:
+            services.update_tag(self.tag.id, self.name_edit.text(),
+                                self.cat_combo.currentText(), self._color)
+        except ValueError as e:   # incluye TagNameConflictError
+            QMessageBox.warning(self, "No se pudo guardar", str(e))
+            return
+        self.accept()
+
+
 class TagManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1422,8 +1595,14 @@ class TagManagerDialog(QDialog):
             row = QWidget(); hl = QHBoxLayout(row); hl.setContentsMargins(4,2,4,2)
             dot = QLabel("●"); dot.setStyleSheet(f"color:{tag.color};font-size:16px;")
             hl.addWidget(dot)
-            lbl = QLabel(f"<b>{tag.name}</b>  <span style='color:#666;'>[{tag.category}]</span>")
+            lbl = QLabel(f"<b>{html.escape(tag.name)}</b>  "
+                         f"<span style='color:#666;'>[{html.escape(tag.category)}]</span>")
             lbl.setTextFormat(Qt.TextFormat.RichText); hl.addWidget(lbl, stretch=1)
+            btn_e = QPushButton("✎"); btn_e.setFixedSize(28, 28)
+            btn_e.setToolTip("Editar nombre, categoría y color")
+            btn_e.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;border-radius:4px;padding:0;")
+            btn_e.clicked.connect(lambda _, t=tag: self._edit(t))
+            hl.addWidget(btn_e)
             chk1 = QCheckBox("Ocultar fotos"); chk1.setChecked(tag.hidden)
             chk1.stateChanged.connect(lambda s, tid=tag.id: services.set_tag_hidden(tid, bool(s)))
             hl.addWidget(chk1)
@@ -1432,11 +1611,27 @@ class TagManagerDialog(QDialog):
             hl.addWidget(chk2)
             btn_d = QPushButton("Eliminar"); btn_d.setFixedWidth(70)
             btn_d.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
-            btn_d.clicked.connect(lambda _, tid=tag.id: (services.delete_tag(tid), self._refresh()))
+            btn_d.clicked.connect(lambda _, t=tag: self._delete(t))
             hl.addWidget(btn_d)
             row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
             self.grid.addWidget(row)
         self.grid.addStretch()
+
+    def _edit(self, tag: Tag):
+        if EditTagDialog(tag, self).exec():
+            self._refresh()
+
+    def _delete(self, tag: Tag):
+        n = services.count_photos_with_tag(tag.id)
+        msg = f"¿Eliminar la etiqueta '{tag.name}'?"
+        if n:
+            msg += f"\n\nSe quitará de {n:,} foto{'s' if n != 1 else ''}."
+        if QMessageBox.question(
+            self, "Confirmar", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            services.delete_tag(tag.id)
+            self._refresh()
 
     def _open_cats(self):
         CategoryManagerDialog(self).exec(); self._refresh()
@@ -1478,7 +1673,22 @@ class IndexDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Indexar carpeta")
         self.setFixedSize(500, 200); self.setStyleSheet(DARK_STYLE)
-        self.worker = None; self._build_ui()
+        self.worker: IndexWorker | None = None; self._build_ui()
+
+    def done(self, result: int):
+        if self.worker is not None and self.worker.isRunning():
+            if QMessageBox.question(
+                self, "Indexación en curso",
+                "La indexación sigue en curso. ¿Cancelarla?\n\n"
+                "Lo que ya se indexó se conserva.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            _disconnect_all(self.worker.progress, self.worker.completed, self.worker.error)
+            retire_thread(self.worker)
+            self.worker = None
+            self.indexing_done.emit()   # Recargar lo que alcanzó a indexarse
+        super().done(result)
 
     def _build_ui(self):
         layout = QVBoxLayout(self); layout.setContentsMargins(16,16,16,16); layout.setSpacing(10)
@@ -1506,8 +1716,11 @@ class IndexDialog(QDialog):
             self.progress.setValue(int(c/t*100)),
             self.status.setText(f"[{c}/{t}] {Path(p).name}")
         ))
-        self.worker.finished.connect(lambda a,s,e: (
-            self.status.setText(f"✓ Listo: {a} indexadas, {e} errores."),
+        self.worker.completed.connect(lambda a,u,e: (
+            self.status.setText(
+                f"✓ Listo: {a:,} nuevas, {u:,} actualizadas, {e:,} errores."
+                + ("  (detalles en el log)" if e else "")
+            ),
             self.btn_start.setEnabled(True),
             self.indexing_done.emit()
         ))
@@ -1524,7 +1737,16 @@ class DeindexDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Des-indexar carpetas")
         self.setMinimumSize(560, 420); self.setStyleSheet(DARK_STYLE)
+        self._missing_worker: MissingFilesWorker | None = None
         self._build_ui(); self._refresh()
+
+    def done(self, result: int):
+        if self._missing_worker is not None:
+            w = self._missing_worker
+            _disconnect_all(w.progress, w.completed, w.error)
+            retire_thread(w)
+            self._missing_worker = None
+        super().done(result)
 
     def _build_ui(self):
         layout = QVBoxLayout(self); layout.setContentsMargins(16,16,16,16); layout.setSpacing(10)
@@ -1536,9 +1758,12 @@ class DeindexDialog(QDialog):
         layout.addWidget(self.scroll, stretch=1)
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep)
-        btn = QPushButton("🧹  Eliminar registros de archivos que ya no existen en disco")
-        btn.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
-        btn.clicked.connect(self._remove_missing); layout.addWidget(btn)
+        self.btn_missing = QPushButton("🧹  Buscar registros de archivos que ya no existen en disco")
+        self.btn_missing.setStyleSheet("color:#FFD700;border:1px solid #FFD700;")
+        self.btn_missing.clicked.connect(self._scan_missing); layout.addWidget(self.btn_missing)
+        self.missing_progress = QProgressBar(); self.missing_progress.setRange(0, 100)
+        self.missing_progress.setVisible(False)
+        layout.addWidget(self.missing_progress)
 
     def _refresh(self):
         for i in reversed(range(self.vbox.count())):
@@ -1552,7 +1777,8 @@ class DeindexDialog(QDialog):
             for folder, count in folders:
                 row = QWidget(); row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
                 hl  = QHBoxLayout(row); hl.setContentsMargins(8,6,8,6)
-                lbl = QLabel(f"<b>{folder}</b>  <span style='color:#666;'>{count:,} archivos</span>")
+                lbl = QLabel(f"<b>{html.escape(folder)}</b>  "
+                             f"<span style='color:#666;'>{count:,} archivos</span>")
                 lbl.setTextFormat(Qt.TextFormat.RichText); hl.addWidget(lbl, stretch=1)
                 btn = QPushButton("Eliminar"); btn.setFixedWidth(75)
                 btn.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
@@ -1561,18 +1787,74 @@ class DeindexDialog(QDialog):
         self.vbox.addStretch()
 
     def _deindex(self, folder: str):
-        if QMessageBox.question(self, "Confirmar",
-            f"¿Eliminar registros de:\n{folder}\n\nLos archivos NO se borrarán.",
+        count, tagged = services.preview_deindex_folder(folder)
+        msg = (f"¿Quitar de PhotoVault la carpeta y sus subcarpetas?\n\n{folder}\n\n"
+               f"Registros: {count:,}")
+        if tagged:
+            msg += (f"\n⚠ {tagged:,} de ellos tienen etiquetas, que se perderán "
+                    f"(aunque vuelvas a indexar la carpeta).")
+        msg += "\n\nLos archivos NO se borran del disco."
+        if QMessageBox.question(self, "Confirmar", msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
             services.deindex_folder(folder); self._refresh()
 
-    def _remove_missing(self):
-        count = services.remove_missing_files()
-        msg   = "No se encontraron archivos faltantes." if count == 0 else \
-                f"Se eliminaron {count} registros."
-        QMessageBox.information(self, "Listo", msg)
-        if count: self._refresh()
+    # ── Archivos faltantes: buscar (en hilo) → confirmar → borrar ─────────
+
+    def _scan_missing(self):
+        self.btn_missing.setEnabled(False)
+        self.missing_progress.setValue(0)
+        self.missing_progress.setVisible(True)
+        w = MissingFilesWorker()
+        w.progress.connect(
+            lambda c, t: self.missing_progress.setValue(int(c / t * 100) if t else 0)
+        )
+        w.completed.connect(self._on_missing_scanned)
+        w.error.connect(self._on_missing_error)
+        self._missing_worker = w
+        w.start()
+
+    def _on_missing_error(self, msg: str):
+        self._missing_worker = None
+        self.missing_progress.setVisible(False)
+        self.btn_missing.setEnabled(True)
+        QMessageBox.critical(self, "Error", msg)
+
+    def _on_missing_scanned(self, report: services.MissingReport):
+        self._missing_worker = None
+        self.missing_progress.setVisible(False)
+        self.btn_missing.setEnabled(True)
+
+        skipped_txt = ""
+        if report.skipped:
+            lines = [f"  • {s.root}  ({s.count:,} registros): {s.reason}" for s in report.skipped]
+            skipped_txt = (
+                "\n\nNo se tocarán estos registros, para proteger tus etiquetas:\n"
+                + "\n".join(lines)
+                + "\n(Si de verdad ya no existen, quítalos con 'Eliminar' en su carpeta.)"
+            )
+
+        if report.count == 0:
+            QMessageBox.information(
+                self, "Archivos faltantes",
+                "No se encontraron registros de archivos faltantes." + skipped_txt,
+            )
+            return
+
+        msg = f"Se encontraron {report.count:,} registros cuyo archivo ya no existe."
+        if report.tagged:
+            msg += f"\n⚠ {report.tagged:,} de ellos tienen etiquetas, que se perderán."
+        msg += skipped_txt + "\n\n¿Eliminar esos registros de PhotoVault?"
+
+        if QMessageBox.question(
+            self, "Confirmar", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        n = services.delete_missing(report)
+        QMessageBox.information(self, "Listo", f"Se eliminaron {n:,} registros.")
+        self._refresh()
 
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
@@ -1586,7 +1868,7 @@ class MainWindow(QMainWindow):
 
         self._active_tags:    list[int]                 = []
         self._offset:         int                       = 0
-        self._page_size:      int                       = 100
+        self._page_size:      int                       = services.get_page_size()
         self._sort_field:     SortField                 = SortField.DATE
         self._sort_order:     SortOrder                 = SortOrder.DESC
         self._current_page:   GalleryPage | None        = None
@@ -1596,6 +1878,7 @@ class MainWindow(QMainWindow):
         self._loader:         ThumbnailLoader | None    = None
         self._select_mode:    bool                      = False
         self._selected_ids:   set[int]                  = set()
+        self._show_sidebar_hidden: bool                 = False
 
         self._build_timer  = QTimer(self)
         self._build_timer.setInterval(0)
@@ -1648,11 +1931,6 @@ class MainWindow(QMainWindow):
         btn_qt.clicked.connect(self._open_quick_tag)
         sb.addWidget(btn_qt)
 
-        if False:  # dummy para que el for de abajo no duplique los botones
-            pass
-        for label, slot in []:
-            btn = QPushButton(label); btn.clicked.connect(slot); sb.addWidget(btn)
-
         sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("color:#2D2D3F;"); sb.addWidget(sep)
         sb.addWidget(QLabel("Filtrar por etiqueta:"))
@@ -1663,6 +1941,16 @@ class MainWindow(QMainWindow):
         self.tag_vbox.setContentsMargins(0,0,0,0); self.tag_vbox.setSpacing(2)
         self.tag_scroll.setWidget(self.tag_widget)
         sb.addWidget(self.tag_scroll, stretch=1)
+
+        # Mostrar/ocultar las etiquetas escondidas del sidebar (para poder restaurarlas)
+        self.btn_show_hidden = QPushButton("")
+        self.btn_show_hidden.setCheckable(True)
+        self.btn_show_hidden.setStyleSheet(
+            "QPushButton{color:#8888AA;font-size:11px;padding:3px 8px;}"
+            "QPushButton:checked{color:#FFD700;border-color:#FFD700;}"
+        )
+        self.btn_show_hidden.toggled.connect(self._on_show_hidden_toggled)
+        sb.addWidget(self.btn_show_hidden)
 
         btn_clear = QPushButton("✕ Limpiar filtros")
         btn_clear.setStyleSheet("color:#FF4A4A;"); btn_clear.clicked.connect(self._clear_filters)
@@ -1737,7 +2025,18 @@ class MainWindow(QMainWindow):
             w = self.tag_vbox.itemAt(i).widget()
             if w: w.deleteLater()
 
-        for category, tags in services.get_sidebar_tags().items():
+        n_hidden = services.count_sidebar_hidden_tags()
+        self.btn_show_hidden.setVisible(n_hidden > 0 or self._show_sidebar_hidden)
+        self.btn_show_hidden.blockSignals(True)
+        self.btn_show_hidden.setChecked(self._show_sidebar_hidden)
+        self.btn_show_hidden.blockSignals(False)
+        self.btn_show_hidden.setText(
+            f"🚫 Ocultar escondidas ({n_hidden})" if self._show_sidebar_hidden
+            else f"👁 Mostrar escondidas ({n_hidden})"
+        )
+
+        groups = services.get_sidebar_tags(include_hidden=self._show_sidebar_hidden)
+        for category, tags in groups.items():
             header = QPushButton(f"▾  {category.upper()}")
             header.setCheckable(True); header.setChecked(True)
             header.setStyleSheet("""
@@ -1752,12 +2051,17 @@ class MainWindow(QMainWindow):
             for tag in tags:
                 row = QWidget(); hl = QHBoxLayout(row)
                 hl.setContentsMargins(0,0,0,0); hl.setSpacing(4)
-                chk = QCheckBox(tag.name); chk.setStyleSheet(f"color:{tag.color};")
+                chk = QCheckBox(tag.name)
+                # Las escondidas se ven en cursiva mientras se muestran
+                italic = "font-style:italic;" if tag.sidebar_hidden else ""
+                chk.setStyleSheet(f"color:{tag.color};{italic}")
                 chk.setProperty("tag_id", tag.id)
                 if tag.id in self._active_tags: chk.setChecked(True)
                 chk.stateChanged.connect(self._on_tag_filter_changed)
                 hl.addWidget(chk, stretch=1)
                 eye = QPushButton("👁" if not tag.sidebar_hidden else "🚫")
+                eye.setToolTip("Volver a mostrar en el sidebar" if tag.sidebar_hidden
+                               else "Esconder del sidebar")
                 eye.setFixedSize(22,22)
                 eye.setStyleSheet("QPushButton{background:transparent;border:none;font-size:11px;padding:0;}"
                                   "QPushButton:hover{background:#2D2D3F;border-radius:4px;}")
@@ -1775,6 +2079,12 @@ class MainWindow(QMainWindow):
 
     def _toggle_sidebar_hidden(self, tag_id: int, currently_hidden: bool):
         services.set_tag_sidebar_hidden(tag_id, not currently_hidden)
+        if currently_hidden and services.count_sidebar_hidden_tags() == 0:
+            self._show_sidebar_hidden = False
+        self._refresh_tags()
+
+    def _on_show_hidden_toggled(self, checked: bool):
+        self._show_sidebar_hidden = checked
         self._refresh_tags()
 
     def _on_tag_filter_changed(self):
@@ -1833,11 +2143,10 @@ class MainWindow(QMainWindow):
     # ── Carga de fotos ────────────────────────────────────────────────────────
 
     def _stop_loader(self):
+        """Descarta el loader actual sin bloquear la UI (ver retire_thread)."""
         if self._loader is not None:
-            self._loader.loaded.disconnect()
-            try: self._loader.finished.disconnect()
-            except TypeError: pass  # No tenía conexiones
-            self._loader.stop(); self._loader.wait(500)
+            _disconnect_all(self._loader.loaded, self._loader.finished)
+            retire_thread(self._loader)
             self._loader = None
 
     def _load_photos(self):
@@ -1881,14 +2190,20 @@ class MainWindow(QMainWindow):
 
         if not self._pending_photos:
             self._build_timer.stop()
-            self._loader = ThumbnailLoader(self._current_page.photos)
-            self._loader.loaded.connect(self._on_thumb_loaded)
-            self._loader.finished.connect(lambda: setattr(self, "_loader", None))
-            self._loader.start()
+            loader = ThumbnailLoader(self._current_page.photos)
+            loader.loaded.connect(self._on_thumb_loaded)
+            loader.finished.connect(lambda l=loader: self._on_loader_finished(l))
+            self._loader = loader
+            loader.start()
 
-    def _on_thumb_loaded(self, photo_id: int, pix: QPixmap):
+    def _on_loader_finished(self, loader: ThumbnailLoader):
+        if self._loader is loader:
+            self._loader = None
+
+    def _on_thumb_loaded(self, photo_id: int, img: QImage):
+        # QPixmap solo se crea aquí, en el hilo de la UI
         if photo_id in self._thumbnails:
-            self._thumbnails[photo_id].set_pixmap(pix)
+            self._thumbnails[photo_id].set_pixmap(QPixmap.fromImage(img))
 
     def _on_search(self):
         self._offset = 0; self._load_photos()
@@ -1939,7 +2254,9 @@ class MainWindow(QMainWindow):
     def _open_settings_dialog(self):
         dlg = SettingsDialog(self._page_size, self)
         if dlg.exec():
-            self._page_size = dlg.page_size; self._offset = 0; self._load_photos()
+            self._page_size = dlg.page_size
+            services.set_page_size(self._page_size)
+            self._offset = 0; self._load_photos()
 
     def _open_deindex_dialog(self):
         DeindexDialog(self).exec(); self._load_photos()
@@ -1973,6 +2290,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._build_timer.stop(); self._stop_loader()
+        wait_all_threads()
         db.close_connection(); super().closeEvent(event)
 
 
