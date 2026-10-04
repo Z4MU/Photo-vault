@@ -11,8 +11,8 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 *Objetivo: que ningún cambio posterior pueda perder datos o romper algo sin que te enteres.*
 
 - [x] #78 ⭐ [B] Repo git en la raíz, historial V2…V11 reconstruido, `.gitignore`, CLAUDE.md dentro
-  - [ ] Subir a GitHub (`git push`) — pendiente de confirmación
-  - [ ] Borrar las carpetas `Fotos V1…V11` (ya están en el historial; V1 no: no estaba en GitHub y quedó fuera del historial)
+  - [x] Subido a GitHub
+  - [x] Carpetas `Fotos V2…V11` enviadas a la Papelera (se conserva `Fotos V1`: no está en el historial)
 - [x] #13 ⭐ [B] Backup automático de la DB: diario (últimos 7) + obligatorio antes de migrar (últimos 3)
 - [x] #74 ⭐ [B] Migraciones versionadas con `PRAGMA user_version` (verificado contra copia de la DB real)
 - [x] #75 ⭐ [B] Logging a archivo rotativo + excepthook global + mensajes de Qt al log
@@ -24,25 +24,28 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 1 — Fallos críticos → v1.1
+## Fase 1 — Fallos críticos → v1.1 ✅
 *Objetivo: que lo que ya existe funcione bien.*
 
-- [ ] #1 ⭐ [B] "Eliminar faltantes": contar → confirmar → borrar; en hilo; avisar si falta la raíz de la unidad
-- [ ] #2 ⭐ [B] Duplicados a la Papelera (`send2trash`) en lugar de `unlink`
-- [ ] #3 ⭐ [M] Hilos seguros: `QImage` en el worker → `QPixmap` en la UI; esperar de verdad a los hilos (loader, MD5, indexación)
-- [ ] #4 ⭐ [B] Orientación EXIF en miniaturas y visor (`ImageOps.exif_transpose`)
-- [ ] #5 ⭐ [B] Fecha EXIF priorizando `DateTimeOriginal`
-- [ ] #6 [B] Tamaño en la clave del caché de miniaturas
-- [ ] #7 [B] Filtro de carpeta exacto (separador final + `ESCAPE`)
-- [ ] #8 [B] Escapar nombres en el SVG de estadísticas y en `QLabel` con HTML
-- [ ] #9 [B] Guardar el tamaño de página
-- [ ] #10 [B] Poder restaurar tags ocultos del sidebar
-- [ ] #11 [B] Editar tags existentes (nombre, color, categoría)
-- [ ] #12 [B] Limpiar código muerto, llenar `width/height`, contador `skipped`
-- [ ] *(nuevo)* [B] Instalar `pillow-heif` (requirements + build) — la colección tiene muchos `.HEIC` sin miniatura
-- [ ] Un test por cada bug arreglado
+- [x] #1 ⭐ [B] "Eliminar faltantes": buscar en hilo → resumen → confirmar → borrar. Protege unidades desconectadas y unidades donde faltan todos los archivos
+- [x] #2 ⭐ [B] Duplicados a la Papelera (`send2trash`) en lugar de `unlink`
+- [x] #3 ⭐ [M] Hilos seguros: `QImage` en el worker; `retire_thread` en vez de `wait(500)`; workers cancelables; señal `finished` ya no se redefine
+- [x] #4 ⭐ [B] Orientación EXIF en miniaturas (`exif_transpose`) y visor (`QImageReader.setAutoTransform`)
+- [x] #5 ⭐ [B] Fecha EXIF priorizando `DateTimeOriginal`
+- [x] #6 [B] Tamaño en la clave del caché de miniaturas (`THUMB_VERSION` 2)
+- [x] #7 [B] Filtro de carpeta exacto (`folder_like_pattern`, `ESCAPE '!'`)
+- [x] #8 [B] Escapar nombres en el SVG de estadísticas y en `QLabel`
+- [x] #9 [B] Guardar el tamaño de página
+- [x] #10 [B] Poder restaurar tags escondidos del sidebar
+- [x] #11 [B] Editar tags existentes (nombre, color, categoría)
+- [x] #12 [B] Código muerto fuera, `Photo` completo (+`md5`), contador nuevas/actualizadas
+- [x] *(nuevo)* `pillow-heif` instalado y registrado también en `thumbnail_cache` (1.148 HEIC en la colección)
+- [x] *(extra)* Confirmación al eliminar un tag y al des-indexar (con cuántas fotos tienen etiquetas)
+- [x] *(extra)* Visor de detalle con `QImageReader` escalado (no carga el original completo)
+- [x] *(extra)* Miniaturas de video ya no se amontonan en una sola subcarpeta del caché
+- [x] 53 tests nuevos (93 en total); verificado contra copia de la DB real
 
-**Hecho cuando:** pasan todos los tests y no hay crashes al cambiar de página ni al cerrar diálogos.
+**Pendiente para el usuario:** pulsar *Configuración → Purgar huérfanos* una vez, para liberar el caché de miniaturas viejo.
 
 ---
 
@@ -51,7 +54,7 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 - [ ] #14 ⭐ [M] Exportar/importar asignaciones foto↔tag (backup completo del etiquetado)
 - [ ] #15 ⭐ [M] Reubicar carpeta/unidad (`D:\Fotos` → `E:\Fotos`) sin perder etiquetas
 - [ ] #16 [M] Sidecars XMP opcionales
-- [ ] #17 [B] Advertir pérdida de etiquetas al des-indexar / papelera interna
+- [ ] #17 [B] ~~Advertir pérdida de etiquetas al des-indexar~~ (hecho en fase 1) / papelera interna
 
 **Hecho cuando:** puedes cambiar de disco o reinstalar el PC sin perder nada.
 
@@ -65,7 +68,7 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 - [ ] #73 [B] Todo el SQL dentro de `database.py`
 - [ ] #77 [B] `config.py` + QSS en archivo aparte
 - [ ] #79 [M] Tests de `database` y `services`
-- [ ] Corregir los 43 errores de `mypy` y endurecer la config
+- [ ] Corregir los 24 errores de `mypy` y endurecer la config
 - [ ] `ruff format` sobre el código ya dividido
 
 **Hecho cuando:** la app se comporta igual, ningún archivo pasa de ~500 líneas y hay buena cobertura en `database`/`services`.

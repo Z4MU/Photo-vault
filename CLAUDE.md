@@ -28,7 +28,8 @@ PhotoVault es una app de escritorio (Windows) para **indexar, navegar, etiquetar
 | **SQLite** (`sqlite3` stdlib) | Base de datos en `~/.photovault/photovault.db` |
 | **Pillow** | Lectura de imágenes, EXIF, generación de miniaturas |
 | **opencv-python** | Duración/dimensiones de video y frame para miniatura |
-| **pillow-heif** (opcional) | Soporte `.heic` / `.heif`. **Hoy NO está instalado**: los HEIC se indexan sin miniatura (no crashea, queda un warning en el log) |
+| **pillow-heif** | Soporte `.heic` / `.heif` (la colección tiene muchos). Se registra con `try/import`; si faltara, los HEIC se indexan sin miniatura |
+| **Send2Trash** | Mandar archivos a la Papelera de reciclaje (duplicados). Nunca usar `unlink` sobre fotos del usuario |
 | **PyInstaller** | Empaquetado a `PhotoVault.exe` |
 | **pytest / ruff / mypy** | Desarrollo (`requirements-dev.txt`, config en `pyproject.toml`) |
 
@@ -73,13 +74,13 @@ main.py (UI)  →  services.py  →  database.py  →  SQLite
 - La UI **no** escribe SQL ni llama a `database` directamente. Excepciones existentes y permitidas: `db.init_db()`, `db.close_connection()`, `db.DB_PATH`, `db.SCHEMA_VERSION` y `db.DatabaseTooNewError` (en `_startup`).
 - `database.py` devuelve **modelos** (`Photo`, `Tag`, `Stats`…), nunca `sqlite3.Row` hacia afuera.
 - La lógica que combina varias queries (p. ej. obtener tags ocultos + contar + paginar) vive en `services.py`.
-- ⚠️ Hoy `services.py` todavía tiene SQL directo en `delete_photo_file`, `remove_missing_files`, `deindex_folder`, `get_indexed_folders`, `purge_cache_orphans` → se mueve a `database.py` en la fase 3.
+- ⚠️ Hoy `services.py` todavía tiene SQL directo en `get_indexed_folders` y `purge_cache_orphans` → se mueve a `database.py` en la fase 3.
 
 ---
 
 ## 4. Modelos (`models.py`)
 
-- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at`. Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). ⚠️ `_row_to_photo` no llena `width/height/added_at`.
+- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5`. Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
 - `Tag` — `id, name, category, color, hidden, sidebar_hidden`.
 - `GalleryPage` — `photos, total, offset, limit, sort_field, sort_order` + `page_number`, `total_pages`, `has_prev`, `has_next`.
 - `Stats` — `total_photos, total_tags, years, by_month, by_type, top_tags`.
@@ -117,7 +118,12 @@ app_settings(key PK, value)      -- flags internos, p. ej. 'seeded'
 - ⚠️ `ON DELETE CASCADE`: borrar/des-indexar una foto **borra sus etiquetas para siempre**.
 
 ### Filtros de consulta
-`get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (prefijo de ruta), `untagged_only`, más `limit/offset/sort_field/sort_order`.
+`get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (carpeta y subcarpetas), `untagged_only`, más `limit/offset/sort_field/sort_order`.
+
+**Filtro de carpeta:** siempre con `folder_like_pattern(folder)` + `LIKE ? ESCAPE '!'`. Normaliza la ruta, agrega el separador final (`D:\Fotos` no incluye `D:\Fotos2`) y escapa `%`/`_`. El escape es `!` porque `\` es el separador de Windows. Nunca volver a `LIKE folder + '%'`.
+
+### Configuración del usuario
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `page_size`.
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -164,8 +170,10 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 ## 8. Indexación (`indexer.py`)
 
 - `index_folder(folder, progress_callback)` recorre recursivamente y hace `upsert_photo` (ON CONFLICT(path) actualiza todo, incluidos `width/height`).
+- Devuelve `(nuevas, actualizadas, errores)`; acepta `should_stop()` para cancelar.
 - Fecha, en este orden: EXIF (solo imágenes) → nombre del archivo → nombre de la carpeta padre → `mtime`.
-  - ⚠️ Bug conocido: toma el primero de `DateTime`/`DateTimeOriginal`/`DateTimeDigitized` que aparezca; suele ser `DateTime` (fecha de *modificación*). Fase 1.
+  - EXIF con prioridad: `DateTimeOriginal` (IFD Exif) → `DateTimeDigitized` → `DateTime` (IFD0, es la fecha de *modificación*: último recurso). Se usa `img.getexif()` + `get_ifd(0x8769)`, no `_getexif()`.
+  - Las fechas ya guardadas con la regla vieja se corrigen al re-indexar la carpeta.
 - `DATE_PATTERNS` está compilado y es estricto a propósito (tests en `tests/test_dates.py`):
   - El patrón compacto `YYYYMMDD` usa `(?<!\d)...(?!\d)` para **no** atrapar resoluciones (`1920x1080`, `19201080`).
   - Año válido 1990–2099. Mes fuera de 1–12 → se guarda solo el año.
@@ -178,11 +186,13 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 
 ## 9. Miniaturas (`thumbnail_cache.py`)
 
-- Clave = `sha1(path + "::" + mtime)` → si el original cambia, la miniatura se regenera sola.
-- Videos usan prefijo `v_` en la clave.
+- Nombre: `[v_]<sha1(path::mtime::THUMB_VERSION)>_<size>.jpg`, en la subcarpeta `<2 primeros chars del hash>`.
+  - Si el original cambia (mtime), la miniatura se regenera sola.
+  - Cada tamaño (100 duplicados, 200 galería, 480 etiquetado rápido/videos) es un archivo distinto.
+  - **`THUMB_VERSION`**: subirlo cuando cambie la forma de generar miniaturas → invalida todo el caché. v2 = orientación EXIF + tamaño en el nombre.
+- Aplica `ImageOps.exif_transpose` (orientación EXIF de fotos de celular).
 - API: `get_thumbnail(path, size)`, `get_video_thumbnail(path, size)`, `purge_orphans(known_paths)`, `cache_size_mb()`, `CACHE_DIR`.
-- **Ojo:** el tamaño no forma parte de la clave. Si se pide la misma imagen a 200 px y a 480 px, gana la que se generó primero. Fase 1.
-- **Ojo:** no aplica la orientación EXIF → fotos de celular giradas. Fase 1.
+- `purge_orphans` borra también las miniaturas del formato anterior (sin `_<size>`).
 
 ---
 
@@ -192,23 +202,34 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 `__main__` → `setup_logging()` → `QApplication` → `install_qt_handlers()` → `_startup()` (backup diario + `init_db()`; si falla muestra el error y sale con código 1) → `MainWindow`.
 
 ### Hilos
-- `IndexWorker` — indexación.
-- `ThumbnailLoader` — carga miniaturas de la página actual; emite `loaded(photo_id, QPixmap)`.
-- `MD5Worker` — calcula hashes faltantes.
+Todos heredan de `StoppableThread` (`stop()`, `is_stopping()`):
+- `IndexWorker` — indexación; `completed(nuevas, actualizadas, errores)`.
+- `ThumbnailLoader` — miniaturas de la página actual; emite `loaded(photo_id, QImage)`.
+- `MD5Worker` — hashes faltantes; `completed(n)`.
+- `MissingFilesWorker` — busca archivos faltantes; `completed(MissingReport)`. No borra nada.
 
 **Reglas de hilos (causaron crashes `QThread: Destroyed while thread is still running`):**
-- Antes de reemplazar un loader: desconectar señales → `stop()` → `wait()`. Usar `_stop_loader()`.
-- `closeEvent` de la ventana principal detiene timers y loaders.
+- Un worker **nunca** crea `QPixmap` ni widgets: emite `QImage`/datos y el `QPixmap` se crea en el slot (hilo de UI).
+- **Nunca** redefinir la señal `finished` de `QThread` (tapa la original); para resultados usar `completed`.
+- Para descartar un worker que sigue corriendo: `_disconnect_all(señales…)` → `retire_thread(w)`. Pide que pare y guarda la referencia en `_retired_threads` hasta que emita `finished`: no bloquea la UI y Python nunca destruye un hilo vivo. `_stop_loader()` hace esto con el loader de la galería.
+- Los diálogos con workers (`DuplicatesDialog`, `IndexDialog`, `DeindexDialog`) sobreescriben `done()` (se llama al cerrar por cualquier vía: botón, Esc, X) para retirar su worker. `IndexDialog` pregunta antes de cancelar.
+- `MainWindow.closeEvent` detiene timers, retira el loader y llama `wait_all_threads()`.
+- Las funciones lentas de `services`/`indexer` aceptan `should_stop` para que el worker pueda cancelarlas.
 - No llamar una señal propia `done` en una subclase de `QDialog` (choca con `QDialog.done`). Por eso `QuickTagWindow` usa `done_signal`.
-- ⚠️ Pendiente fase 1: `ThumbnailLoader` crea `QPixmap` fuera del hilo de UI (no permitido por Qt) y `_stop_loader` solo espera 500 ms.
+
+### Imágenes grandes
+`load_preview_pixmap(path, max_side)`: `QImageReader` con `setAutoTransform(True)` (orientación EXIF) y `setScaledSize` (no carga el original completo). Si Qt no puede leer el formato (HEIC), usa la miniatura de Pillow. Usarla en vez de `QPixmap(path)`.
+
+### Texto del usuario en la UI
+Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML usar `html.escape()`; en labels de texto plano poner `setTextFormat(Qt.TextFormat.PlainText)` (si no, Qt adivina y puede interpretarlo como HTML). El SVG de estadísticas se arma en `build_bar_chart_svg()`, que escapa.
 
 ### Rendimiento de la galería
 - Widgets de miniatura se crean en lotes de 10 con un `QTimer(0)` (`_add_next_batch`) para no congelar la UI.
-- Paginación (default 100 por página, configurable 10–500; **no se guarda entre sesiones**).
+- Paginación (default 100 por página, configurable 10–500; se guarda en `app_settings.page_size` vía `services.get/set_page_size`).
 - `resizeEvent` con debounce de 400 ms; solo recarga si cambia el número de columnas.
 
 ### Ventana principal (`MainWindow`)
-- Sidebar: botones de acciones, botón destacado **⚡ Etiquetado rápido**, filtros por tag agrupados por categoría (colapsables), botón 👁 para ocultar tags del sidebar, estadísticas.
+- Sidebar: botones de acciones, botón destacado **⚡ Etiquetado rápido**, filtros por tag agrupados por categoría (colapsables), botón 👁 para esconder tags del sidebar, botón **"👁 Mostrar escondidas (N)"** (solo visible si hay escondidas) que las muestra en cursiva con 🚫 para restaurarlas, estadísticas.
 - Barra superior: búsqueda por nombre, ordenamiento (campo + dirección), contador, botón **Seleccionar** (modo selección múltiple) y **Etiquetar selección**.
 - Filtro por tags es **AND** (la foto debe tener todos los seleccionados).
 
@@ -220,11 +241,20 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 | `QuickTagSetupDialog` | Elegir conjunto a etiquetar: carpeta indexada + tags requeridos + "solo sin etiquetar", con conteo en vivo. |
 | `QuickTagWindow` | Etiquetado por teclado: `←/→` navegar, `Space` saltar, `1–9` atajos de tag, `Ctrl+Z` deshacer (historial completo), búsqueda de tags, `Esc` salir. Al terminar la última foto regresa a la galería y esta se recarga. |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
-| `DuplicatesDialog` | Calcula MD5 en hilo, agrupa duplicados, permite **borrar físicamente** copias (con confirmación, nunca la última copia). |
+| `DuplicatesDialog` | Calcula MD5 en hilo (cancelable), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
 | `SettingsDialog` | Fotos por página, tamaño de caché, limpiar caché, purgar huérfanos. |
-| `TagManagerDialog` | Crear/eliminar tags, flags hidden, exportar/importar JSON. |
+| `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/eliminar tags (confirma con el n.º de fotos), flags hidden, exportar/importar JSON. |
+| `EditTagDialog` | Cambiar nombre, categoría y color; avisa si el nombre ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
-| `IndexDialog` / `DeindexDialog` | Indexar carpeta / quitar registros de una carpeta o de archivos que ya no existen. |
+| `IndexDialog` | Indexar carpeta en hilo; muestra nuevas/actualizadas/errores; al cerrar durante la indexación pregunta y cancela. |
+| `DeindexDialog` | Quitar registros de una carpeta (y subcarpetas; confirma con n.º de registros y cuántos tienen tags) o buscar archivos faltantes: **buscar en hilo → mostrar resumen → confirmar → borrar**. |
+
+### Archivos faltantes — protección contra pérdida de datos
+`services.find_missing_files()` agrupa por unidad (`Path.anchor`) y **no incluye**:
+- unidades que no existen (disco desconectado), ni
+- unidades donde faltan **todos** los archivos y son ≥ `SUSPICIOUS_ROOT_MIN` (20): probablemente otro disco con la misma letra.
+
+Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existen, se quitan con "Eliminar" en su carpeta. `delete_missing(report)` solo borra `report.missing_ids`. Nunca volver a un "buscar y borrar" en un solo paso.
 
 ### Estilo visual
 - Tema oscuro único definido en la constante `DARK_STYLE` (al final de `main.py`).
@@ -263,7 +293,7 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - Salida: `dist\PhotoVault.exe` (un solo archivo, `console=False`, UPX activado, ~148 MB).
 - `build.bat` busca Python en: PATH → `py` → `%LOCALAPPDATA%\Python\pythoncore-*` → instalaciones típicas.
 - Si el `.exe` abre y se cierra: revisar `~/.photovault/logs/photovault.log`. Si no hay nada, poner `console=True` en el `.spec`, recompilar y ver el traceback.
-- `hiddenimports` incluye `PyQt6.QtSvg`, `PyQt6.QtSvgWidgets`, `cv2`, `pillow_heif`. Si agregas un import dinámico nuevo, añádelo ahí.
+- `hiddenimports` incluye `PyQt6.QtSvg`, `PyQt6.QtSvgWidgets`, `cv2`, `pillow_heif`, `send2trash.win(.legacy)`. Si agregas un import dinámico nuevo, añádelo ahí.
 - `build/`, `dist/`, `.venv/` no se commitean.
 
 ### Tests
@@ -271,11 +301,14 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - `make_legacy_db(path)` simula una DB de V1 para probar migraciones.
 - Para probar contra datos reales: copiar la DB real con la API de backup (abriéndola `?mode=ro`) a un directorio temporal y apuntar `DB_PATH` ahí. Nunca contra la DB real.
 - Si tocas `DATE_PATTERNS`: agregar casos válidos y falsos positivos en `tests/test_dates.py`.
+- `tests/test_ui_helpers.py` usa `QT_QPA_PLATFORM=offscreen` para probar funciones de `main.py` sin ventanas.
+- Archivos de prueba (JPEG con EXIF, orientación, etc.) se generan con Pillow dentro del test; no hay fixtures binarios en el repo.
+- Al arreglar un bug, agregar un test que falle sin el arreglo.
 
 ### Lint
 - `ruff` con reglas E, W, F, B, I, UP. Se ignoran a propósito las reglas del estilo compacto de la UI (`E701/E702`, alineación de `=`) hasta la fase 3.
 - **No correr `ruff format`** todavía: reformatearía todo `main.py`. Se hará al dividirlo en la fase 3.
-- `mypy`: línea base de **43 errores** (casi todos parámetros `= None` sin `Optional`, más el tipo de retorno de `get_all_photos_for_duplicates`). Se corrigen en la fase 3; no agregar errores nuevos.
+- `mypy`: línea base de **24 errores**, todos de `Optional` implícito (parámetros `= None` tipados como `str`/`list[int]`) y la lista `params` sin anotar en `get_photos`/`get_photo_count`. Se corrigen en la fase 3; no agregar errores nuevos.
 
 ---
 
@@ -293,19 +326,15 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 
 ## 13. Deuda técnica y bugs conocidos
 
-El detalle y el orden están en `ROADMAP.md` (fases 1–3). Los más graves:
+El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
-1. ⚠️ **Pérdida de datos:** `DeindexDialog._remove_missing` → `services.remove_missing_files()` borra **sin confirmar** todo registro cuyo archivo no existe. Con el disco `G:` desconectado borraría toda la colección y sus etiquetas (CASCADE). Además corre en el hilo de UI.
-2. Duplicados se borran con `unlink` (permanente), no a la Papelera.
-3. `ThumbnailLoader` crea `QPixmap` fuera del hilo de UI; `_stop_loader` solo espera 500 ms.
-4. Miniaturas sin orientación EXIF; tamaño no incluido en la clave del caché.
-5. Fecha EXIF usa `DateTime` en lugar de `DateTimeOriginal`.
-6. `deindex_folder` y filtro `folder` usan `LIKE 'carpeta%'` (afecta `D:\Fotos2`; `_`/`%` son comodines).
-7. Nombres con `&`/`<` rompen el SVG de estadísticas y los `QLabel` con HTML.
-8. Tamaño de página no persiste; tags ocultos del sidebar no se pueden restaurar desde ahí; no se pueden editar tags existentes.
-9. Código residual en `MainWindow._build_ui` (`if False: pass` / `for ... in []`); `get_all_photos_for_duplicates` con `object.__setattr__` inútil y retorno de tuplas.
-10. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces; `get_photos_for_tagging` con `limit=99_999`; `_refresh_tag_ui` llama `get_all_tags()` en un bucle; `PhotoDetailDialog` carga el original completo.
-11. `pillow-heif` no instalado → los `.HEIC` del usuario no tienen miniatura.
+1. **Des-indexar / faltantes borran etiquetas para siempre** (CASCADE). Ahora se confirma mostrando cuántas tienen tags, pero no hay forma de recuperarlas salvo un backup → fase 2 (#14 exportar asignaciones, #17 papelera interna).
+2. **Cambiar la letra de unidad** obliga a re-indexar y se pierden las etiquetas → fase 2 (#15).
+3. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces (EXIF + tamaño); `get_photos_for_tagging` con `limit=99_999`; `get_indexed_folders` carga todas las rutas en Python → fase 4.
+4. `QuickTagWindow` y `PhotoDetailDialog` cargan imágenes en el hilo de UI (con `load_preview_pixmap` ya es rápido, pero un HEIC grande sin caché tarda) → fase 5/7.
+5. `SettingsDialog._clear_cache` borra el caché con `shutil.rmtree` en el hilo de UI y sin confirmar (es regenerable, pero con 170k miniaturas tarda).
+6. El caché de miniaturas de antes de la fase 1 (formato sin tamaño) queda como huérfano hasta pulsar **Purgar huérfanos** en Configuración.
+7. Las fechas guardadas con la regla EXIF vieja se corrigen solo al re-indexar.
 
 ---
 
@@ -321,3 +350,12 @@ El detalle y el orden están en `ROADMAP.md` (fases 1–3). Los más graves:
 - `subprocess.Popen(["start", ...], shell=True)` solo funcionaba en Windows → `QDesktopServices.openUrl`.
 - `build.bat` no encontraba Python → autodetección de rutas.
 - Errores invisibles en el .exe (console=False) → logging a archivo + excepthook global.
+- "Eliminar faltantes" borraba sin confirmar y con el disco desconectado habría borrado todo → buscar/confirmar/borrar + unidades protegidas (`test_unidad_desconectada_se_protege`).
+- Duplicados borrados con `unlink` → `send2trash`.
+- `QPixmap` creado en un worker; `wait(500)` que soltaba hilos vivos; señal `finished` redefinida en workers → `QImage` + `retire_thread` + `completed`.
+- Miniaturas giradas (orientación EXIF) y de tamaño equivocado (tamaño fuera de la clave) → `exif_transpose` + `THUMB_VERSION` 2.
+- Fecha EXIF de modificación en lugar de la de captura → prioridad `DateTimeOriginal`.
+- `LIKE 'carpeta%'` incluía `Fotos2` y trataba `_`/`%` como comodines → `folder_like_pattern`.
+- Nombres con `&`/`<` rompían el SVG y los `QLabel` → `html.escape` / `PlainText`.
+- Tamaño de página no persistía; tags escondidos del sidebar no se podían restaurar; tags no se podían editar.
+- Todas las miniaturas de video caían en una sola subcarpeta `v_/` del caché.
