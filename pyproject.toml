@@ -35,8 +35,8 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = [
-    "backup", "database", "indexer", "logging_setup",
-    "models", "services", "thumbnail_cache",
+    "backup", "config", "database", "indexer", "logging_setup",
+    "models", "services", "thumbnail_cache", "ui", "xmp_sidecar",
 ]
 
 # ── mypy ──────────────────────────────────────────────────────────────────────

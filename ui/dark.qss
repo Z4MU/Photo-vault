@@ -1,0 +1,28 @@
+/* PhotoVault — tema oscuro. Paleta en config.py (COLORS). */
+* { font-family:'Segoe UI',sans-serif; font-size:13px; }
+QMainWindow,QDialog,QWidget { background:#0D0D1A; color:#D0D0E8; }
+QPushButton { background:#1E1E2E;color:#D0D0E8;border:1px solid #3A3A5A;
+              border-radius:6px;padding:6px 12px; }
+QPushButton:hover   { background:#2A2A3E;border-color:#4A9EFF; }
+QPushButton:pressed { background:#4A9EFF33; }
+QPushButton:disabled { color:#444;border-color:#222; }
+QLineEdit,QComboBox { background:#1E1E2E;color:#D0D0E8;border:1px solid #3A3A5A;
+                      border-radius:6px;padding:6px 10px; }
+QLineEdit:focus,QComboBox:focus { border-color:#4A9EFF; }
+QScrollArea { border:none; }
+QScrollBar:vertical { background:#13131F;width:8px;border-radius:4px; }
+QScrollBar::handle:vertical { background:#3A3A5A;border-radius:4px;min-height:20px; }
+QScrollBar::handle:vertical:hover { background:#4A9EFF; }
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical { height:0; }
+QProgressBar { background:#1E1E2E;border:1px solid #3A3A5A;border-radius:4px;
+               text-align:center;color:#D0D0E8; }
+QProgressBar::chunk { background:#4A9EFF;border-radius:4px; }
+QGroupBox { border:1px solid #3A3A5A;border-radius:6px;margin-top:8px;
+            padding-top:8px;color:#8888AA;font-size:11px; }
+QCheckBox { color:#D0D0E8;spacing:6px; }
+QCheckBox::indicator { width:14px;height:14px;border:1px solid #3A3A5A;
+                       border-radius:3px;background:#1E1E2E; }
+QCheckBox::indicator:checked { background:#4A9EFF;border-color:#4A9EFF; }
+QLabel { color:#D0D0E8; }
+QComboBox QAbstractItemView { background:#1E1E2E;border:1px solid #3A3A5A;
+                              selection-background-color:#4A9EFF33; }
