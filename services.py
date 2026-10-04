@@ -6,9 +6,11 @@ Capa de lógica de negocio entre la UI y la base de datos.
 import hashlib
 import json
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -16,7 +18,8 @@ from send2trash import send2trash
 
 import database as db
 import thumbnail_cache
-from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag
+import xmp_sidecar
+from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag, TrashBatch
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +107,7 @@ def add_tag(photo_id: int, tag_name: str) -> Tag:
         raise ValueError("El nombre de etiqueta no puede estar vacío.")
     tag_id = db.create_tag(tag_name)
     db.add_tag_to_photo(photo_id, tag_id)
+    _sync_sidecars([photo_id])
     tag = db.get_tag(tag_id)
     assert tag is not None
     return tag
@@ -112,10 +116,12 @@ def add_tag(photo_id: int, tag_name: str) -> Tag:
 def add_tag_by_id(photo_id: int, tag_id: int) -> None:
     """Asigna una etiqueta existente (sin buscarla por nombre)."""
     db.add_tag_to_photo(photo_id, tag_id)
+    _sync_sidecars([photo_id])
 
 
 def remove_tag(photo_id: int, tag_id: int):
     db.remove_tag_from_photo(photo_id, tag_id)
+    _sync_sidecars([photo_id])
 
 
 # ── Etiquetado en lote ────────────────────────────────────────────────────────
@@ -129,6 +135,7 @@ def bulk_add_tag(photo_ids: list[int], tag_name: str) -> int:
         return 0
     tag_id = db.create_tag(tag_name.strip().lower())
     db.add_tag_to_photos(photo_ids, tag_id)
+    _sync_sidecars(photo_ids)
     return len(photo_ids)
 
 
@@ -137,6 +144,7 @@ def bulk_remove_tag(photo_ids: list[int], tag_id: int) -> int:
     if not photo_ids:
         return 0
     db.remove_tag_from_photos(photo_ids, tag_id)
+    _sync_sidecars(photo_ids)
     return len(photo_ids)
 
 
@@ -165,6 +173,7 @@ def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> 
 def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
     """Lanza db.TagNameConflictError si el nombre ya lo usa otra etiqueta."""
     db.update_tag(tag_id, name, category, color)
+    _sync_sidecars(db.get_photo_ids_with_tag(tag_id))
 
 
 def get_tag(tag_id: int) -> Optional[Tag]:
@@ -176,7 +185,9 @@ def count_photos_with_tag(tag_id: int) -> int:
 
 
 def delete_tag(tag_id: int):
+    affected = db.get_photo_ids_with_tag(tag_id)
     db.delete_tag(tag_id)
+    _sync_sidecars(affected)
 
 
 def set_tag_hidden(tag_id: int, hidden: bool):
@@ -201,12 +212,23 @@ def create_category(name: str) -> bool:
     return db.create_category(name)
 
 
+def _photo_ids_in_category(category: str) -> list[int]:
+    ids: set[int] = set()
+    for t in db.get_tags_by_category(category):
+        ids.update(db.get_photo_ids_with_tag(t.id))
+    return sorted(ids)
+
+
 def rename_category(old_name: str, new_name: str):
+    affected = _photo_ids_in_category(old_name) if is_xmp_enabled() else []
     db.rename_category(old_name, new_name)
+    _sync_sidecars(affected)
 
 
 def delete_category(name: str):
+    affected = _photo_ids_in_category(name) if is_xmp_enabled() else []
     db.delete_category(name)
+    _sync_sidecars(affected)
 
 
 # ── Estadísticas ──────────────────────────────────────────────────────────────
@@ -237,37 +259,80 @@ def set_page_size(value: int) -> None:
 
 # ── Exportar / importar etiquetas ─────────────────────────────────────────────
 
-def export_tags(path: str) -> int:
+EXPORT_VERSION = 2
+
+
+@dataclass
+class ExportSummary:
+    tags:        int
+    assignments: int   # fotos con etiquetas
+
+
+@dataclass
+class ImportResult:
+    created:         int = 0   # etiquetas nuevas
+    skipped:         int = 0   # etiquetas que ya existían
+    photos_matched:  int = 0   # fotos encontradas por ruta exacta
+    photos_by_name:  int = 0   # encontradas por nombre + tamaño (ruta distinta)
+    photos_missing:  int = 0   # no encontradas en la DB
+    pairs_added:     int = 0   # asignaciones foto↔etiqueta nuevas
+
+
+def export_tags(path: str) -> ExportSummary:
     """
-    Exporta todas las etiquetas (con categoría y color) a un JSON.
-    Devuelve la cantidad exportada.
+    Exporta etiquetas, categorías y las asignaciones foto↔etiqueta a un JSON
+    (formato versión 2). Es un respaldo completo del trabajo de etiquetado.
     """
     tags = db.get_all_tags()
+    assignments = db.get_all_assignments()
     data = {
-        "version": 1,
+        "version": EXPORT_VERSION,
+        "app": "PhotoVault",
+        "exported_at": datetime.now().isoformat(timespec="seconds"),
         "tags": [
             {"name": t.name, "category": t.category, "color": t.color,
              "hidden": t.hidden, "sidebar_hidden": t.sidebar_hidden}
             for t in tags
         ],
         "categories": db.get_all_categories(),
+        "assignments": [
+            {"path": p, "filename": fn, "filesize": size, "tags": names}
+            for p, fn, size, names in assignments
+        ],
     }
-    Path(path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    return len(tags)
+    # Escribir a .tmp y renombrar: nunca queda un archivo a medias
+    target = Path(path)
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(target)
+    logger.info("Exportadas %d etiquetas y %d fotos etiquetadas a %s", len(tags), len(assignments), path)
+    return ExportSummary(tags=len(tags), assignments=len(assignments))
 
 
-def import_tags(path: str) -> tuple[int, int]:
-    """
-    Importa etiquetas desde un JSON exportado por export_tags.
-    Devuelve (creadas, omitidas_ya_existian).
-    """
-    raw  = Path(path).read_text(encoding="utf-8")
-    data = json.loads(raw)
-
-    if data.get("version") != 1:
+def _read_export(path: str) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("version") not in (1, 2):
         raise ValueError("Formato de archivo no reconocido.")
+    return data
 
-    created = skipped = 0
+
+def read_export_summary(path: str) -> ExportSummary:
+    """Qué contiene un archivo exportado (para preguntar antes de importar)."""
+    data = _read_export(path)
+    return ExportSummary(tags=len(data.get("tags", [])),
+                         assignments=len(data.get("assignments", [])))
+
+
+def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
+    """
+    Importa un JSON de export_tags (versión 1 o 2).
+    - Etiquetas: solo crea las que no existen; nunca sobrescribe.
+    - Asignaciones (v2): empareja cada foto por ruta exacta; si no está, por
+      nombre + tamaño cuando hay UNA sola coincidencia (sirve si cambió la
+      letra de la unidad o se movió la carpeta). Solo agrega, nunca quita.
+    """
+    data   = _read_export(path)
+    result = ImportResult()
 
     for cat in data.get("categories", []):
         db.create_category(cat)
@@ -278,12 +343,232 @@ def import_tags(path: str) -> tuple[int, int]:
         if not name:
             continue
         if name in existing_names:
-            skipped += 1
+            result.skipped += 1
             continue
         db.create_tag(name, tag_data.get("category", "general"), tag_data.get("color", "#4A9EFF"))
-        created += 1
+        existing_names.add(name)
+        result.created += 1
 
-    return created, skipped
+    if include_assignments and data.get("assignments"):
+        by_path, by_name = db.get_photo_lookup()
+        tag_ids = db.get_tag_ids_by_name()
+        pairs: list[tuple[int, int]] = []
+        touched: list[int] = []
+        for a in data["assignments"]:
+            pid = by_path.get(a.get("path", ""))
+            if pid is not None:
+                result.photos_matched += 1
+            else:
+                candidates = by_name.get((str(a.get("filename", "")).lower(), a.get("filesize")), [])
+                if len(candidates) == 1:
+                    pid = candidates[0]
+                    result.photos_by_name += 1
+                else:
+                    result.photos_missing += 1
+                    continue
+            touched.append(pid)
+            for name in a.get("tags", []):
+                name = str(name).strip().lower()
+                if name not in tag_ids:
+                    tag_ids[name] = db.create_tag(name)
+                    result.created += 1
+                pairs.append((pid, tag_ids[name]))
+        result.pairs_added = db.add_assignments(pairs)
+        _sync_sidecars(touched)
+
+    logger.info("Importación desde %s: %s", path, result)
+    return result
+
+
+# ── Sidecars XMP ──────────────────────────────────────────────────────────────
+
+XMP_SETTING = "xmp_sidecars"
+
+
+def is_xmp_enabled() -> bool:
+    return db.get_setting(XMP_SETTING) == "1"
+
+
+def set_xmp_enabled(enabled: bool) -> None:
+    db.set_setting(XMP_SETTING, "1" if enabled else "0")
+
+
+def _write_photo_sidecar(photo_id: int) -> xmp_sidecar.WriteResult | None:
+    photo = db.get_photo_by_id(photo_id)
+    if photo is None:
+        return None
+    tags: list[tuple[str, str | None]] = [(t.name, t.category) for t in db.get_photo_tags(photo_id)]
+    return xmp_sidecar.write_sidecar(photo.path, tags)
+
+
+def _sync_sidecars(photo_ids: list[int]) -> None:
+    """Actualiza los sidecars de estas fotos si la opción está activada."""
+    if not photo_ids or not is_xmp_enabled():
+        return
+    for pid in photo_ids:
+        _write_photo_sidecar(pid)
+
+
+@dataclass
+class SidecarSyncResult:
+    written:   int = 0
+    unchanged: int = 0
+    foreign:   int = 0   # había un .xmp de otro programa: no se tocó
+    errors:    int = 0
+
+
+def sync_all_sidecars(progress_callback: ProgressCallback | None = None,
+                      should_stop: StopCheck | None = None) -> SidecarSyncResult:
+    """Escribe el sidecar de todas las fotos con etiquetas."""
+    ids    = db.get_tagged_photo_ids()
+    result = SidecarSyncResult()
+    for i, pid in enumerate(ids):
+        if should_stop and should_stop():
+            break
+        if progress_callback:
+            progress_callback(i + 1, len(ids))
+        r = _write_photo_sidecar(pid)
+        if r == xmp_sidecar.WriteResult.WRITTEN:
+            result.written += 1
+        elif r == xmp_sidecar.WriteResult.SKIPPED_FOREIGN:
+            result.foreign += 1
+        elif r == xmp_sidecar.WriteResult.ERROR:
+            result.errors += 1
+        else:
+            result.unchanged += 1
+    logger.info("Sincronización de sidecars: %s", result)
+    return result
+
+
+@dataclass
+class SidecarImportResult:
+    checked:     int = 0
+    with_xmp:    int = 0
+    pairs_added: int = 0
+    tags_created: int = 0
+
+
+def import_from_sidecars(progress_callback: ProgressCallback | None = None,
+                         should_stop: StopCheck | None = None) -> SidecarImportResult:
+    """
+    Lee los .xmp junto a cada foto indexada (de PhotoVault o de otros
+    programas) y agrega esas etiquetas. Solo agrega, nunca quita.
+    """
+    rows    = db.get_all_photo_paths()
+    tag_ids = db.get_tag_ids_by_name()
+    result  = SidecarImportResult()
+    pairs: list[tuple[int, int]] = []
+    for i, (pid, path) in enumerate(rows):
+        if should_stop and should_stop():
+            break
+        result.checked += 1
+        if progress_callback and (i % 200 == 0 or i + 1 == len(rows)):
+            progress_callback(i + 1, len(rows))
+        tags = xmp_sidecar.read_sidecar(path)
+        if not tags:
+            continue
+        result.with_xmp += 1
+        for name, category in tags:
+            if name not in tag_ids:
+                tag_ids[name] = db.create_tag(name, category or "general")
+                result.tags_created += 1
+            pairs.append((pid, tag_ids[name]))
+    result.pairs_added = db.add_assignments(pairs)
+    logger.info("Importación desde sidecars: %s", result)
+    return result
+
+
+# ── Papelera interna ──────────────────────────────────────────────────────────
+
+TRASH_KEEP_DAYS = 30
+
+
+def list_trash() -> list[TrashBatch]:
+    return db.list_trash_batches()
+
+
+def count_trash() -> int:
+    return db.count_trash()
+
+
+def restore_trash_batch(batch_id: str) -> tuple[int, int]:
+    """Devuelve (restaurados, fusionados con un registro que ya existía)."""
+    restored, merged = db.restore_trash_batch(batch_id)
+    return restored, merged
+
+
+def delete_trash_batch(batch_id: str) -> int:
+    return db.delete_trash_batch(batch_id)
+
+
+def empty_trash() -> int:
+    return db.purge_trash()
+
+
+def purge_old_trash() -> int:
+    """Al arrancar: borra de la papelera lo que tenga más de TRASH_KEEP_DAYS días."""
+    n = db.purge_trash(older_than_days=TRASH_KEEP_DAYS)
+    if n:
+        logger.info("Papelera interna: %d registros con más de %d días eliminados", n, TRASH_KEEP_DAYS)
+    return n
+
+
+# ── Reubicar carpeta / unidad ─────────────────────────────────────────────────
+
+@dataclass
+class RelocationPreview:
+    old_folder:    str
+    new_folder:    str
+    count:         int          # registros que cambian de ruta
+    conflicts:     int          # ya existe un registro con la ruta nueva → se fusionan
+    sample_size:   int          # cuántas rutas nuevas se revisaron en disco
+    sample_found:  int          # cuántas de ellas existen
+    plan:          list = field(default_factory=list, repr=False)
+
+    @property
+    def looks_right(self) -> bool:
+        """Al menos la mitad de la muestra existe en la ubicación nueva."""
+        return self.sample_size > 0 and self.sample_found * 2 >= self.sample_size
+
+
+def preview_relocation(old_folder: str, new_folder: str, sample: int = 25) -> RelocationPreview:
+    """
+    Calcula qué pasaría al reubicar old_folder → new_folder (no cambia nada).
+    Revisa una muestra de rutas nuevas en disco para detectar errores de tipeo.
+    """
+    # Validar antes de normpath: normpath("") devuelve "."
+    if not old_folder.strip() or not new_folder.strip():
+        raise ValueError("Indica la carpeta vieja y la nueva.")
+    old_n = os.path.normpath(old_folder.strip()).rstrip("/\\")
+    new_n = os.path.normpath(new_folder.strip()).rstrip("/\\")
+    if old_n.lower() == new_n.lower():
+        raise ValueError("La carpeta nueva es igual a la vieja.")
+
+    plan = db.get_relocation_plan(old_folder, new_folder)
+    step = max(1, len(plan) // sample) if plan else 1
+    checked = plan[::step][:sample]
+    found = sum(1 for _pid, new_path, _e in checked if Path(new_path).exists())
+    return RelocationPreview(
+        old_folder=old_n, new_folder=new_n, count=len(plan),
+        conflicts=sum(1 for _p, _n, e in plan if e is not None),
+        sample_size=len(checked), sample_found=found, plan=plan,
+    )
+
+
+def apply_relocation(preview: RelocationPreview) -> tuple[int, int]:
+    """Aplica una vista previa de preview_relocation. Devuelve (movidos, fusionados)."""
+    moved, merged = db.apply_relocation(preview.plan)
+    logger.info("Reubicado %s → %s: %d movidos, %d fusionados",
+                preview.old_folder, preview.new_folder, moved, merged)
+    return moved, merged
+
+
+def get_indexed_roots() -> list[tuple[str, int, bool]]:
+    """[(unidad, registros, disponible)] para sugerir qué reubicar."""
+    counts: dict[str, int] = defaultdict(int)
+    for _pid, path in db.get_all_photo_paths():
+        counts[_root_of(path)] += 1
+    return [(root, n, Path(root).exists()) for root, n in sorted(counts.items())]
 
 
 # ── Duplicados ────────────────────────────────────────────────────────────────
@@ -362,7 +647,7 @@ def delete_photo_file(photo_id: int) -> bool:
             logger.exception("No se pudo mandar a la Papelera: %s", photo.path)
             return False
         logger.info("Enviado a la Papelera: %s", photo.path)
-    db.delete_photos([photo_id])
+    db.delete_photos([photo_id], reason=f"Duplicado enviado a la Papelera de Windows: {photo.filename}")
     return True
 
 
@@ -456,7 +741,7 @@ def delete_missing(report: MissingReport) -> int:
     """Borra los registros encontrados por find_missing_files()."""
     if report.cancelled:
         return 0
-    n = db.delete_photos(report.missing_ids)
+    n = db.delete_photos(report.missing_ids, reason="Archivos que ya no existían en disco")
     logger.info("Eliminados %d registros de archivos faltantes", n)
     return n
 
@@ -469,7 +754,7 @@ def preview_deindex_folder(folder: str) -> tuple[int, int]:
 
 def deindex_folder(folder: str) -> int:
     """Quita los registros de `folder` y sus subcarpetas. No toca el disco."""
-    n = db.delete_photos(db.get_folder_photo_ids(folder))
+    n = db.delete_photos(db.get_folder_photo_ids(folder), reason=f"Carpeta des-indexada: {folder}")
     logger.info("Des-indexada %s: %d registros", folder, n)
     return n
 

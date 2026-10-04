@@ -25,6 +25,7 @@ src_files = [
     'thumbnail_cache.py',
     'backup.py',
     'logging_setup.py',
+    'xmp_sidecar.py',
 ]
 
 # ── Datos extra a empaquetar (recursos no-.py) ────────────────────────────────

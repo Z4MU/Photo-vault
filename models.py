@@ -133,3 +133,13 @@ class DuplicateGroup:
             return 0
         sizes = [p.filesize or 0 for p in self.photos]
         return sum(sizes) - max(sizes)
+
+
+@dataclass
+class TrashBatch:
+    """Una operación que quitó registros (des-indexar, faltantes, duplicado…)."""
+    batch_id:   str
+    reason:     str
+    deleted_at: str     # UTC, formato SQLite 'YYYY-MM-DD HH:MM:SS'
+    count:      int
+    tagged:     int     # cuántos tenían etiquetas

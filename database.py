@@ -3,16 +3,18 @@ PhotoVault - database.py
 Maneja toda la interacción con SQLite.
 """
 
+import json
 import logging
 import os
 import sqlite3
 import threading
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Optional
 
 import backup
-from models import Photo, SortField, SortOrder, Stats, Tag, sort_to_sql
+from models import Photo, SortField, SortOrder, Stats, Tag, TrashBatch, sort_to_sql
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +163,26 @@ def _m001_baseline(conn: sqlite3.Connection) -> None:
     )
 
 
+def _m002_internal_trash(conn: sqlite3.Connection) -> None:
+    """Papelera interna: registros quitados (con sus etiquetas) para poder restaurarlos."""
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS deleted_photos (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id    TEXT NOT NULL,              -- una operación = un lote
+            reason      TEXT NOT NULL,              -- texto para el usuario
+            deleted_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            path        TEXT NOT NULL,
+            photo_json  TEXT NOT NULL,              -- columnas de photos
+            tags_json   TEXT NOT NULL DEFAULT '[]'  -- [{name, category, color}]
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_batch ON deleted_photos(batch_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_at    ON deleted_photos(deleted_at)")
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m001_baseline,
+    _m002_internal_trash,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -486,13 +506,249 @@ def get_all_photo_paths() -> list[tuple[int, str]]:
     return [(r[0], r[1]) for r in conn.execute("SELECT id, path FROM photos").fetchall()]
 
 
-def delete_photos(photo_ids: list[int]) -> int:
-    """Borra registros (y por CASCADE sus etiquetas). No toca archivos del disco."""
+# Columnas de photos que se guardan en la papelera (todas menos id)
+_TRASH_PHOTO_FIELDS = (
+    "path", "filename", "media_type", "year", "month", "filesize",
+    "width", "height", "duration", "md5", "added_at",
+)
+
+
+def _chunks(items: list, size: int = 500):
+    # SQLite limita la cantidad de parámetros por consulta
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
+
+
+def delete_photos(photo_ids: list[int], reason: str = "Eliminado") -> int:
+    """
+    Quita registros de la DB. No toca archivos del disco.
+    Antes de borrar, copia cada registro y sus etiquetas a la papelera
+    interna (deleted_photos) en la misma transacción, para poder restaurarlos.
+    """
     if not photo_ids:
         return 0
+    batch_id = uuid.uuid4().hex
+    cols = ", ".join(_TRASH_PHOTO_FIELDS)
     with transaction() as conn:
-        conn.executemany("DELETE FROM photos WHERE id = ?", [(i,) for i in photo_ids])
+        for chunk in _chunks(photo_ids):
+            ph = ",".join("?" * len(chunk))
+            photos = conn.execute(
+                f"SELECT id, {cols} FROM photos WHERE id IN ({ph})", chunk
+            ).fetchall()
+            tags: dict[int, list[dict]] = {}
+            for r in conn.execute(f"""
+                SELECT pt.photo_id, t.name, t.category, t.color
+                FROM photo_tags pt JOIN tags t ON t.id = pt.tag_id
+                WHERE pt.photo_id IN ({ph})
+            """, chunk):
+                tags.setdefault(r[0], []).append(
+                    {"name": r[1], "category": r[2], "color": r[3]}
+                )
+            conn.executemany(
+                "INSERT INTO deleted_photos (batch_id, reason, path, photo_json, tags_json) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [
+                    (batch_id, reason, r["path"],
+                     json.dumps({k: r[k] for k in _TRASH_PHOTO_FIELDS}, ensure_ascii=False),
+                     json.dumps(tags.get(r["id"], []), ensure_ascii=False))
+                    for r in photos
+                ],
+            )
+            conn.execute(f"DELETE FROM photos WHERE id IN ({ph})", chunk)
+    logger.info("%d registros a la papelera interna (lote %s, %s)",
+                len(photo_ids), batch_id, reason)
     return len(photo_ids)
+
+
+# ── Papelera interna ──────────────────────────────────────────────────────────
+
+def list_trash_batches() -> list[TrashBatch]:
+    rows = get_connection().execute("""
+        SELECT batch_id, reason, MIN(deleted_at) AS deleted_at, COUNT(*) AS n,
+               SUM(CASE WHEN tags_json != '[]' THEN 1 ELSE 0 END) AS tagged
+        FROM deleted_photos
+        GROUP BY batch_id
+        ORDER BY deleted_at DESC, MIN(id) DESC
+    """).fetchall()
+    return [TrashBatch(batch_id=r["batch_id"], reason=r["reason"], deleted_at=r["deleted_at"],
+                       count=r["n"], tagged=r["tagged"]) for r in rows]
+
+
+def count_trash() -> int:
+    return get_connection().execute("SELECT COUNT(*) FROM deleted_photos").fetchone()[0]
+
+
+def _get_or_create_tag(conn: sqlite3.Connection, name: str,
+                       category: str | None, color: str | None) -> int:
+    row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row[0]
+    category = category or "general"
+    conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
+    return conn.execute(
+        "INSERT INTO tags (name, category, color) VALUES (?, ?, ?) RETURNING id",
+        (name, category, color or "#4A9EFF"),
+    ).fetchone()[0]
+
+
+def restore_trash_batch(batch_id: str) -> tuple[int, int]:
+    """
+    Restaura un lote de la papelera. Devuelve (restaurados, fusionados):
+    si la ruta ya volvió a indexarse, sus etiquetas se agregan a ese registro.
+    Las etiquetas que se hayan borrado mientras tanto se vuelven a crear.
+    """
+    restored = merged = 0
+    with transaction() as conn:
+        entries = conn.execute(
+            "SELECT id, photo_json, tags_json FROM deleted_photos WHERE batch_id = ?", (batch_id,)
+        ).fetchall()
+        for e in entries:
+            data = json.loads(e["photo_json"])
+            existing = conn.execute(
+                "SELECT id FROM photos WHERE path = ?", (data["path"],)
+            ).fetchone()
+            if existing:
+                photo_id = existing[0]
+                merged += 1
+            else:
+                cols = [k for k in _TRASH_PHOTO_FIELDS if k in data]
+                photo_id = conn.execute(
+                    f"INSERT INTO photos ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))}) "
+                    "RETURNING id",
+                    [data[k] for k in cols],
+                ).fetchone()[0]
+                restored += 1
+            for t in json.loads(e["tags_json"]):
+                tag_id = _get_or_create_tag(conn, t["name"], t.get("category"), t.get("color"))
+                conn.execute(
+                    "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)",
+                    (photo_id, tag_id),
+                )
+        conn.execute("DELETE FROM deleted_photos WHERE batch_id = ?", (batch_id,))
+    logger.info("Lote %s restaurado: %d restaurados, %d fusionados", batch_id, restored, merged)
+    return restored, merged
+
+
+def delete_trash_batch(batch_id: str) -> int:
+    with transaction() as conn:
+        return conn.execute("DELETE FROM deleted_photos WHERE batch_id = ?", (batch_id,)).rowcount
+
+
+def purge_trash(older_than_days: int | None = None) -> int:
+    """Vacía la papelera (todo, o solo lo más viejo que N días)."""
+    with transaction() as conn:
+        if older_than_days is None:
+            return conn.execute("DELETE FROM deleted_photos").rowcount
+        return conn.execute(
+            "DELETE FROM deleted_photos WHERE deleted_at < datetime('now', ?)",
+            (f"-{int(older_than_days)} days",),
+        ).rowcount
+
+
+# ── Reubicar carpetas / unidades ──────────────────────────────────────────────
+
+def _strip_seps(folder: str) -> str:
+    return os.path.normpath(folder).rstrip("/\\")
+
+
+def get_relocation_plan(old_folder: str, new_folder: str) -> list[tuple[int, str, int | None]]:
+    """
+    [(photo_id, ruta_nueva, id_existente_o_None)] para mover old_folder → new_folder.
+    id_existente: ya hay un registro con la ruta nueva (p. ej. se re-indexó).
+    """
+    old_n, new_n = _strip_seps(old_folder), _strip_seps(new_folder)
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT id, path FROM photos WHERE path LIKE ? ESCAPE '!'", (folder_like_pattern(old_folder),)
+    ).fetchall()
+    plan = []
+    for pid, path in rows:
+        new_path = new_n + path[len(old_n):]
+        existing = conn.execute("SELECT id FROM photos WHERE path = ?", (new_path,)).fetchone()
+        plan.append((pid, new_path, existing[0] if existing else None))
+    return plan
+
+
+def apply_relocation(plan: list[tuple[int, str, int | None]]) -> tuple[int, int]:
+    """
+    Aplica un plan de get_relocation_plan. Devuelve (movidos, fusionados).
+    Fusionar = pasar las etiquetas al registro existente y quitar el viejo
+    (no va a la papelera: no se pierde nada).
+    """
+    moved = merged = 0
+    with transaction() as conn:
+        for pid, new_path, existing_id in plan:
+            if existing_id is None:
+                conn.execute(
+                    "UPDATE photos SET path = ?, filename = ? WHERE id = ?",
+                    (new_path, os.path.basename(new_path), pid),
+                )
+                moved += 1
+            else:
+                conn.execute(
+                    "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) "
+                    "SELECT ?, tag_id FROM photo_tags WHERE photo_id = ?",
+                    (existing_id, pid),
+                )
+                conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
+                merged += 1
+    return moved, merged
+
+
+# ── Asignaciones foto ↔ etiqueta (exportar / importar) ───────────────────────
+
+def get_all_assignments() -> list[tuple[str, str, int | None, list[str]]]:
+    """[(ruta, nombre, tamaño, [etiquetas])] de todas las fotos con etiquetas."""
+    rows = get_connection().execute("""
+        SELECT p.path, p.filename, p.filesize, t.name
+        FROM photo_tags pt
+        JOIN photos p ON p.id = pt.photo_id
+        JOIN tags   t ON t.id = pt.tag_id
+        ORDER BY p.path, t.name
+    """).fetchall()
+    out: list[tuple[str, str, int | None, list[str]]] = []
+    for path, filename, filesize, tag in rows:
+        if out and out[-1][0] == path:
+            out[-1][3].append(tag)
+        else:
+            out.append((path, filename, filesize, [tag]))
+    return out
+
+
+def get_photo_lookup() -> tuple[dict[str, int], dict[tuple[str, int | None], list[int]]]:
+    """Índices para emparejar fotos: {ruta: id} y {(nombre_minúsculas, tamaño): [ids]}."""
+    by_path: dict[str, int] = {}
+    by_name: dict[tuple[str, int | None], list[int]] = {}
+    for pid, path, filename, filesize in get_connection().execute(
+        "SELECT id, path, filename, filesize FROM photos"
+    ):
+        by_path[path] = pid
+        by_name.setdefault((filename.lower(), filesize), []).append(pid)
+    return by_path, by_name
+
+
+def add_assignments(pairs: list[tuple[int, int]]) -> int:
+    """Agrega pares (photo_id, tag_id). Devuelve cuántos eran nuevos."""
+    with transaction() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) VALUES (?, ?)", pairs
+        )
+        return conn.total_changes - before
+
+
+def get_tag_ids_by_name() -> dict[str, int]:
+    return {r[1]: r[0] for r in get_connection().execute("SELECT id, name FROM tags")}
+
+
+def get_photo_ids_with_tag(tag_id: int) -> list[int]:
+    return [r[0] for r in get_connection().execute(
+        "SELECT photo_id FROM photo_tags WHERE tag_id = ?", (tag_id,)
+    )]
+
+
+def get_tagged_photo_ids() -> list[int]:
+    return [r[0] for r in get_connection().execute("SELECT DISTINCT photo_id FROM photo_tags")]
 
 
 def count_tagged(photo_ids: list[int]) -> int:
@@ -501,9 +757,7 @@ def count_tagged(photo_ids: list[int]) -> int:
         return 0
     conn  = get_connection()
     total = 0
-    # SQLite limita la cantidad de parámetros por consulta
-    for i in range(0, len(photo_ids), 500):
-        chunk = photo_ids[i:i + 500]
+    for chunk in _chunks(photo_ids):
         placeholders = ",".join("?" * len(chunk))
         total += conn.execute(
             f"SELECT COUNT(DISTINCT photo_id) FROM photo_tags WHERE photo_id IN ({placeholders})",

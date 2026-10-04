@@ -13,9 +13,10 @@ Features nuevos en esta versión:
 import html
 import logging
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QEventLoop, Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QImage, QImageReader, QPixmap
 from PyQt6.QtSvgWidgets import QSvgWidget
 from PyQt6.QtWidgets import (
@@ -34,6 +35,7 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSpinBox,
@@ -47,7 +49,7 @@ import indexer
 import logging_setup
 import services
 import thumbnail_cache
-from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Tag
+from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Tag, TrashBatch
 
 logger = logging.getLogger(__name__)
 
@@ -194,6 +196,72 @@ class MissingFilesWorker(StoppableThread):
             self.error.emit(str(e))
         finally:
             db.close_connection()
+
+
+class TaskWorker(StoppableThread):
+    """
+    Corre fn(progress_callback=..., should_stop=...) en un hilo.
+    Para funciones de services que siguen esa convención.
+    """
+    progress  = pyqtSignal(int, int)
+    completed = pyqtSignal(object)
+    error     = pyqtSignal(str)
+
+    def __init__(self, fn):
+        super().__init__()
+        self._fn = fn
+
+    def run(self):
+        try:
+            result = self._fn(
+                progress_callback=lambda c, t: self.progress.emit(c, t),
+                should_stop=self.is_stopping,
+            )
+            self.completed.emit(result)
+        except Exception as e:
+            logger.exception("Error en tarea en segundo plano")
+            self.error.emit(str(e))
+        finally:
+            db.close_connection()
+
+
+def run_with_progress(parent: QWidget, title: str, text: str, fn):
+    """
+    Ejecuta fn en un TaskWorker mostrando un diálogo de progreso con botón
+    Cancelar. La UI sigue respondiendo. Devuelve el resultado de fn (parcial
+    si se canceló), o None si hubo un error (ya mostrado al usuario).
+    """
+    dlg = QProgressDialog(text, "Cancelar", 0, 100, parent)
+    dlg.setWindowTitle(title)
+    dlg.setWindowModality(Qt.WindowModality.WindowModal)
+    dlg.setMinimumDuration(0)
+    dlg.setAutoClose(False); dlg.setAutoReset(False)
+    dlg.setStyleSheet(DARK_STYLE)
+
+    worker = TaskWorker(fn)
+    box: dict = {}
+    loop = QEventLoop()
+
+    def finish(key: str, value) -> None:
+        box[key] = value
+        loop.quit()
+
+    def cancel() -> None:
+        dlg.setLabelText("Cancelando…")
+        worker.stop()
+
+    worker.progress.connect(lambda c, t: dlg.setValue(int(c / t * 100) if t else 0))
+    worker.completed.connect(lambda r: finish("result", r))
+    worker.error.connect(lambda e: finish("error", e))
+    dlg.canceled.connect(cancel)
+    worker.start()
+    loop.exec()
+    worker.wait()
+    dlg.close()
+    if "error" in box:
+        QMessageBox.critical(parent, title, f"{box['error']}\n\nDetalles en:\n{logging_setup.LOG_FILE}")
+        return None
+    return box.get("result")
 
 
 # ─── Utilidades de imagen ─────────────────────────────────────────────────────
@@ -764,8 +832,8 @@ class DuplicatesDialog(QDialog):
         reply = QMessageBox.question(
             self, "Confirmar",
             f"¿Mandar este archivo a la Papelera de reciclaje?\n\n{photo.path}\n\n"
-            "También se quitará de PhotoVault (con sus etiquetas). "
-            "Puedes recuperar el archivo desde la Papelera.",
+            "También se quitará de PhotoVault; sus etiquetas quedan en la Papelera de "
+            "PhotoVault. El archivo se recupera desde la Papelera de Windows.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -1320,7 +1388,7 @@ class SettingsDialog(QDialog):
     def __init__(self, current_page_size: int, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuración")
-        self.setFixedSize(440, 320)
+        self.setFixedSize(480, 520)
         self.setStyleSheet(DARK_STYLE)
         self.page_size = current_page_size
         self._build_ui()
@@ -1365,6 +1433,37 @@ class SettingsDialog(QDialog):
         cache_row.addWidget(btn_clear); cache_row.addWidget(btn_purge)
         layout.addLayout(cache_row)
 
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("color:#2D2D3F;"); layout.addWidget(sep2)
+
+        # ── Sidecars XMP ──────────────────────────────────────────────────
+        layout.addWidget(QLabel("<b>Etiquetas en archivos .xmp</b>"))
+        self.chk_xmp = QCheckBox("Guardar las etiquetas también en un .xmp junto a cada foto")
+        self.chk_xmp.setChecked(services.is_xmp_enabled())
+        layout.addWidget(self.chk_xmp)
+        xmp_info = QLabel(
+            "Crea p. ej. <i>IMG_1234.JPG.xmp</i> al lado de la foto. Otros programas "
+            "(digiKam, darktable, Lightroom…) pueden leerlos, y sirven de respaldo si "
+            "pierdes la base de datos.<br>"
+            "⚠ Los nombres de <b>todas</b> las etiquetas quedan visibles en la carpeta, "
+            "incluidas las de contenido oculto. Nunca se modifican .xmp de otros programas."
+        )
+        xmp_info.setWordWrap(True)
+        xmp_info.setStyleSheet("color:#666;font-size:11px;")
+        layout.addWidget(xmp_info)
+
+        xmp_row = QHBoxLayout()
+        btn_sync = QPushButton("⬆  Escribir .xmp ahora")
+        btn_sync.setToolTip("Crea/actualiza el .xmp de todas las fotos que tienen etiquetas")
+        btn_sync.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
+        btn_sync.clicked.connect(self._sync_xmp)
+        btn_read = QPushButton("⬇  Importar desde .xmp")
+        btn_read.setToolTip("Busca .xmp junto a las fotos indexadas y agrega sus etiquetas")
+        btn_read.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
+        btn_read.clicked.connect(self._import_xmp)
+        xmp_row.addWidget(btn_sync); xmp_row.addWidget(btn_read)
+        layout.addLayout(xmp_row)
+
         layout.addStretch()
         btn_row = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar"); btn_cancel.clicked.connect(self.reject)
@@ -1391,8 +1490,44 @@ class SettingsDialog(QDialog):
         QMessageBox.information(self, "Purga completada",
             f"Se eliminaron {n} miniaturas huérfanas del caché.")
 
+    def _sync_xmp(self):
+        r = run_with_progress(self, "Escribir .xmp", "Escribiendo etiquetas en archivos .xmp…",
+                              services.sync_all_sidecars)
+        if r is None:
+            return
+        msg = f"Escritos: {r.written:,}\nSin cambios: {r.unchanged:,}"
+        if r.foreign:
+            msg += f"\nOmitidos (ya había un .xmp de otro programa): {r.foreign:,}"
+        if r.errors:
+            msg += f"\nErrores: {r.errors:,} (¿unidad desconectada? ver el log)"
+        QMessageBox.information(self, "Archivos .xmp", msg)
+
+    def _import_xmp(self):
+        r = run_with_progress(self, "Importar desde .xmp",
+                              "Buscando archivos .xmp junto a las fotos…",
+                              services.import_from_sidecars)
+        if r is None:
+            return
+        QMessageBox.information(
+            self, "Importado desde .xmp",
+            f"Fotos revisadas: {r.checked:,}\n"
+            f"Con archivo .xmp: {r.with_xmp:,}\n"
+            f"Etiquetas nuevas creadas: {r.tags_created:,}\n"
+            f"Asignaciones agregadas: {r.pairs_added:,}",
+        )
+
     def _apply(self):
         self.page_size = self.spin.value()
+        was_enabled = services.is_xmp_enabled()
+        services.set_xmp_enabled(self.chk_xmp.isChecked())
+        if self.chk_xmp.isChecked() and not was_enabled:
+            if QMessageBox.question(
+                self, "Archivos .xmp",
+                "Desde ahora cada cambio de etiquetas actualiza el .xmp de la foto.\n\n"
+                "¿Escribir ya los .xmp de las fotos que tienen etiquetas?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            ) == QMessageBox.StandardButton.Yes:
+                self._sync_xmp()
         self.accept()
 
 
@@ -1637,14 +1772,19 @@ class TagManagerDialog(QDialog):
         CategoryManagerDialog(self).exec(); self._refresh()
 
     def _export(self):
+        default = f"photovault_etiquetas_{datetime.now():%Y-%m-%d}.json"
         path, _ = QFileDialog.getSaveFileName(
-            self, "Exportar etiquetas", "photovault_tags.json",
-            "JSON (*.json)"
+            self, "Exportar etiquetas y asignaciones", default, "JSON (*.json)"
         )
         if not path: return
         try:
-            n = services.export_tags(path)
-            QMessageBox.information(self, "Exportado", f"Se exportaron {n} etiquetas a:\n{path}")
+            s = services.export_tags(path)
+            QMessageBox.information(
+                self, "Exportado",
+                f"Se exportaron {s.tags:,} etiquetas y las asignaciones de "
+                f"{s.assignments:,} fotos a:\n{path}\n\n"
+                "Guarda este archivo fuera de este PC (USB, nube) como respaldo.",
+            )
         except Exception as e:
             logger.exception("Error exportando etiquetas a %s", path)
             QMessageBox.critical(self, "Error", str(e))
@@ -1655,9 +1795,32 @@ class TagManagerDialog(QDialog):
         )
         if not path: return
         try:
-            created, skipped = services.import_tags(path)
-            QMessageBox.information(self, "Importado",
-                f"Etiquetas creadas: {created}\nYa existían (omitidas): {skipped}")
+            summary = services.read_export_summary(path)
+            include = False
+            if summary.assignments:
+                answer = QMessageBox.question(
+                    self, "Importar",
+                    f"El archivo tiene {summary.tags:,} etiquetas y asignaciones para "
+                    f"{summary.assignments:,} fotos.\n\n"
+                    "¿Importar también las asignaciones?\n"
+                    "(Solo se agregan etiquetas a las fotos; nunca se quita ninguna.)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+                    | QMessageBox.StandardButton.Cancel,
+                )
+                if answer == QMessageBox.StandardButton.Cancel:
+                    return
+                include = answer == QMessageBox.StandardButton.Yes
+            r = services.import_tags(path, include_assignments=include)
+            msg = f"Etiquetas creadas: {r.created:,}\nYa existían (omitidas): {r.skipped:,}"
+            if include:
+                msg += (f"\n\nFotos encontradas por ruta: {r.photos_matched:,}"
+                        f"\nFotos encontradas por nombre y tamaño: {r.photos_by_name:,}"
+                        f"\nFotos no encontradas: {r.photos_missing:,}"
+                        f"\nAsignaciones agregadas: {r.pairs_added:,}")
+                if r.photos_missing:
+                    msg += ("\n\nSi las fotos no encontradas están en otra unidad o carpeta, "
+                            "indexa esa carpeta o usa 'Reubicar' y vuelve a importar.")
+            QMessageBox.information(self, "Importado", msg)
             self._refresh()
         except Exception as e:
             logger.exception("Error importando etiquetas desde %s", path)
@@ -1735,8 +1898,8 @@ class IndexDialog(QDialog):
 class DeindexDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Des-indexar carpetas")
-        self.setMinimumSize(560, 420); self.setStyleSheet(DARK_STYLE)
+        self.setWindowTitle("Carpetas indexadas")
+        self.setMinimumSize(620, 480); self.setStyleSheet(DARK_STYLE)
         self._missing_worker: MissingFilesWorker | None = None
         self._build_ui(); self._refresh()
 
@@ -1765,7 +1928,28 @@ class DeindexDialog(QDialog):
         self.missing_progress.setVisible(False)
         layout.addWidget(self.missing_progress)
 
+        tools = QHBoxLayout()
+        btn_reloc = QPushButton("📦  Reubicar carpeta o unidad…")
+        btn_reloc.setToolTip("Si moviste las fotos o cambió la letra de la unidad: "
+                             "actualiza las rutas sin perder etiquetas")
+        btn_reloc.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;")
+        btn_reloc.clicked.connect(lambda: self._open_relocate())
+        self.btn_trash = QPushButton("")
+        self.btn_trash.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
+        self.btn_trash.clicked.connect(self._open_trash)
+        tools.addWidget(btn_reloc); tools.addWidget(self.btn_trash)
+        layout.addLayout(tools)
+
+    def _open_relocate(self, old_folder: str = ""):
+        if RelocateDialog(self, old_folder).exec():
+            self._refresh()
+
+    def _open_trash(self):
+        TrashDialog(self).exec()
+        self._refresh()
+
     def _refresh(self):
+        self.btn_trash.setText(f"♻  Papelera de PhotoVault ({services.count_trash():,})")
         for i in reversed(range(self.vbox.count())):
             w = self.vbox.itemAt(i).widget()
             if w: w.deleteLater()
@@ -1780,6 +1964,10 @@ class DeindexDialog(QDialog):
                 lbl = QLabel(f"<b>{html.escape(folder)}</b>  "
                              f"<span style='color:#666;'>{count:,} archivos</span>")
                 lbl.setTextFormat(Qt.TextFormat.RichText); hl.addWidget(lbl, stretch=1)
+                btn_mv = QPushButton("Reubicar"); btn_mv.setFixedWidth(80)
+                btn_mv.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;")
+                btn_mv.clicked.connect(lambda _, f=folder: self._open_relocate(f))
+                hl.addWidget(btn_mv)
                 btn = QPushButton("Eliminar"); btn.setFixedWidth(75)
                 btn.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
                 btn.clicked.connect(lambda _, f=folder: self._deindex(f))
@@ -1791,9 +1979,11 @@ class DeindexDialog(QDialog):
         msg = (f"¿Quitar de PhotoVault la carpeta y sus subcarpetas?\n\n{folder}\n\n"
                f"Registros: {count:,}")
         if tagged:
-            msg += (f"\n⚠ {tagged:,} de ellos tienen etiquetas, que se perderán "
-                    f"(aunque vuelvas a indexar la carpeta).")
-        msg += "\n\nLos archivos NO se borran del disco."
+            msg += f"\n{tagged:,} de ellos tienen etiquetas."
+        msg += ("\n\nLos archivos NO se borran del disco. Podrás restaurar los registros "
+                f"(con sus etiquetas) desde la Papelera de PhotoVault durante "
+                f"{services.TRASH_KEEP_DAYS} días.\n\n"
+                "Si solo moviste la carpeta, usa 'Reubicar' en su lugar.")
         if QMessageBox.question(self, "Confirmar", msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         ) == QMessageBox.StandardButton.Yes:
@@ -1831,7 +2021,8 @@ class DeindexDialog(QDialog):
             skipped_txt = (
                 "\n\nNo se tocarán estos registros, para proteger tus etiquetas:\n"
                 + "\n".join(lines)
-                + "\n(Si de verdad ya no existen, quítalos con 'Eliminar' en su carpeta.)"
+                + "\n(Si la unidad cambió de letra o moviste las fotos, usa 'Reubicar'. "
+                  "Si de verdad ya no existen, quítalos con 'Eliminar' en su carpeta.)"
             )
 
         if report.count == 0:
@@ -1843,8 +2034,12 @@ class DeindexDialog(QDialog):
 
         msg = f"Se encontraron {report.count:,} registros cuyo archivo ya no existe."
         if report.tagged:
-            msg += f"\n⚠ {report.tagged:,} de ellos tienen etiquetas, que se perderán."
-        msg += skipped_txt + "\n\n¿Eliminar esos registros de PhotoVault?"
+            msg += f"\n{report.tagged:,} de ellos tienen etiquetas."
+        msg += skipped_txt + (
+            "\n\n¿Quitar esos registros de PhotoVault?\n"
+            f"Podrás restaurarlos desde la Papelera de PhotoVault durante "
+            f"{services.TRASH_KEEP_DAYS} días."
+        )
 
         if QMessageBox.question(
             self, "Confirmar", msg,
@@ -1853,8 +2048,228 @@ class DeindexDialog(QDialog):
         ) != QMessageBox.StandardButton.Yes:
             return
         n = services.delete_missing(report)
-        QMessageBox.information(self, "Listo", f"Se eliminaron {n:,} registros.")
+        QMessageBox.information(self, "Listo",
+            f"Se quitaron {n:,} registros (están en la Papelera de PhotoVault).")
         self._refresh()
+
+
+# ─── Dialog: Reubicar carpeta / unidad ───────────────────────────────────────
+
+class RelocateDialog(QDialog):
+    """
+    Cambia el prefijo de ruta de los registros (p. ej. G:\\ → E:\\, o
+    D:\\Fotos → E:\\Respaldo\\Fotos) sin perder etiquetas.
+    """
+
+    def __init__(self, parent=None, old_folder: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Reubicar carpeta o unidad")
+        self.setMinimumSize(600, 360); self.setStyleSheet(DARK_STYLE)
+        self._preview: services.RelocationPreview | None = None
+
+        layout = QVBoxLayout(self); layout.setContentsMargins(16, 16, 16, 16); layout.setSpacing(10)
+        intro = QLabel(
+            "Usa esto si moviste las fotos a otra carpeta o si el disco cambió de letra. "
+            "Se actualizan las rutas en PhotoVault y se conservan todas las etiquetas. "
+            "No se mueve ningún archivo."
+        )
+        intro.setWordWrap(True); intro.setStyleSheet("color:#8888AA;font-size:11px;")
+        layout.addWidget(intro)
+
+        layout.addWidget(QLabel("Ruta vieja (como está en PhotoVault):"))
+        self.old_combo = QComboBox(); self.old_combo.setEditable(True)
+        for root, n, available in services.get_indexed_roots():
+            label = f"{root}   ({n:,} registros{'' if available else ' — NO disponible'})"
+            self.old_combo.addItem(label, userData=root)
+        if old_folder:
+            self.old_combo.setEditText(old_folder)
+        layout.addWidget(self.old_combo)
+
+        layout.addWidget(QLabel("Ruta nueva (donde están ahora los archivos):"))
+        row = QHBoxLayout()
+        self.new_edit = QLineEdit(); self.new_edit.setPlaceholderText("p. ej. E:\\  o  E:\\Respaldo\\Fotos")
+        btn_b = QPushButton("Examinar"); btn_b.clicked.connect(self._browse)
+        row.addWidget(self.new_edit); row.addWidget(btn_b)
+        layout.addLayout(row)
+
+        self.preview_lbl = QLabel("")
+        self.preview_lbl.setWordWrap(True)
+        self.preview_lbl.setTextFormat(Qt.TextFormat.RichText)
+        layout.addWidget(self.preview_lbl, stretch=1)
+
+        btns = QHBoxLayout()
+        btn_cancel = QPushButton("Cancelar"); btn_cancel.clicked.connect(self.reject)
+        btn_prev = QPushButton("🔍  Vista previa"); btn_prev.clicked.connect(self._do_preview)
+        self.btn_apply = QPushButton("✓  Reubicar")
+        self.btn_apply.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self._apply)
+        btns.addWidget(btn_cancel); btns.addStretch()
+        btns.addWidget(btn_prev); btns.addWidget(self.btn_apply)
+        layout.addLayout(btns)
+
+        # Cualquier cambio invalida la vista previa
+        self.old_combo.editTextChanged.connect(self._invalidate)
+        self.new_edit.textChanged.connect(self._invalidate)
+
+    def _old_value(self) -> str:
+        # Si el texto es el de un ítem de la lista, usar la ruta (sin el conteo)
+        idx = self.old_combo.findText(self.old_combo.currentText())
+        if idx >= 0 and self.old_combo.itemData(idx):
+            return self.old_combo.itemData(idx)
+        return self.old_combo.currentText().strip()
+
+    def _browse(self):
+        f = QFileDialog.getExistingDirectory(self, "Ubicación nueva")
+        if f: self.new_edit.setText(str(Path(f)))
+
+    def _invalidate(self):
+        self._preview = None
+        self.btn_apply.setEnabled(False)
+        self.preview_lbl.setText("")
+
+    def _do_preview(self):
+        try:
+            p = services.preview_relocation(self._old_value(), self.new_edit.text().strip())
+        except ValueError as e:
+            QMessageBox.warning(self, "Reubicar", str(e)); return
+        if p.count == 0:
+            self.preview_lbl.setText("<span style='color:#FFD700;'>No hay registros dentro de "
+                                     f"{html.escape(p.old_folder)}.</span>")
+            return
+        color = "#4AFF9E" if p.looks_right else "#FF4A4A"
+        txt = (f"<b>{p.count:,}</b> registros pasarán de <b>{html.escape(p.old_folder)}</b> "
+               f"a <b>{html.escape(p.new_folder)}</b>.<br>"
+               f"<span style='color:{color};'>Comprobación: {p.sample_found} de {p.sample_size} "
+               f"archivos de muestra existen en la ruta nueva.</span>")
+        if not p.looks_right:
+            txt += ("<br><span style='color:#FF4A4A;'>⚠ La mayoría NO está en la ruta nueva. "
+                    "Revisa que la ruta sea correcta antes de continuar.</span>")
+        if p.conflicts:
+            txt += (f"<br>{p.conflicts:,} ya estaban indexados en la ruta nueva: se fusionarán "
+                    "(sus etiquetas se suman al registro existente).")
+        self.preview_lbl.setText(txt)
+        self._preview = p
+        self.btn_apply.setEnabled(True)
+
+    def _apply(self):
+        p = self._preview
+        if p is None:
+            return
+        if not p.looks_right and QMessageBox.question(
+            self, "¿Seguro?",
+            "La mayoría de los archivos no está en la ruta nueva.\n¿Reubicar de todos modos?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        moved, merged = services.apply_relocation(p)
+        QMessageBox.information(self, "Reubicado",
+            f"Rutas actualizadas: {moved:,}\nFusionados con registros existentes: {merged:,}")
+        self.accept()
+
+
+# ─── Dialog: Papelera de PhotoVault ──────────────────────────────────────────
+
+class TrashDialog(QDialog):
+    """Registros quitados (des-indexar, faltantes, duplicados) con sus etiquetas."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Papelera de PhotoVault")
+        self.setMinimumSize(620, 440); self.setStyleSheet(DARK_STYLE)
+
+        layout = QVBoxLayout(self); layout.setContentsMargins(16, 16, 16, 16); layout.setSpacing(10)
+        info = QLabel(
+            "Aquí quedan los registros que quitaste de PhotoVault, con sus etiquetas, "
+            f"durante {services.TRASH_KEEP_DAYS} días. Restaurar no recupera archivos del disco: "
+            "si mandaste un duplicado a la Papelera de Windows, recupéralo desde allí."
+        )
+        info.setWordWrap(True); info.setStyleSheet("color:#8888AA;font-size:11px;")
+        layout.addWidget(info)
+
+        self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
+        self.container = QWidget(); self.vbox = QVBoxLayout(self.container)
+        self.vbox.setSpacing(4); self.scroll.setWidget(self.container)
+        layout.addWidget(self.scroll, stretch=1)
+
+        btns = QHBoxLayout()
+        btn_empty = QPushButton("🗑  Vaciar papelera")
+        btn_empty.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;")
+        btn_empty.clicked.connect(self._empty)
+        btn_close = QPushButton("Cerrar"); btn_close.clicked.connect(self.accept)
+        btns.addWidget(btn_empty); btns.addStretch(); btns.addWidget(btn_close)
+        layout.addLayout(btns)
+        self._refresh()
+
+    def _refresh(self):
+        for i in reversed(range(self.vbox.count())):
+            w = self.vbox.itemAt(i).widget()
+            if w: w.deleteLater()
+        batches = services.list_trash()
+        if not batches:
+            lbl = QLabel("La papelera está vacía."); lbl.setStyleSheet("color:#666;")
+            self.vbox.addWidget(lbl)
+        for b in batches:
+            row = QWidget(); row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
+            hl = QHBoxLayout(row); hl.setContentsMargins(8, 6, 8, 6)
+            when = _local_time(b.deleted_at)
+            tagged = f" · {b.tagged:,} con etiquetas" if b.tagged else ""
+            lbl = QLabel(f"<b>{html.escape(b.reason)}</b><br>"
+                         f"<span style='color:#888;font-size:11px;'>{when} · "
+                         f"{b.count:,} registros{tagged}</span>")
+            lbl.setTextFormat(Qt.TextFormat.RichText); lbl.setWordWrap(True)
+            hl.addWidget(lbl, stretch=1)
+            btn_r = QPushButton("↺ Restaurar"); btn_r.setFixedWidth(95)
+            btn_r.setStyleSheet("color:#4AFF9E;border:1px solid #4AFF9E;")
+            btn_r.clicked.connect(lambda _, bb=b: self._restore(bb))
+            btn_d = QPushButton("✕"); btn_d.setFixedSize(28, 28)
+            btn_d.setToolTip("Eliminar definitivamente este lote")
+            btn_d.setStyleSheet("color:#FF4A4A;border:1px solid #FF4A4A;border-radius:4px;padding:0;")
+            btn_d.clicked.connect(lambda _, bb=b: self._delete(bb))
+            hl.addWidget(btn_r); hl.addWidget(btn_d)
+            self.vbox.addWidget(row)
+        self.vbox.addStretch()
+
+    def _restore(self, b: TrashBatch):
+        restored, merged = services.restore_trash_batch(b.batch_id)
+        msg = f"Restaurados: {restored:,}"
+        if merged:
+            msg += f"\nYa estaban indexados de nuevo (se les devolvieron las etiquetas): {merged:,}"
+        QMessageBox.information(self, "Restaurado", msg)
+        self._refresh()
+
+    def _delete(self, b: TrashBatch):
+        if QMessageBox.question(
+            self, "Eliminar definitivamente",
+            f"¿Eliminar definitivamente este lote ({b.count:,} registros)?\n"
+            "Sus etiquetas ya no se podrán recuperar.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            services.delete_trash_batch(b.batch_id); self._refresh()
+
+    def _empty(self):
+        n = services.count_trash()
+        if not n:
+            return
+        if QMessageBox.question(
+            self, "Vaciar papelera",
+            f"¿Eliminar definitivamente los {n:,} registros de la papelera?\n"
+            "Sus etiquetas ya no se podrán recuperar.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes:
+            services.empty_trash(); self._refresh()
+
+
+def _local_time(sqlite_utc: str) -> str:
+    """'YYYY-MM-DD HH:MM:SS' en UTC (datetime('now') de SQLite) → hora local legible."""
+    try:
+        dt = datetime.strptime(sqlite_utc, "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        return dt.astimezone().strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        return sqlite_utc
 
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
@@ -1914,7 +2329,7 @@ class MainWindow(QMainWindow):
         for label, slot in [
             ("＋ Indexar carpeta",     self._open_index_dialog),
             ("🏷  Gestionar etiquetas", self._open_tag_manager),
-            ("🗂  Des-indexar",         self._open_deindex_dialog),
+            ("🗂  Carpetas",            self._open_deindex_dialog),
             ("📊  Estadísticas",        self._open_stats_dialog),
             ("🔍  Duplicados",          self._open_duplicates_dialog),
             ("⚙  Configuración",       self._open_settings_dialog),
@@ -2348,6 +2763,11 @@ def _startup() -> bool:
             f"No se hicieron cambios. Detalles en:\n{logging_setup.LOG_FILE}",
         )
         return False
+    try:
+        services.purge_old_trash()
+    except Exception:
+        # No es crítico: la papelera se vaciará en otro arranque
+        logger.exception("No se pudo limpiar la papelera interna")
     return True
 
 
