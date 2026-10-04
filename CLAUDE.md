@@ -51,6 +51,7 @@ models.py           Dataclasses tipadas + enums de ordenamiento
 indexer.py          Escaneo de carpetas, extracción de fecha/dimensiones/duración
 thumbnail_cache.py  Caché persistente de miniaturas en disco
 backup.py           Backups rotativos de la DB (diario + pre-migración)
+xmp_sidecar.py      Leer/escribir etiquetas en archivos .xmp junto a las fotos
 logging_setup.py    Logging a archivo + captura global de excepciones
 tests/              Suite de pytest (conftest.py aísla DB, backups y caché en tmp)
 pyproject.toml      Config de pytest, ruff y mypy
@@ -68,6 +69,7 @@ main.py (UI)  →  services.py  →  database.py  →  SQLite
                      ↓                ↓
               thumbnail_cache.py   backup.py
               indexer.py
+              xmp_sidecar.py
 ```
 
 **Reglas:**
@@ -98,7 +100,7 @@ main.py (UI)  →  services.py  →  database.py  →  SQLite
 - Todo hilo worker (`QThread`) debe llamar `db.close_connection()` al terminar (ya lo hacen `IndexWorker`, `ThumbnailLoader`, `MD5Worker`).
 - Escrituras con `with transaction() as conn:` (commit/rollback automático).
 
-### Esquema (versión 1)
+### Esquema (versión 2)
 
 ```sql
 photos(id PK, path UNIQUE, filename, media_type, year, month, filesize,
@@ -107,15 +109,30 @@ tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden)
 photo_tags(photo_id → photos ON DELETE CASCADE, tag_id → tags ON DELETE CASCADE,
            PK(photo_id, tag_id))
 categories(name PK COLLATE NOCASE)
-app_settings(key PK, value)      -- flags internos, p. ej. 'seeded'
+app_settings(key PK, value)      -- flags internos y preferencias
+deleted_photos(id PK, batch_id, reason, deleted_at, path,   -- v2: papelera interna
+               photo_json, tags_json)
 ```
 
-Índices: `photos(year)`, `photos(month)`, `photos(md5)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`.
+Índices: `photos(year)`, `photos(month)`, `photos(md5)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`.
+
+Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`.
 (La DB real tiene además una columna sobrante `photos.sidebar_hidden` de alguna versión vieja; es inofensiva.)
 
 - `tags.hidden = 1` → las fotos con ese tag **no aparecen** en la galería.
 - `tags.sidebar_hidden = 1` → el tag no aparece en el panel de filtros.
-- ⚠️ `ON DELETE CASCADE`: borrar/des-indexar una foto **borra sus etiquetas para siempre**.
+- ⚠️ `ON DELETE CASCADE`: borrar una fila de `photos` borra sus etiquetas. Por eso **todo borrado de fotos pasa por `db.delete_photos(ids, reason)`**, que antes copia registro + etiquetas a `deleted_photos` en la misma transacción. Nunca hacer `DELETE FROM photos` directo (excepción: `apply_relocation` al fusionar, donde las etiquetas ya se pasaron al otro registro).
+
+### Papelera interna
+- `delete_photos(ids, reason)`: un lote (`batch_id` uuid) por operación; `reason` es texto para el usuario ("Carpeta des-indexada: …").
+- `restore_trash_batch(batch_id)` → `(restaurados, fusionados)`: si la ruta ya volvió a indexarse, le suma las etiquetas; los tags borrados se recrean con la categoría/color **del momento del borrado**.
+- `services.purge_old_trash()` corre en `_startup()` y elimina lo que tenga más de `TRASH_KEEP_DAYS` (30) días.
+- No guarda tags borrados con "Eliminar etiqueta" (eso se confirma mostrando cuántas fotos la tienen).
+
+### Reubicar (cambiar prefijo de ruta)
+- `get_relocation_plan(old, new)` → `[(photo_id, ruta_nueva, id_existente)]`; `apply_relocation(plan)` → `(movidos, fusionados)`.
+- `services.preview_relocation()` revisa en disco una muestra de 25 rutas nuevas (`looks_right` si existen ≥ 50 %) para detectar errores de tipeo. La UI exige vista previa antes de aplicar y pide confirmación extra si `looks_right` es falso.
+- Si la ruta nueva ya estaba indexada (se re-indexó), se fusionan: etiquetas al registro existente y el viejo se quita.
 
 ### Filtros de consulta
 `get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (carpeta y subcarpetas), `untagged_only`, más `limit/offset/sort_field/sort_order`.
@@ -123,7 +140,7 @@ app_settings(key PK, value)      -- flags internos, p. ej. 'seeded'
 **Filtro de carpeta:** siempre con `folder_like_pattern(folder)` + `LIKE ? ESCAPE '!'`. Normaliza la ruta, agrega el separador final (`D:\Fotos` no incluye `D:\Fotos2`) y escapa `%`/`_`. El escape es `!` porque `\` es el separador de Windows. Nunca volver a `LIKE folder + '%'`.
 
 ### Configuración del usuario
-`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `page_size`.
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `page_size`, `xmp_sidecars` (`"1"` = activado).
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -247,7 +264,10 @@ Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML u
 | `EditTagDialog` | Cambiar nombre, categoría y color; avisa si el nombre ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
 | `IndexDialog` | Indexar carpeta en hilo; muestra nuevas/actualizadas/errores; al cerrar durante la indexación pregunta y cancela. |
-| `DeindexDialog` | Quitar registros de una carpeta (y subcarpetas; confirma con n.º de registros y cuántos tienen tags) o buscar archivos faltantes: **buscar en hilo → mostrar resumen → confirmar → borrar**. |
+| `DeindexDialog` ("🗂 Carpetas") | Lista de carpetas con **Reubicar** y **Eliminar** (a la papelera; confirma con n.º de registros/tags); buscar archivos faltantes (**buscar en hilo → resumen → confirmar → papelera**); botones *Reubicar carpeta o unidad…* y *Papelera de PhotoVault (N)*. |
+| `RelocateDialog` | Ruta vieja (combo con las unidades indexadas y si están disponibles) → ruta nueva; vista previa obligatoria con comprobación en disco. |
+| `TrashDialog` | Lotes de la papelera interna: restaurar, eliminar lote, vaciar. |
+| `SettingsDialog` | (además) opción `.xmp`, *Escribir .xmp ahora*, *Importar desde .xmp*. |
 
 ### Archivos faltantes — protección contra pérdida de datos
 `services.find_missing_files()` agrupa por unidad (`Path.anchor`) y **no incluye**:
@@ -261,13 +281,28 @@ Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existe
 - Paleta: fondo `#0D0D1A`, paneles `#13131F` / `#1E1E2E`, bordes `#2D2D3F` / `#3A3A5A`, acento `#4A9EFF`, peligro `#FF4A4A`, advertencia `#FFD700`.
 - Mantener esta paleta en cualquier UI nueva.
 
-### Formato de exportación de tags (JSON)
+### Formato de exportación de tags (JSON, versión 2)
 ```json
-{ "version": 1,
+{ "version": 2, "app": "PhotoVault", "exported_at": "2026-10-04T12:00:00",
   "tags": [{"name": "...", "category": "...", "color": "#RRGGBB", "hidden": false, "sidebar_hidden": false}],
-  "categories": ["..."] }
+  "categories": ["..."],
+  "assignments": [{"path": "G:\\...\\a.jpg", "filename": "a.jpg", "filesize": 123, "tags": ["x", "y"]}] }
 ```
-La importación solo crea tags que no existan; nunca sobrescribe. ⚠️ No incluye las asignaciones foto↔tag (fase 2).
+- Se sigue aceptando la versión 1 (sin `assignments`).
+- La importación solo crea tags que no existan (nunca sobrescribe) y **solo agrega** asignaciones, nunca quita.
+- Emparejamiento de fotos: ruta exacta → si no, `(nombre, tamaño)` cuando hay **una sola** coincidencia (cambio de unidad/carpeta). Si hay varias, no adivina (`photos_missing`).
+- La UI pregunta si importar las asignaciones (Sí / No / Cancelar).
+
+### Sidecars XMP (`xmp_sidecar.py`)
+- Opcional (Configuración, desactivado por defecto). Con la opción activa, `services._sync_sidecars(ids)` se llama tras **cada** función que cambia etiquetas (`add_tag`, `add_tag_by_id`, `remove_tag`, `bulk_*`, `update_tag`, `delete_tag`, `rename/delete_category`, `import_tags`). Si agregas otra función que cambie etiquetas, llama `_sync_sidecars` también.
+- Escribe `<foto>.<ext>.xmp` (digiKam/darktable); lee también `<foto>.xmp` (Lightroom). `dc:subject` + `lr:hierarchicalSubject` (`categoria|tag`).
+- Marca `photovault:managed="True"`: **solo se modifican/borran sidecars propios**; uno de otro programa nunca se toca (`SKIPPED_FOREIGN`). Sin etiquetas → se borra el propio.
+- No crea carpetas (si la de la foto no existe → `ERROR`, p. ej. disco desconectado). Escribe a `.tmp` y renombra.
+- `sync_all_sidecars` (escribir todo) e `import_from_sidecars` (leer los .xmp de todas las fotos indexadas, propios o ajenos) corren con `run_with_progress`.
+- ⚠️ Privacidad: los nombres de todas las etiquetas (también las de contenido oculto) quedan visibles junto a las fotos; la UI lo advierte.
+
+### Tareas largas genéricas
+`run_with_progress(parent, título, texto, fn)` corre `fn(progress_callback=, should_stop=)` en un `TaskWorker` con `QProgressDialog` cancelable y un `QEventLoop` (la UI sigue respondiendo). Devuelve el resultado (parcial si se canceló) o `None` si hubo error (ya mostrado). Úsalo para nuevas funciones de `services` que sigan esa firma.
 
 ---
 
@@ -328,8 +363,8 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 
 El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
-1. **Des-indexar / faltantes borran etiquetas para siempre** (CASCADE). Ahora se confirma mostrando cuántas tienen tags, pero no hay forma de recuperarlas salvo un backup → fase 2 (#14 exportar asignaciones, #17 papelera interna).
-2. **Cambiar la letra de unidad** obliga a re-indexar y se pierden las etiquetas → fase 2 (#15).
+1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
+2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
 3. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces (EXIF + tamaño); `get_photos_for_tagging` con `limit=99_999`; `get_indexed_folders` carga todas las rutas en Python → fase 4.
 4. `QuickTagWindow` y `PhotoDetailDialog` cargan imágenes en el hilo de UI (con `load_preview_pixmap` ya es rápido, pero un HEIC grande sin caché tarda) → fase 5/7.
 5. `SettingsDialog._clear_cache` borra el caché con `shutil.rmtree` en el hilo de UI y sin confirmar (es regenerable, pero con 170k miniaturas tarda).
@@ -359,3 +394,7 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - Nombres con `&`/`<` rompían el SVG y los `QLabel` → `html.escape` / `PlainText`.
 - Tamaño de página no persistía; tags escondidos del sidebar no se podían restaurar; tags no se podían editar.
 - Todas las miniaturas de video caían en una sola subcarpeta `v_/` del caché.
+- Des-indexar / faltantes / duplicados borraban etiquetas para siempre → papelera interna (`deleted_photos`).
+- Cambiar la letra de la unidad obligaba a re-indexar y perder etiquetas → Reubicar.
+- El JSON exportado no incluía las asignaciones foto↔etiqueta → formato v2.
+- `preview_relocation("")` no fallaba porque `normpath("")` es `"."` → validar antes de normalizar.

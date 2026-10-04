@@ -49,14 +49,18 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 2 — Protección de datos → v1.2
+## Fase 2 — Protección de datos → v1.2 ✅
 
-- [ ] #14 ⭐ [M] Exportar/importar asignaciones foto↔tag (backup completo del etiquetado)
-- [ ] #15 ⭐ [M] Reubicar carpeta/unidad (`D:\Fotos` → `E:\Fotos`) sin perder etiquetas
-- [ ] #16 [M] Sidecars XMP opcionales
-- [ ] #17 [B] ~~Advertir pérdida de etiquetas al des-indexar~~ (hecho en fase 1) / papelera interna
+- [x] #14 ⭐ [M] Exportar/importar asignaciones foto↔tag (JSON v2; empareja por ruta o por nombre+tamaño)
+- [x] #15 ⭐ [M] Reubicar carpeta/unidad sin perder etiquetas (vista previa con comprobación en disco; fusiona si ya se re-indexó)
+- [x] #16 [M] Sidecars XMP opcionales (escribir, sincronizar todo, importar desde .xmp propios y de otros programas)
+- [x] #17 [B] Papelera interna de 30 días (migración v2): des-indexar, faltantes y duplicados se pueden restaurar con sus etiquetas
+- [x] *(extra)* `run_with_progress`: tareas largas con progreso y Cancelar
+- [x] 37 tests nuevos (130 en total); verificado contra copia de la DB real
 
-**Hecho cuando:** puedes cambiar de disco o reinstalar el PC sin perder nada.
+**Hecho cuando:** puedes cambiar de disco o reinstalar el PC sin perder nada. ✓
+
+**Recomendado para el usuario:** *Gestionar etiquetas → Exportar JSON* y guardar el archivo fuera del PC (USB/nube).
 
 ---
 
