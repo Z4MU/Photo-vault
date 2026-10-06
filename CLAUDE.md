@@ -101,13 +101,14 @@ main.py → ui/ → services.py → database.py → SQLite
 
 ## 4. Modelos (`models.py`)
 
-- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5`. Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
+- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5, mtime`. `mtime` es el del archivo al indexarlo (None = registro de antes de v3 aún no re-indexado). Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
 - `Tag` — `id, name, category, color, hidden, sidebar_hidden`.
 - `GalleryPage` — `photos, total, offset, limit, sort_field, sort_order` + `page_number`, `total_pages`, `has_prev`, `has_next`.
 - `Stats` — `total_photos, total_tags, years, by_month, by_type, top_tags`.
 - `DuplicateGroup` — `md5, photos` + `size`, `wasted_bytes`.
 - `SortField` (`DATE`, `FILENAME`, `FILESIZE`, `ADDED_AT`) y `SortOrder` (`ASC`, `DESC`).
 - `sort_to_sql(field, order)` traduce a SQL usando el **allowlist `_SORT_SQL`**. Nunca interpolar ordenamiento desde input del usuario.
+  - Todo orden termina en `p.id` (paginación estable con nombres/tamaños repetidos) y ASC/DESC son exactamente inversos, para que un índice sirva a ambos. Fecha: `year, month, filename, id`.
 
 ---
 
@@ -115,15 +116,17 @@ main.py → ui/ → services.py → database.py → SQLite
 
 ### Conexiones
 - **Una conexión por hilo** con `threading.local()` (`get_connection()`).
-- PRAGMAs: `journal_mode=WAL`, `foreign_keys=ON`, `cache_size=-8000`.
+- PRAGMAs: `journal_mode=WAL`, `foreign_keys=ON`, `cache_size=-32000`, `synchronous=NORMAL` (seguro con WAL; mucho más rápido al escribir), `temp_store=MEMORY`.
 - Todo hilo worker (`QThread`) debe llamar `db.close_connection()` al terminar (ya lo hacen `IndexWorker`, `ThumbnailLoader`, `MD5Worker`).
 - Escrituras con `with transaction() as conn:` (commit/rollback automático).
 
-### Esquema (versión 2)
+### Esquema (versión 3)
 
 ```sql
 photos(id PK, path UNIQUE, filename, media_type, year, month, filesize,
-       width, height, duration, md5, added_at)
+       width, height, duration, md5, added_at,
+       mtime REAL,                                   -- v3: indexación incremental
+       folder GENERATED ALWAYS AS (rtrim(path, replace(path,'\',''))) VIRTUAL)  -- v3
 tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden)
 photo_tags(photo_id → photos ON DELETE CASCADE, tag_id → tags ON DELETE CASCADE,
            PK(photo_id, tag_id))
@@ -133,9 +136,12 @@ deleted_photos(id PK, batch_id, reason, deleted_at, path,   -- v2: papelera inte
                photo_json, tags_json)
 ```
 
-Índices: `photos(year)`, `photos(month)`, `photos(md5)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`.
+Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
 
-Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`.
+Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real).
+
+- `photos.folder` es una columna **calculada** (no se escribe nunca): la carpeta de la foto con la `\` final. `PRAGMA table_info` no la muestra; `_columns()` usa `table_xinfo`.
+- El `upsert` pone `md5 = NULL` si cambió el tamaño o el `mtime` (antes un md5 viejo sobrevivía a cambios del archivo).
 (La DB real tiene además una columna sobrante `photos.sidebar_hidden` de alguna versión vieja; es inofensiva.)
 
 - `tags.hidden = 1` → las fotos con ese tag **no aparecen** en la galería.
@@ -205,8 +211,12 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 
 ## 8. Indexación (`indexer.py`)
 
-- `index_folder(folder, progress_callback)` recorre recursivamente y hace `upsert_photo` (ON CONFLICT(path) actualiza todo, incluidos `width/height`).
-- Devuelve `(nuevas, actualizadas, errores)`; acepta `should_stop()` para cancelar.
+- `index_folder(folder, progress_callback, should_stop, force=False)` → `IndexResult(added, updated, unchanged, errors, cancelled, new_ids)`.
+- **Listado:** `scan_media_files()` con `os.scandir` (en Windows el tamaño y el mtime vienen en el listado; antes `rglob`+`is_file`+`stat`). Las rutas salen con el mismo formato que `str(Path(...))`, aunque la carpeta llegue con `/` (test: `test_rutas_iguales_a_las_de_versiones_anteriores`). **Si cambia el formato de las rutas, la DB se duplicaría.**
+- **Incremental:** con `get_index_state(folder)` → `{ruta: (tamaño, mtime)}`; mismo tamaño y mtime = `unchanged`, no se abre el archivo. `force=True` relee todo.
+- **Registros de antes de v3** (`mtime` NULL) con el mismo tamaño: solo se les anota el mtime (`set_mtimes`), sin abrir el archivo. Primera re-indexación de `G:\Fotos` (171.840): ~2 s; sin esto, ~90 min.
+- **Una sola apertura por imagen** (`_read_image_info`: EXIF + tamaño); escritura en lotes de `BATCH_SIZE` (500) con `upsert_photos` en una transacción por lote. Al cancelar se guarda lo leído.
+- Medido con la colección real: archivo sin cambios 0,06 ms; releído 2,6 ms (antes 31 ms en frío).
 - Fecha, en este orden: EXIF (solo imágenes) → nombre del archivo → nombre de la carpeta padre → `mtime`.
   - EXIF con prioridad: `DateTimeOriginal` (IFD Exif) → `DateTimeDigitized` → `DateTime` (IFD0, es la fecha de *modificación*: último recurso). Se usa `img.getexif()` + `get_ifd(0x8769)`, no `_getexif()`.
   - Las fechas ya guardadas con la regla vieja se corrigen al re-indexar la carpeta.
@@ -227,7 +237,9 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
   - Cada tamaño (100 duplicados, 200 galería, 480 etiquetado rápido/videos) es un archivo distinto.
   - **`THUMB_VERSION`**: subirlo cuando cambie la forma de generar miniaturas → invalida todo el caché. v2 = orientación EXIF + tamaño en el nombre.
 - Aplica `ImageOps.exif_transpose` (orientación EXIF de fotos de celular).
-- API: `get_thumbnail(path, size)`, `get_video_thumbnail(path, size)`, `purge_orphans(known_paths)`, `cache_size_mb()`, `CACHE_DIR`.
+- API: `get_thumbnail(path, size, mtime=None)`, `get_video_thumbnail(...)`, **`get_photo_thumbnail(photo, size)`** (elige imagen/video y usa `photo.mtime`), `is_cached(...)`, `purge_orphans([(ruta, mtime)])`, `cache_size_mb()`, `CACHE_DIR`.
+- **Pasar siempre el `mtime` de la DB** (o usar `get_photo_thumbnail`): sin él se consulta el archivo en el disco de la colección por cada miniatura. Con él, una miniatura en caché tarda 0,17 ms (antes 5,6 ms). Con el mismo mtime la clave es idéntica a la de antes, así que el caché existente sigue valiendo.
+- `services.pregenerate_thumbnails(ids | None)`: genera las que falten con `THUMB_WORKERS` hilos (Pillow suelta el GIL: ×2,3 medido), por tandas cancelables; la comprobación de caché también va dentro de los hilos.
 - `purge_orphans` borra también las miniaturas del formato anterior (sin `_<size>`).
 
 ---
@@ -245,8 +257,8 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 
 ### Hilos
 Todos heredan de `StoppableThread` (`stop()`, `is_stopping()`):
-- `IndexWorker` — indexación; `completed(nuevas, actualizadas, errores)`.
-- `ThumbnailLoader` — miniaturas de la página actual; emite `loaded(photo_id, QImage)`.
+- `IndexWorker` — indexación; `completed(IndexResult)`.
+- `ThumbnailLoader(photos, prefetch)` — miniaturas de la página en paralelo (pool de `THUMB_WORKERS`); emite `loaded(photo_id, QImage)` a medida que están; después deja en caché de disco las de `prefetch` (la página siguiente) sin emitir.
 - `MD5Worker` — hashes faltantes; `completed(n)`.
 - `MissingFilesWorker` — busca archivos faltantes; `completed(MissingReport)`. No borra nada.
 
@@ -268,8 +280,18 @@ Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML u
 
 ### Rendimiento de la galería
 - Widgets de miniatura se crean en lotes de 10 con un `QTimer(0)` (`_add_next_batch`) para no congelar la UI.
-- Paginación (default 100 por página, configurable 10–500; se guarda en `app_settings.page_size` vía `services.get/set_page_size`).
+- **`QPixmapCache`** (150 MB, clave `thumb:<id>:<mtime>`): las miniaturas ya mostradas se pintan al instante al volver a una página; el loader solo pide las que faltan.
+- **Precarga:** al terminar una página se generan en disco las miniaturas de la siguiente (`services.get_gallery_photos`, sin contar el total).
+- **Búsqueda con debounce** de 300 ms (`SEARCH_DEBOUNCE_MS`); Enter busca ya. Antes: una consulta por tecla.
+- Paginación (default 100 por página, configurable 10–500; se guarda en `app_settings.page_size` vía `services.get/set_page_size`). Con los índices de v3, la página 1000 tarda 4 ms: no hace falta paginación por keyset (#23 descartado tras medir).
 - `resizeEvent` con debounce de 400 ms; solo recarga si cambia el número de columnas.
+- Sidebar: `services.get_totals()` (2 COUNT) en lugar de `get_stats()` completo.
+
+### Tareas en segundo plano (`MainWindow`)
+- Una a la vez (`_bg_worker`, `_bg_kind` = `"index"` | `"thumbs"`), con progreso y **Cancelar** en la barra de estado (`TaskStatusWidget`). Se puede seguir usando la app.
+- `start_indexing(folder)`: `IndexDialog` solo elige la carpeta y emite `start_requested`. Al terminar recarga y, si hubo fotos nuevas, lanza `start_thumbnail_generation(new_ids)`. La indexación tiene prioridad: cancela una generación de miniaturas en curso.
+- `start_thumbnail_generation(None)` = toda la colección (botón *Generar todas* en Configuración); devuelve False si hay otra tarea.
+- Al cerrar con una indexación en curso, pregunta; lo ya indexado se conserva.
 
 ### Ventana principal (`MainWindow`)
 - Sidebar: botones de acciones, botón destacado **⚡ Etiquetado rápido**, filtros por tag agrupados por categoría (colapsables), botón 👁 para esconder tags del sidebar, botón **"👁 Mostrar escondidas (N)"** (solo visible si hay escondidas) que las muestra en cursiva con 🚫 para restaurarlas, estadísticas.
@@ -284,16 +306,16 @@ Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML u
 | `QuickTagSetupDialog` | Elegir conjunto a etiquetar: carpeta indexada + tags requeridos + "solo sin etiquetar", con conteo en vivo. |
 | `QuickTagWindow` | Etiquetado por teclado: `←/→` navegar, `Space` saltar, `1–9` atajos de tag, `Ctrl+Z` deshacer (historial completo), búsqueda de tags, `Esc` salir. Al terminar la última foto regresa a la galería y esta se recarga. |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
-| `DuplicatesDialog` | Calcula MD5 en hilo (cancelable), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
+| `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
 | `SettingsDialog` | Fotos por página, tamaño de caché, limpiar caché, purgar huérfanos. |
 | `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/eliminar tags (confirma con el n.º de fotos), flags hidden, exportar/importar JSON. |
 | `EditTagDialog` | Cambiar nombre, categoría y color; avisa si el nombre ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
-| `IndexDialog` | Indexar carpeta en hilo; muestra nuevas/actualizadas/errores; al cerrar durante la indexación pregunta y cancela. |
+| `IndexDialog` | Solo elige la carpeta y emite `start_requested(folder)`; la indexación corre en `MainWindow` (segundo plano). Con `busy=True` deshabilita el botón. |
 | `DeindexDialog` ("🗂 Carpetas") | Lista de carpetas con **Reubicar** y **Eliminar** (a la papelera; confirma con n.º de registros/tags); buscar archivos faltantes (**buscar en hilo → resumen → confirmar → papelera**); botones *Reubicar carpeta o unidad…* y *Papelera de PhotoVault (N)*. |
 | `RelocateDialog` | Ruta vieja (combo con las unidades indexadas y si están disponibles) → ruta nueva; vista previa obligatoria con comprobación en disco. |
 | `TrashDialog` | Lotes de la papelera interna: restaurar, eliminar lote, vaciar. |
-| `SettingsDialog` | (además) opción `.xmp`, *Escribir .xmp ahora*, *Importar desde .xmp*. |
+| `SettingsDialog` | (además) opción `.xmp`, *Escribir .xmp ahora*, *Importar desde .xmp*, *Generar todas* (miniaturas en segundo plano); *Purgar huérfanos* corre con `run_with_progress`. |
 
 ### Archivos faltantes — protección contra pérdida de datos
 `services.find_missing_files()` agrupa por unidad (`Path.anchor`) y **no incluye**:
@@ -400,7 +422,9 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-3. Rendimiento: búsqueda sin debounce; commit por archivo al indexar; cada imagen se abre 2 veces (EXIF + tamaño); `get_photos_for_tagging` con `limit=99_999`; `get_folder_counts` carga todas las rutas en Python → fase 4.
+3. `get_photos_for_tagging` carga todas las fotos coincidentes (843 ms para 171k); navegar por ids bajo demanda llegará con la fase 5/7.
+10. Crear los 100 widgets de una página tarda ~130 ms aunque las miniaturas estén en memoria → galería virtualizada (fase 5, #18).
+11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
 9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
 4. `QuickTagWindow` y `PhotoDetailDialog` cargan imágenes en el hilo de UI (con `load_preview_pixmap` ya es rápido, pero un HEIC grande sin caché tarda) → fase 5/7.
@@ -440,3 +464,8 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - `self.scroll` en diálogos tapaba `QWidget.scroll()` → `self.scroll_box`.
 - Un fallo al importar la UI cerraba el `.exe` sin dejar log → imports después de `setup_logging()`.
 - Error del cálculo de MD5 dejaba visible la barra de progreso.
+- Etiquetado rápido "sin etiquetar" cargaba solo 99.999 de 171.546 fotos (`limit=99_999` fijo) → `limit=-1`.
+- Un md5 viejo sobrevivía a cambios del archivo → el upsert lo invalida.
+- Paginación inestable con nombres repetidos (sin desempate) → `p.id` al final de cada orden.
+- Re-indexar releía todo (14 s por 457 archivos) → incremental por tamaño+mtime.
+- Pregenerar miniaturas revisaba el caché de 172k fotos sin poder cancelar → comprobación dentro de los hilos.

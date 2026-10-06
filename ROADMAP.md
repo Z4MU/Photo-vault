@@ -81,22 +81,41 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 4 — Rendimiento → v1.3
+## Fase 4 — Rendimiento → v1.3 ✅
+*Medido con una copia de la DB real (171.840 fotos en `G:`).*
 
-- [ ] #19 ⭐ [M] Indexación incremental (columna `mtime`)
-- [ ] #20 ⭐ [B] Indexación por lotes y una sola apertura por imagen
-- [ ] #65 [M] Indexación en segundo plano y cancelable
-- [ ] #21 [B] Debounce en la búsqueda
-- [ ] #22 [M] Búsqueda con FTS5
-- [ ] #23 [M] Paginación keyset
-- [ ] #28 [B] Índice compuesto para ordenar por fecha + `PRAGMA synchronous=NORMAL`
-- [ ] #24 [M] Miniaturas en paralelo (`QThreadPool`) + precarga
-- [ ] #25 [B] Caché en memoria (`QPixmapCache`)
-- [ ] #26 [M] Pre-generar miniaturas tras indexar
-- [ ] #27 [B] Duplicados: agrupar por tamaño primero, luego xxhash
-- [ ] #29 [B] Estadísticas y carpetas calculadas en SQL
+| Operación | Antes | Después |
+|---|---|---|
+| Galería, página 1 | 30 ms | 0,8 ms |
+| Galería, página 1000 (offset 100k) | 230 ms | 3,8 ms |
+| Búsqueda por nombre | 50 ms (por tecla) | 12 ms (una vez, con debounce) |
+| Lista de carpetas | 328 ms | 12 ms |
+| Lista de unidades | 517 ms | 86 ms |
+| Estadísticas | 116 ms | 76 ms |
+| Re-indexar 457 archivos sin cambios | 14,4 s | 0,03 s |
+| Primera re-indexación de todo `G:\Fotos` tras actualizar | ~90 min (estimado) | ~2 s |
+| Miniatura ya en caché | 5,6 ms | 0,17 ms |
+| Miniaturas en frío (mismas 80 fotos) | 35 ms/foto | 15 ms/foto (4 hilos) |
+| MD5 para duplicados | 171.840 archivos | 64.694 (solo tamaños repetidos) |
 
-**Hecho cuando:** re-indexar 100k archivos sin cambios tarda segundos y la UI nunca se congela.
+- [x] #19 ⭐ [M] Indexación incremental (columna `mtime`, migración v3); registros viejos solo reciben el mtime
+- [x] #20 ⭐ [B] `os.scandir`, una sola apertura por imagen, escritura por lotes de 500
+- [x] #65 [M] Indexación en segundo plano con progreso y Cancelar en la barra de estado
+- [x] #21 [B] Debounce de 300 ms en la búsqueda
+- [—] #22 [M] FTS5 — **descartado tras medir**: con índices y debounce, buscar tarda 12 ms
+- [—] #23 [M] Paginación keyset — **descartada tras medir**: la página 1000 tarda 4 ms
+- [x] #28 [B] Índices de orden (fecha, nombre, tamaño, agregado, carpeta) + `synchronous=NORMAL`
+- [x] #24 [M] Miniaturas en paralelo + precarga de la página siguiente
+- [x] #25 [B] `QPixmapCache` (150 MB): volver a una página no regenera nada
+- [x] #26 [M] Miniaturas de lo nuevo se generan solas tras indexar; botón *Generar todas*
+- [x] #27 [B] Duplicados: solo se hashean los archivos de tamaño repetido (xxhash no hizo falta: el disco es el límite)
+- [x] #29 [B] Carpetas (columna calculada indexada), unidades y totales en SQL
+- [x] *(bug)* Etiquetado rápido "sin etiquetar" solo cargaba 99.999 de 171.546 fotos
+- [x] *(bug)* El md5 no se invalidaba al cambiar el archivo
+- [x] *(bug)* Paginación inestable con nombres repetidos
+- [x] 22 tests nuevos (182 en total) + pruebas de humo con la DB real
+
+**Pendiente para el usuario:** indexar `G:\Fotos` una vez (≈2 s) para que todos los registros tengan `mtime`; hay 3 fotos nuevas sin indexar.
 
 ---
 
