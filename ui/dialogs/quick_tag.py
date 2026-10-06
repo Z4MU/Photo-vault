@@ -431,11 +431,8 @@ class QuickTagWindow(QDialog):
 
         # Imagen
         self.img_label.clear()
-        if photo.is_video:
-            jpeg = thumbnail_cache.get_video_thumbnail(photo.path, size=config.THUMB_SIZE_LARGE)
-        else:
-            # Para el modo rápido mostramos imagen a mayor resolución
-            jpeg = thumbnail_cache.get_thumbnail(photo.path, size=config.THUMB_SIZE_LARGE)
+        # Para el modo rápido mostramos imagen a mayor resolución
+        jpeg = thumbnail_cache.get_photo_thumbnail(photo, size=config.THUMB_SIZE_LARGE)
 
         if jpeg:
             pix = QPixmap()

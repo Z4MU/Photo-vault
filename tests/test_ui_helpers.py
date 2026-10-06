@@ -135,6 +135,62 @@ def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
     win.close()
 
 
+def test_cargador_de_miniaturas_en_paralelo_con_precarga(qapp, tmp_path, db_path):
+    import database as db
+    import thumbnail_cache as tc
+
+    db.init_db()
+    photos = []
+    for i in range(10):
+        p = tmp_path / f"{i}.jpg"
+        Image.new("RGB", (400, 300)).save(p)
+        db.upsert_photo(str(p), p.name, 2020, 1, p.stat().st_size, mtime=p.stat().st_mtime)
+    photos = db.get_photos(limit=-1)
+    page, nxt = photos[:6], photos[6:]
+
+    got: dict[int, tuple[int, int]] = {}
+    loader = workers.ThumbnailLoader(page, prefetch=nxt)
+    loader.loaded.connect(lambda pid, img: got.__setitem__(pid, (img.width(), img.height())))
+    loader.start()
+    assert loader.wait(20_000)
+    qapp.processEvents()
+
+    assert set(got) == {p.id for p in page}
+    assert all(max(wh) <= 200 for wh in got.values())
+    # La página siguiente quedó en el caché de disco, sin emitirse
+    assert all(tc.is_cached(p.path, mtime=p.mtime) for p in nxt)
+
+
+def test_index_dialog_pide_indexar_y_se_cierra(qapp, tmp_path):
+    from ui.dialogs.folders import IndexDialog
+
+    dlg = IndexDialog()
+    asked: list[str] = []
+    dlg.start_requested.connect(asked.append)
+    dlg.path_edit.setText(str(tmp_path))
+    dlg._start()
+    assert asked == [str(tmp_path)]
+    assert dlg.result() == IndexDialog.DialogCode.Accepted
+    busy = IndexDialog(busy=True)
+    assert not busy.btn_start.isEnabled()
+
+
+def test_barra_de_tarea(qapp):
+    from ui.widgets import TaskStatusWidget
+
+    w = TaskStatusWidget()
+    hits = []
+    w.cancel_clicked.connect(lambda: hits.append(1))
+    w.start("Indexando…")
+    assert not w.isHidden()
+    w.set_progress(5, 10, "5/10")
+    assert (w.bar.value(), w.bar.maximum()) == (5, 10)
+    w.btn_cancel.click()
+    assert hits == [1]
+    w.finish("listo", hide_after_ms=1)
+    assert w.btn_cancel.isHidden()
+
+
 def test_retire_thread_mantiene_vivo_hasta_terminar(qapp):
     class Lento(workers.StoppableThread):
         def run(self):

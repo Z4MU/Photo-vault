@@ -30,7 +30,6 @@ from models import TrashBatch
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 from ui.workers import (
-    IndexWorker,
     MissingFilesWorker,
     disconnect_all,
     retire_thread,
@@ -43,35 +42,22 @@ logger = logging.getLogger(__name__)
 
 
 class IndexDialog(QDialog):
-    indexing_done = pyqtSignal()
+    """
+    Elige la carpeta a indexar. La indexación la corre la ventana principal en
+    segundo plano (progreso en la barra de estado): este diálogo se cierra al
+    empezar y se puede seguir usando la app.
+    """
 
-    def __init__(self, parent=None):
+    start_requested = pyqtSignal(str)
+
+    def __init__(self, parent=None, busy: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Indexar carpeta")
-        self.setFixedSize(500, 200)
+        self.setFixedSize(520, 190)
         self.setStyleSheet(DARK_STYLE)
-        self.worker: IndexWorker | None = None
-        self._build_ui()
+        self._build_ui(busy)
 
-    def done(self, result: int):
-        if self.worker is not None and self.worker.isRunning():
-            if (
-                QMessageBox.question(
-                    self,
-                    "Indexación en curso",
-                    "La indexación sigue en curso. ¿Cancelarla?\n\nLo que ya se indexó se conserva.",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                )
-                != QMessageBox.StandardButton.Yes
-            ):
-                return
-            disconnect_all(self.worker.progress, self.worker.completed, self.worker.error)
-            retire_thread(self.worker)
-            self.worker = None
-            self.indexing_done.emit()  # Recargar lo que alcanzó a indexarse
-        super().done(result)
-
-    def _build_ui(self):
+    def _build_ui(self, busy: bool):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(10)
@@ -83,48 +69,32 @@ class IndexDialog(QDialog):
         row.addWidget(self.path_edit)
         row.addWidget(btn_b)
         layout.addLayout(row)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        layout.addWidget(self.progress)
-        self.status = QLabel("Listo para indexar.")
-        self.status.setStyleSheet("color:#8888AA;font-size:10px;")
-        layout.addWidget(self.status)
+        info = QLabel(
+            "Se indexa en segundo plano (verás el progreso abajo en la ventana). "
+            "Si la carpeta ya estaba indexada, solo se leen los archivos nuevos o modificados."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#8888AA;font-size:11px;")
+        layout.addWidget(info)
         self.btn_start = QPushButton("▶  Iniciar indexación")
         self.btn_start.clicked.connect(self._start)
+        if busy:
+            self.btn_start.setEnabled(False)
+            self.btn_start.setText("Ya hay una indexación en curso")
         layout.addWidget(self.btn_start)
 
     def _browse(self):
         f = QFileDialog.getExistingDirectory(self, "Seleccionar carpeta")
         if f:
-            self.path_edit.setText(f)
+            self.path_edit.setText(str(Path(f)))
 
     def _start(self):
         folder = self.path_edit.text().strip()
-        if not folder or not Path(folder).exists():
+        if not folder or not Path(folder).is_dir():
             QMessageBox.warning(self, "Error", "Selecciona una carpeta válida.")
             return
-        self.btn_start.setEnabled(False)
-        self.worker = IndexWorker(folder)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.completed.connect(self._on_completed)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
-
-    def _on_progress(self, current: int, total: int, path: str):
-        self.progress.setValue(int(current / total * 100) if total else 0)
-        self.status.setText(f"[{current}/{total}] {Path(path).name}")
-
-    def _on_completed(self, added: int, updated: int, errors: int):
-        self.status.setText(
-            f"✓ Listo: {added:,} nuevas, {updated:,} actualizadas, {errors:,} errores."
-            + ("  (detalles en el log)" if errors else "")
-        )
-        self.btn_start.setEnabled(True)
-        self.indexing_done.emit()
-
-    def _on_error(self, message: str):
-        QMessageBox.critical(self, "Error", message)
-        self.btn_start.setEnabled(True)
+        self.start_requested.emit(folder)
+        self.accept()
 
 
 # ─── Dialog: Des-indexar carpetas ─────────────────────────────────────────────

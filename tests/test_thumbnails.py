@@ -72,10 +72,34 @@ def test_purga_conserva_vigentes_y_borra_viejas(tmp_path):
     old.parent.mkdir(parents=True, exist_ok=True)
     old.write_bytes(b"x")
 
-    removed = tc.purge_orphans([str(a)])  # b ya no está indexada
+    removed = tc.purge_orphans([(str(a), None)])  # b ya no está indexada
 
     assert removed == 2  # la de b + la vieja
     assert len(list(tc.CACHE_DIR.rglob("*.jpg"))) == 2
+
+
+def test_con_mtime_de_la_db_no_consulta_el_disco(tmp_path, monkeypatch):
+    src = tmp_path / "foto.jpg"
+    Image.new("RGB", (300, 200)).save(src)
+    mtime = src.stat().st_mtime
+    first = tc.get_thumbnail(str(src))  # sin mtime: lo consulta
+
+    def no_stat(*a, **k):
+        raise AssertionError("no debía consultar el mtime del archivo")
+
+    monkeypatch.setattr(tc.os.path, "getmtime", no_stat)
+    # Mismo mtime que el del archivo → misma clave → acierto de caché
+    assert tc.get_thumbnail(str(src), mtime=mtime) == first
+    assert tc.is_cached(str(src), mtime=mtime)
+
+
+def test_purga_usa_el_mtime_de_la_db(tmp_path, monkeypatch):
+    src = tmp_path / "foto.jpg"
+    Image.new("RGB", (50, 50)).save(src)
+    mtime = src.stat().st_mtime
+    tc.get_thumbnail(str(src), mtime=mtime)
+    monkeypatch.setattr(tc.os.path, "getmtime", lambda *a: (_ for _ in ()).throw(AssertionError("stat")))
+    assert tc.purge_orphans([(str(src), mtime)]) == 0
 
 
 def test_videos_no_se_amontonan_en_una_carpeta(tmp_path):

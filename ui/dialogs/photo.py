@@ -57,7 +57,7 @@ class PhotoDetailDialog(QDialog):
             left.setMinimumWidth(500)
             ll = QVBoxLayout(left)
             ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = thumbnail_cache.get_video_thumbnail(self.photo.path, size=config.THUMB_SIZE_LARGE)
+            thumb = thumbnail_cache.get_photo_thumbnail(self.photo, size=config.THUMB_SIZE_LARGE)
             lbl = QLabel()
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             if thumb:

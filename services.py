@@ -28,6 +28,31 @@ StopCheck = Callable[[], bool]
 # ── Galería ───────────────────────────────────────────────────────────────────
 
 
+def get_gallery_photos(
+    tag_ids: list[int] | None = None,
+    search: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    sort_field: SortField = SortField.DATE,
+    sort_order: SortOrder = SortOrder.DESC,
+    folder: str | None = None,
+    untagged_only: bool = False,
+    hidden_tag_ids: set[int] | None = None,
+) -> list[Photo]:
+    """Solo las fotos de una página, sin contar el total (p. ej. para precargar la siguiente)."""
+    return db.get_photos(
+        tag_ids=tag_ids or None,
+        hidden_tag_ids=hidden_tag_ids if hidden_tag_ids is not None else db.get_hidden_tag_ids(),
+        search=search,
+        limit=limit,
+        offset=offset,
+        sort_field=sort_field,
+        sort_order=sort_order,
+        folder=folder,
+        untagged_only=untagged_only,
+    )
+
+
 def get_gallery_page(
     tag_ids: list[int] | None = None,
     search: str | None = None,
@@ -38,6 +63,8 @@ def get_gallery_page(
     folder: str | None = None,
     untagged_only: bool = False,
 ) -> GalleryPage:
+    if limit <= 0:
+        raise ValueError("limit debe ser positivo")
     hidden = db.get_hidden_tag_ids()
     total = db.get_photo_count(
         tag_ids=tag_ids or None,
@@ -46,16 +73,8 @@ def get_gallery_page(
         folder=folder,
         untagged_only=untagged_only,
     )
-    photos = db.get_photos(
-        tag_ids=tag_ids or None,
-        hidden_tag_ids=hidden,
-        search=search,
-        limit=limit,
-        offset=offset,
-        sort_field=sort_field,
-        sort_order=sort_order,
-        folder=folder,
-        untagged_only=untagged_only,
+    photos = get_gallery_photos(
+        tag_ids, search, limit, offset, sort_field, sort_order, folder, untagged_only, hidden
     )
     return GalleryPage(
         photos=photos,
@@ -73,9 +92,9 @@ def get_photos_for_tagging(
     untagged_only: bool = False,
 ) -> list[Photo]:
     """
-    Devuelve la lista completa de fotos para el modo etiquetado rápido.
-    Sin paginación — carga todos los IDs en memoria para permitir
-    navegación libre sin consultas adicionales.
+    Devuelve la lista COMPLETA de fotos para el modo etiquetado rápido
+    (sin paginación, para navegar libremente). Antes tenía limit=99_999 y con
+    la colección real (171k sin etiquetar) se perdían 71k fotos.
     """
     hidden = db.get_hidden_tag_ids()
     return db.get_photos(
@@ -83,7 +102,7 @@ def get_photos_for_tagging(
         hidden_tag_ids=hidden,
         folder=folder,
         untagged_only=untagged_only,
-        limit=99_999,
+        limit=-1,  # SQLite: LIMIT -1 = sin límite
         offset=0,
         sort_field=SortField.DATE,
         sort_order=SortOrder.ASC,
@@ -253,6 +272,11 @@ def delete_category(name: str):
 
 def get_stats() -> Stats:
     return db.get_stats()
+
+
+def get_totals() -> tuple[int, int]:
+    """(fotos, etiquetas): lo que muestra el sidebar, sin calcular todas las estadísticas."""
+    return db.get_totals()
 
 
 # ── Preferencias ──────────────────────────────────────────────────────────────
@@ -594,10 +618,7 @@ def apply_relocation(preview: RelocationPreview) -> tuple[int, int]:
 
 def get_indexed_roots() -> list[tuple[str, int, bool]]:
     """[(unidad, registros, disponible)] para sugerir qué reubicar."""
-    counts: dict[str, int] = defaultdict(int)
-    for _pid, path in db.get_all_photo_paths():
-        counts[_root_of(path)] += 1
-    return [(root, n, Path(root).exists()) for root, n in sorted(counts.items())]
+    return [(root, n, Path(root).exists()) for root, n in db.get_root_counts()]
 
 
 # ── Duplicados ────────────────────────────────────────────────────────────────
@@ -621,12 +642,14 @@ def compute_missing_md5s(
     progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
 ) -> int:
     """
-    Calcula el MD5 de las fotos que aún no lo tienen en la DB.
+    Calcula el MD5 de las fotos que aún no lo tienen en la DB, pero SOLO de
+    las que comparten tamaño con otra: un archivo de tamaño único no puede
+    tener duplicado exacto (en la colección real: 38 % de los archivos).
     progress_callback(current, total) se llama por cada archivo procesado.
     should_stop() se consulta antes de cada archivo para poder cancelar.
     Devuelve la cantidad de archivos procesados.
     """
-    pending = [p for p in db.get_all_photos_for_duplicates() if not p.md5]
+    pending = db.get_duplicate_candidates_without_md5()
     total = len(pending)
 
     for i, photo in enumerate(pending):
@@ -805,4 +828,60 @@ def purge_cache_orphans() -> int:
     Elimina del caché de miniaturas los archivos que ya no tienen registro en la DB.
     Devuelve la cantidad de archivos eliminados.
     """
-    return thumbnail_cache.purge_orphans([path for _pid, path in db.get_all_photo_paths()])
+    return thumbnail_cache.purge_orphans(db.get_paths_with_mtime())
+
+
+@dataclass
+class ThumbnailBatchResult:
+    generated: int = 0
+    already_cached: int = 0
+    failed: int = 0
+
+
+THUMB_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))
+
+
+def pregenerate_thumbnails(
+    photo_ids: list[int] | None = None,
+    progress_callback: ProgressCallback | None = None,
+    should_stop: StopCheck | None = None,
+) -> ThumbnailBatchResult:
+    """
+    Genera en segundo plano las miniaturas de galería que falten (de esas fotos,
+    o de toda la colección si photo_ids es None). Usa varios hilos: Pillow
+    suelta el GIL al decodificar, así que de verdad corre en paralelo.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    photos = db.get_photos_by_ids(photo_ids) if photo_ids is not None else db.get_photos(limit=-1)
+    result = ThumbnailBatchResult()
+    total = len(photos)
+    if progress_callback:
+        progress_callback(0, total)
+
+    def one(p: Photo) -> str:
+        # Comprobar el caché dentro del hilo: con registros sin mtime en la DB
+        # eso consulta el disco de la colección, y hacerlo antes para 170k fotos
+        # tardaba minutos sin poder cancelarse.
+        if thumbnail_cache.is_cached(p.path, video=p.is_video, mtime=p.mtime):
+            return "cached"
+        return "ok" if thumbnail_cache.get_photo_thumbnail(p) is not None else "failed"
+
+    chunk_size = THUMB_WORKERS * 8
+    with ThreadPoolExecutor(max_workers=THUMB_WORKERS) as pool:
+        # Tandas pequeñas: se puede cancelar en cualquier momento
+        for start in range(0, total, chunk_size):
+            if should_stop and should_stop():
+                break
+            chunk = photos[start : start + chunk_size]
+            for status in pool.map(one, chunk):
+                if status == "ok":
+                    result.generated += 1
+                elif status == "cached":
+                    result.already_cached += 1
+                else:
+                    result.failed += 1
+            if progress_callback:
+                progress_callback(min(start + len(chunk), total), total)
+    logger.info("Miniaturas pre-generadas: %s", result)
+    return result

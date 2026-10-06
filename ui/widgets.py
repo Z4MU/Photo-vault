@@ -5,13 +5,16 @@ Widgets reutilizables de la galería.
 
 import logging
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QLayout,
+    QProgressBar,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -55,6 +58,70 @@ class ClickableRow(QWidget):
     def mousePressEvent(self, event):
         self.clicked.emit()
         super().mousePressEvent(event)
+
+
+# ─── Barra de tarea en segundo plano ──────────────────────────────────────────
+
+
+class TaskStatusWidget(QWidget):
+    """
+    Progreso de una tarea en segundo plano (indexar, generar miniaturas) para
+    la barra de estado: texto + barra + botón Cancelar. Oculto si no hay tarea.
+    """
+
+    cancel_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(6, 0, 6, 0)
+        lay.setSpacing(8)
+        self.label = QLabel("")
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setStyleSheet("color:#8888AA;font-size:11px;")
+        self.bar = QProgressBar()
+        self.bar.setFixedWidth(180)
+        self.bar.setFixedHeight(14)
+        self.bar.setTextVisible(False)
+        self.btn_cancel = QPushButton("Cancelar")
+        self.btn_cancel.setStyleSheet(
+            "color:#FF4A4A;border:1px solid #FF4A4A;padding:1px 8px;font-size:11px;"
+        )
+        self.btn_cancel.clicked.connect(self.cancel_clicked)
+        lay.addWidget(self.label, stretch=1)
+        lay.addWidget(self.bar)
+        lay.addWidget(self.btn_cancel)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+        self.hide()
+
+    def start(self, text: str) -> None:
+        self._hide_timer.stop()
+        self.label.setText(text)
+        self.bar.setRange(0, 0)  # indeterminada hasta el primer progreso
+        self.bar.show()
+        self.btn_cancel.show()
+        self.btn_cancel.setEnabled(True)
+        self.show()
+
+    def set_progress(self, current: int, total: int, text: str) -> None:
+        if total > 0:
+            self.bar.setRange(0, total)
+            self.bar.setValue(current)
+        self.label.setText(text)
+
+    def set_cancelling(self) -> None:
+        self.btn_cancel.setEnabled(False)
+        self.label.setText("Cancelando…")
+
+    def finish(self, text: str, hide_after_ms: int = 10_000) -> None:
+        """Muestra el resultado unos segundos y se oculta."""
+        self.label.setText(text)
+        self.bar.hide()
+        self.btn_cancel.hide()
+        self.show()
+        self._hide_timer.start(hide_after_ms)
 
 
 # ─── Widget de miniatura ──────────────────────────────────────────────────────

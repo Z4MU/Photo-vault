@@ -16,8 +16,10 @@ Correcciones aplicadas:
 """
 
 import logging
+import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -175,15 +177,6 @@ def _extract_date_from_string(text: str):
     return None, None
 
 
-def _get_image_size(path: str):
-    try:
-        with Image.open(path) as img:
-            return img.width, img.height
-    except Exception as e:
-        logger.warning("No se pudo leer el tamaño de %s: %s", path, e)
-        return None, None
-
-
 def _get_video_info(path: str):
     """Extrae duración (segundos) y dimensiones del video usando opencv."""
     try:
@@ -214,69 +207,195 @@ def extract_video_thumbnail(path: str, size: int = 200) -> bytes | None:
     return get_video_thumbnail(path, size=size)
 
 
+def _read_image_info(path: str) -> tuple[int | None, int | None, int | None, int | None]:
+    """
+    (año, mes, ancho, alto) abriendo la imagen UNA sola vez. Image.open solo
+    lee la cabecera (no decodifica los píxeles), así que es barato.
+    """
+    try:
+        with Image.open(path) as img:
+            width, height = img.width, img.height
+            try:
+                exif = img.getexif()
+                if exif:
+                    exif_ifd = exif.get_ifd(_EXIF_IFD)
+                    for value in (
+                        exif_ifd.get(_TAG_DATETIME_ORIGINAL),
+                        exif_ifd.get(_TAG_DATETIME_DIGITIZED),
+                        exif.get(_TAG_DATETIME),
+                    ):
+                        parsed = _parse_exif_date(value)
+                        if parsed:
+                            return parsed[0], parsed[1], width, height
+            except Exception as e:
+                logger.debug("Sin fecha EXIF en %s: %s", path, e)
+            return None, None, width, height
+    except Exception as e:
+        logger.warning("No se pudo leer la imagen %s: %s", path, e)
+        return None, None, None, None
+
+
+@dataclass
+class ScannedFile:
+    path: str
+    size: int
+    mtime: float
+
+
+def scan_media_files(folder: str, should_stop: Callable[[], bool] | None = None) -> list[ScannedFile]:
+    """
+    Lista recursivamente las imágenes y videos de `folder` con su tamaño y mtime.
+    Usa os.scandir: en Windows el tamaño y la fecha vienen en el mismo listado
+    del directorio, sin consultar cada archivo (antes: rglob + is_file + stat).
+    Las rutas salen con el mismo formato que Path() (barras invertidas).
+    """
+    root = str(Path(folder))
+    out: list[ScannedFile] = []
+    stack = [root]
+    while stack:
+        if should_stop and should_stop():
+            break
+        current = stack.pop()
+        try:
+            entries = os.scandir(current)
+        except OSError as e:
+            logger.warning("No se pudo leer la carpeta %s: %s", current, e)
+            continue
+        with entries:
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif os.path.splitext(entry.name)[1].lower() in SUPPORTED_EXTENSIONS and entry.is_file():
+                        st = entry.stat()
+                        out.append(ScannedFile(entry.path, st.st_size, st.st_mtime))
+                except OSError as e:
+                    logger.warning("No se pudo leer %s: %s", entry.path, e)
+    out.sort(key=lambda f: f.path)
+    return out
+
+
+def read_media_info(f: ScannedFile) -> db.PhotoRecord:
+    """Lee fecha, dimensiones y duración de un archivo (la parte lenta de indexar)."""
+    filename = os.path.basename(f.path)
+    is_video = os.path.splitext(filename)[1].lower() in VIDEO_EXTENSIONS
+
+    year = month = width = height = None
+    duration = None
+    if is_video:
+        duration, width, height = _get_video_info(f.path)
+    else:
+        year, month, width, height = _read_image_info(f.path)
+
+    if not year:
+        year, month = _extract_date_from_string(filename)
+    if not year:
+        year, month = _extract_date_from_string(os.path.dirname(f.path))
+    if not year:
+        dt = datetime.fromtimestamp(f.mtime)
+        year, month = dt.year, dt.month
+
+    return db.PhotoRecord(
+        path=f.path,
+        filename=filename,
+        year=year,
+        month=month,
+        filesize=f.size,
+        width=width,
+        height=height,
+        media_type="video" if is_video else "image",
+        duration=duration,
+        mtime=f.mtime,
+    )
+
+
+@dataclass
+class IndexResult:
+    added: int = 0
+    updated: int = 0  # cambió en disco (o es de antes de la indexación incremental)
+    unchanged: int = 0  # mismo tamaño y fecha: no se volvió a leer
+    errors: int = 0
+    cancelled: bool = False
+    new_ids: list[int] = field(default_factory=list, repr=False)
+
+    @property
+    def total(self) -> int:
+        return self.added + self.updated + self.unchanged + self.errors
+
+
+BATCH_SIZE = 500
+
+
 def index_folder(
     folder: str,
     progress_callback: Callable[[int, int, str], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
-) -> tuple[int, int, int]:
+    force: bool = False,
+) -> IndexResult:
     """
     Escanea una carpeta recursivamente e indexa imágenes y videos.
+
+    Incremental: un archivo ya indexado con el mismo tamaño y mtime no se
+    vuelve a abrir (force=True lo relee todo). Escribe en lotes de BATCH_SIZE,
+    en una transacción por lote. Si se cancela, lo ya leído se guarda.
+
     progress_callback(current, total, filepath) se llama por cada archivo.
-    should_stop() se consulta antes de cada archivo para poder cancelar.
-    Devuelve (nuevas, actualizadas, errores).
+    should_stop() se consulta antes de cada archivo.
     """
-    root = Path(folder)
-    if not root.exists():
-        raise ValueError(f"La carpeta no existe: {root}")
+    if not Path(folder).exists():
+        raise ValueError(f"La carpeta no existe: {folder}")
 
-    all_files = [p for p in root.rglob("*") if p.suffix.lower() in SUPPORTED_EXTENSIONS and p.is_file()]
+    files = scan_media_files(folder, should_stop)
+    known = db.get_index_state(folder)
+    result = IndexResult()
+    pending: list[db.PhotoRecord] = []
+    # Registros de antes de v3 (mtime NULL) con el mismo tamaño: solo se les
+    # anota el mtime, sin abrir el archivo. Si no, la primera indexación tras
+    # actualizar tendría que releer toda la colección (~90 min con 172k fotos).
+    mtime_only: list[tuple[float, str]] = []
 
-    total = len(all_files)
-    added = updated = errors = 0
+    def flush() -> None:
+        db.upsert_photos(pending)
+        db.set_mtimes(mtime_only)
+        pending.clear()
+        mtime_only.clear()
 
-    for i, filepath in enumerate(all_files):
+    total = len(files)
+    for i, f in enumerate(files):
         if should_stop and should_stop():
-            logger.info("Indexación de %s cancelada en %d/%d", root, i, total)
+            result.cancelled = True
+            logger.info("Indexación de %s cancelada en %d/%d", folder, i, total)
             break
         if progress_callback:
-            progress_callback(i + 1, total, str(filepath))
+            progress_callback(i + 1, total, f.path)
 
+        previous = known.get(f.path)
+        if not force and previous is not None:
+            old_size, old_mtime = previous
+            if old_size == f.size and old_mtime == f.mtime:
+                result.unchanged += 1
+                continue
+            if old_mtime is None and old_size == f.size:
+                mtime_only.append((f.mtime, f.path))
+                result.unchanged += 1
+                if len(mtime_only) >= BATCH_SIZE:
+                    flush()
+                continue
         try:
-            path_str = str(filepath)
-            filename = filepath.name
-            filesize = filepath.stat().st_size
-            ext = filepath.suffix.lower()
-            is_video = ext in VIDEO_EXTENSIONS
-            media_type = "video" if is_video else "image"
-
-            # ── Fecha ──────────────────────────────────────────────────────
-            year = month = None
-            if not is_video:
-                year, month = _extract_date_from_exif(path_str)
-            if not year:
-                year, month = _extract_date_from_string(filename)
-            if not year:
-                year, month = _extract_date_from_string(str(filepath.parent))
-            if not year:
-                mtime = datetime.fromtimestamp(filepath.stat().st_mtime)
-                year, month = mtime.year, mtime.month
-
-            # ── Dimensiones / duración ─────────────────────────────────────
-            if is_video:
-                duration, width, height = _get_video_info(path_str)
-            else:
-                width, height = _get_image_size(path_str)
-                duration = None
-
-            existed = db.photo_exists(path_str)
-            db.upsert_photo(path_str, filename, year, month, filesize, width, height, media_type, duration)
-            if existed:
-                updated += 1
-            else:
-                added += 1
-
+            pending.append(read_media_info(f))
         except Exception as e:
-            errors += 1
-            logger.error("Error indexando %s: %s", filepath, e, exc_info=True)
+            result.errors += 1
+            logger.error("Error indexando %s: %s", f.path, e, exc_info=True)
+            continue
+        if previous is None:
+            result.added += 1
+        else:
+            result.updated += 1
+        if len(pending) >= BATCH_SIZE:
+            flush()
 
-    return added, updated, errors
+    flush()
+    if result.added:
+        result.new_ids = db.get_photo_ids_by_paths([f.path for f in files if f.path not in known])
+    logger.info("Indexada %s: %s", folder, result)
+    return result

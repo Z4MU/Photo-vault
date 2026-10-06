@@ -160,11 +160,7 @@ class DuplicatesDialog(QDialog):
                 img_lbl.setFixedSize(100, 100)
                 img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 img_lbl.setStyleSheet("background:#13131F;border-radius:4px;")
-                jpeg = (
-                    thumbnail_cache.get_video_thumbnail(photo.path, size=config.THUMB_SIZE_SMALL)
-                    if photo.is_video
-                    else thumbnail_cache.get_thumbnail(photo.path, size=config.THUMB_SIZE_SMALL)
-                )
+                jpeg = thumbnail_cache.get_photo_thumbnail(photo, size=config.THUMB_SIZE_SMALL)
                 if jpeg:
                     pix = QPixmap()
                     pix.loadFromData(jpeg)

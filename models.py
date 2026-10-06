@@ -21,21 +21,25 @@ class SortOrder(Enum):
     DESC = "desc"
 
 
-# Mapa a SQL — usamos un allowlist fijo para evitar inyección
+# Mapa a SQL — usamos un allowlist fijo para evitar inyección.
+# - Cada orden termina en p.id: con nombres o tamaños repetidos, la paginación
+#   con OFFSET sería inestable (una foto podría salir en dos páginas o en ninguna).
+# - ASC y DESC son exactamente inversos para que un mismo índice sirva a ambos
+#   (idx_photos_date, idx_photos_filename, idx_photos_filesize, idx_photos_added).
 _SORT_SQL: dict[tuple, str] = {
-    (SortField.DATE, SortOrder.DESC): "p.year DESC, p.month DESC, p.filename",
-    (SortField.DATE, SortOrder.ASC): "p.year ASC,  p.month ASC,  p.filename",
-    (SortField.FILENAME, SortOrder.ASC): "p.filename ASC",
-    (SortField.FILENAME, SortOrder.DESC): "p.filename DESC",
-    (SortField.FILESIZE, SortOrder.DESC): "p.filesize DESC",
-    (SortField.FILESIZE, SortOrder.ASC): "p.filesize ASC",
-    (SortField.ADDED_AT, SortOrder.DESC): "p.added_at DESC",
-    (SortField.ADDED_AT, SortOrder.ASC): "p.added_at ASC",
+    (SortField.DATE, SortOrder.DESC): "p.year DESC, p.month DESC, p.filename DESC, p.id DESC",
+    (SortField.DATE, SortOrder.ASC): "p.year ASC, p.month ASC, p.filename ASC, p.id ASC",
+    (SortField.FILENAME, SortOrder.ASC): "p.filename ASC, p.id ASC",
+    (SortField.FILENAME, SortOrder.DESC): "p.filename DESC, p.id DESC",
+    (SortField.FILESIZE, SortOrder.DESC): "p.filesize DESC, p.id DESC",
+    (SortField.FILESIZE, SortOrder.ASC): "p.filesize ASC, p.id ASC",
+    (SortField.ADDED_AT, SortOrder.DESC): "p.added_at DESC, p.id DESC",
+    (SortField.ADDED_AT, SortOrder.ASC): "p.added_at ASC, p.id ASC",
 }
 
 
 def sort_to_sql(field: SortField, order: SortOrder) -> str:
-    return _SORT_SQL.get((field, order), "p.year DESC, p.month DESC, p.filename")
+    return _SORT_SQL.get((field, order), _SORT_SQL[(SortField.DATE, SortOrder.DESC)])
 
 
 # ── Entidades ─────────────────────────────────────────────────────────────────
@@ -55,6 +59,7 @@ class Photo:
     height: int | None = None
     added_at: str | None = None
     md5: str | None = None  # Solo se carga donde hace falta (duplicados)
+    mtime: float | None = None  # mtime del archivo al indexarlo (None = antes de v3)
 
     @property
     def is_video(self) -> bool:

@@ -4,6 +4,7 @@ Hilos (QThread) y utilidades para correr tareas largas sin congelar la UI.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -13,6 +14,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import config
 import database as db
 import indexer
 import logging_setup
@@ -78,7 +80,7 @@ def disconnect_all(*signals) -> None:
 
 class IndexWorker(StoppableThread):
     progress = pyqtSignal(int, int, str)
-    completed = pyqtSignal(int, int, int)  # nuevas, actualizadas, errores
+    completed = pyqtSignal(object)  # indexer.IndexResult
     error = pyqtSignal(str)
 
     def __init__(self, folder: str):
@@ -87,12 +89,12 @@ class IndexWorker(StoppableThread):
 
     def run(self):
         try:
-            added, updated, errors = indexer.index_folder(
+            result = indexer.index_folder(
                 self.folder,
                 progress_callback=lambda c, t, p: self.progress.emit(c, t, p),
                 should_stop=self.is_stopping,
             )
-            self.completed.emit(added, updated, errors)
+            self.completed.emit(result)
         except Exception as e:
             logger.exception("Error indexando %s", self.folder)
             self.error.emit(str(e))
@@ -100,39 +102,75 @@ class IndexWorker(StoppableThread):
             db.close_connection()
 
 
+def _load_thumbnail_image(photo: Photo, size: int) -> QImage | None:
+    """Miniatura como QImage (QImage sí se puede crear fuera del hilo de la UI)."""
+    jpeg = thumbnail_cache.get_photo_thumbnail(photo, size=size)
+    if not jpeg:
+        return None
+    img = QImage.fromData(jpeg)
+    if img.isNull():
+        return None
+    if img.width() > size or img.height() > size:
+        img = img.scaled(
+            size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+    return img
+
+
 class ThumbnailLoader(StoppableThread):
+    """
+    Carga las miniaturas de la página actual en paralelo (THUMB_WORKERS hilos)
+    y emite `loaded` a medida que están. Después sigue generando en caché las
+    de `prefetch` (la página siguiente) sin emitir nada, para que al pasar de
+    página aparezcan al instante.
+    """
+
     loaded = pyqtSignal(int, QImage)
 
-    def __init__(self, photos: list[Photo]):
+    def __init__(self, photos: list[Photo], prefetch: list[Photo] | None = None, size: int | None = None):
         super().__init__()
         self.photos = photos
+        self.prefetch = prefetch or []
+        self.size = size or config.THUMB_SIZE_GALLERY
 
     def run(self):
-        for photo in self.photos:
-            if self._stop_flag:
-                break
-            try:
-                jpeg = (
-                    thumbnail_cache.get_video_thumbnail(photo.path)
-                    if photo.is_video
-                    else thumbnail_cache.get_thumbnail(photo.path)
-                )
-                if jpeg:
-                    img = QImage.fromData(jpeg)
-                    if not img.isNull():
-                        if img.width() > 200 or img.height() > 200:
-                            img = img.scaled(
-                                200,
-                                200,
-                                Qt.AspectRatioMode.KeepAspectRatio,
-                                Qt.TransformationMode.SmoothTransformation,
-                            )
-                        self.loaded.emit(photo.id, img)
-            except Exception:
-                logger.exception("Error cargando miniatura de %s", photo.path)
-            if not self._stop_flag:
-                self.msleep(5)
-        db.close_connection()
+        try:
+            with ThreadPoolExecutor(max_workers=services.THUMB_WORKERS) as pool:
+                futures = {pool.submit(self._safe_load, p): p for p in self.photos}
+                for fut in as_completed(futures):
+                    if self._stop_flag:
+                        break
+                    img = fut.result()
+                    if img is not None:
+                        self.loaded.emit(futures[fut].id, img)
+                if self._stop_flag:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    return
+                # Precarga: solo dejar las miniaturas en el caché de disco
+                for chunk_start in range(0, len(self.prefetch), services.THUMB_WORKERS):
+                    if self._stop_flag:
+                        break
+                    chunk = self.prefetch[chunk_start : chunk_start + services.THUMB_WORKERS]
+                    list(pool.map(self._safe_cache, chunk))
+        finally:
+            db.close_connection()
+
+    def _safe_load(self, photo: Photo) -> QImage | None:
+        if self._stop_flag:
+            return None
+        try:
+            return _load_thumbnail_image(photo, self.size)
+        except Exception:
+            logger.exception("Error cargando miniatura de %s", photo.path)
+            return None
+
+    def _safe_cache(self, photo: Photo) -> None:
+        if self._stop_flag:
+            return
+        try:
+            thumbnail_cache.get_photo_thumbnail(photo, size=self.size)
+        except Exception:
+            logger.exception("Error precargando miniatura de %s", photo.path)
 
 
 class MD5Worker(StoppableThread):

@@ -55,19 +55,26 @@ def _log_failure(filepath: str, what: str, exc: BaseException) -> None:
         logger.warning("No se pudo %s %s: %s", what, filepath, exc)
 
 
-def _source_hash(filepath: str) -> str:
-    """Hash que identifica la versión actual del archivo original."""
-    try:
-        mtime = str(os.path.getmtime(filepath))
-    except OSError:
-        mtime = "0"
-    raw = f"{filepath}::{mtime}::{THUMB_VERSION}".encode()
+def _source_hash(filepath: str, mtime: float | None = None) -> str:
+    """
+    Hash que identifica la versión del archivo original.
+    `mtime`: el guardado en la DB al indexar. Pasarlo evita consultar el disco
+    de la colección por cada miniatura (en un disco USB eso era casi todo el
+    tiempo de una miniatura en caché). Si es None, se consulta el archivo.
+    """
+    if mtime is None:
+        try:
+            mtime = os.path.getmtime(filepath)
+        except OSError:
+            mtime = 0
+    mtime_str = "0" if not mtime else str(mtime)
+    raw = f"{filepath}::{mtime_str}::{THUMB_VERSION}".encode()
     return hashlib.sha1(raw).hexdigest()
 
 
-def _cache_name(filepath: str, size: int, video: bool) -> str:
+def _cache_name(filepath: str, size: int, video: bool, mtime: float | None = None) -> str:
     prefix = _VIDEO_PREFIX if video else ""
-    return f"{prefix}{_source_hash(filepath)}_{size}.jpg"
+    return f"{prefix}{_source_hash(filepath, mtime)}_{size}.jpg"
 
 
 def _cache_path(name: str) -> Path:
@@ -77,8 +84,12 @@ def _cache_path(name: str) -> Path:
     return CACHE_DIR / h[:2] / name
 
 
-def _get_cached(filepath: str, size: int, video: bool) -> bytes | None:
-    path = _cache_path(_cache_name(filepath, size, video))
+def is_cached(filepath: str, size: int = THUMB_SIZE, video: bool = False, mtime: float | None = None) -> bool:
+    return _cache_path(_cache_name(filepath, size, video, mtime)).exists()
+
+
+def _get_cached(filepath: str, size: int, video: bool, mtime: float | None = None) -> bytes | None:
+    path = _cache_path(_cache_name(filepath, size, video, mtime))
 
     # ── Caché hit ──────────────────────────────────────────────────────────
     if path.exists():
@@ -100,19 +111,26 @@ def _get_cached(filepath: str, size: int, video: bool) -> bytes | None:
     return data
 
 
-def get_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
+def get_thumbnail(filepath: str, size: int = THUMB_SIZE, mtime: float | None = None) -> bytes | None:
     """
     Devuelve la miniatura en bytes (JPEG), con la orientación EXIF aplicada.
     - Si existe en caché y el archivo no cambió, la lee del disco.
     - Si no existe o el original cambió, la genera y la guarda.
     - Devuelve None si no se puede procesar el archivo.
+    `mtime`: pasar `photo.mtime` (de la DB) siempre que se tenga.
     """
-    return _get_cached(filepath, size, video=False)
+    return _get_cached(filepath, size, video=False, mtime=mtime)
 
 
-def get_video_thumbnail(filepath: str, size: int = THUMB_SIZE) -> bytes | None:
+def get_video_thumbnail(filepath: str, size: int = THUMB_SIZE, mtime: float | None = None) -> bytes | None:
     """Igual que get_thumbnail pero para videos (usa opencv)."""
-    return _get_cached(filepath, size, video=True)
+    return _get_cached(filepath, size, video=True, mtime=mtime)
+
+
+def get_photo_thumbnail(photo, size: int = THUMB_SIZE) -> bytes | None:
+    """Atajo para un models.Photo: elige imagen/video y usa su mtime de la DB."""
+    getter = get_video_thumbnail if photo.is_video else get_thumbnail
+    return getter(photo.path, size=size, mtime=photo.mtime)
 
 
 def _to_jpeg(img: Image.Image, size: int) -> bytes:
@@ -160,17 +178,18 @@ def _generate_video(filepath: str, size: int) -> bytes | None:
         return None
 
 
-def purge_orphans(known_paths: list[str]) -> int:
+def purge_orphans(known: list[tuple[str, float | None]]) -> int:
     """
     Elimina del caché las miniaturas que no corresponden a la versión actual
     de un archivo indexado (archivo des-indexado, modificado, o miniatura de
     un formato de caché anterior).
+    `known`: [(ruta, mtime de la DB)]. Con mtime None se consulta el archivo.
     Devuelve la cantidad de archivos eliminados.
     """
     if not CACHE_DIR.exists():
         return 0
 
-    valid_hashes = {_source_hash(p) for p in known_paths}
+    valid_hashes = {_source_hash(p, m) for p, m in known}
 
     removed = 0
     for thumb in CACHE_DIR.rglob("*.jpg"):

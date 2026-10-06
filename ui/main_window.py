@@ -4,9 +4,11 @@ Ventana principal: sidebar, galería paginada, filtros.
 """
 
 import logging
+from functools import partial
+from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QImage, QPixmap
+from PyQt6.QtGui import QImage, QPixmap, QPixmapCache
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -20,13 +22,15 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStatusBar,
     QVBoxLayout,
     QWidget,
 )
 
 import database as db
+import indexer
 import services
-from models import GalleryPage, SortField, SortOrder
+from models import GalleryPage, Photo, SortField, SortOrder
 from ui.dialogs.duplicates import DuplicatesDialog
 from ui.dialogs.folders import DeindexDialog, IndexDialog
 from ui.dialogs.photo import BulkTagDialog, PhotoDetailDialog
@@ -35,8 +39,11 @@ from ui.dialogs.settings import SettingsDialog
 from ui.dialogs.stats import StatsDialog
 from ui.dialogs.tags import TagManagerDialog
 from ui.style import DARK_STYLE
-from ui.widgets import PhotoThumbnail, clear_layout, layout_widgets
+from ui.widgets import PhotoThumbnail, TaskStatusWidget, clear_layout, layout_widgets
 from ui.workers import (
+    IndexWorker,
+    StoppableThread,
+    TaskWorker,
     ThumbnailLoader,
     disconnect_all,
     retire_thread,
@@ -44,6 +51,15 @@ from ui.workers import (
 )
 
 logger = logging.getLogger(__name__)
+
+SEARCH_DEBOUNCE_MS = 300
+# Miniaturas ya mostradas en esta sesión, en memoria (volver a una página es instantáneo).
+# 150 MB ≈ 900 miniaturas de 200×200.
+PIXMAP_CACHE_KB = 150 * 1024
+
+
+def _pixmap_key(photo: Photo) -> str:
+    return f"thumb:{photo.id}:{photo.mtime}"
 
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
@@ -69,6 +85,7 @@ class MainWindow(QMainWindow):
         self._select_mode: bool = False
         self._selected_ids: set[int] = set()
         self._show_sidebar_hidden: bool = False
+        self._photos_by_id: dict[int, Photo] = {}
 
         self._build_timer = QTimer(self)
         self._build_timer.setInterval(0)
@@ -79,6 +96,18 @@ class MainWindow(QMainWindow):
         self._resize_timer.setInterval(400)
         self._resize_timer.timeout.connect(self._on_resize_settled)
         self._last_grid_cols = 0
+
+        # La búsqueda espera a que se deje de escribir (antes: una consulta por tecla)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(SEARCH_DEBOUNCE_MS)
+        self._search_timer.timeout.connect(self._on_search)
+
+        QPixmapCache.setCacheLimit(PIXMAP_CACHE_KB)
+
+        # Tarea en segundo plano (una a la vez): "index" o "thumbs"
+        self._bg_worker: StoppableThread | None = None
+        self._bg_kind: str | None = None
 
         # db.init_db() corre antes, en _startup()
         self._build_ui()
@@ -174,7 +203,8 @@ class MainWindow(QMainWindow):
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("🔍 Buscar por nombre…")
-        self.search_edit.textChanged.connect(self._on_search)
+        self.search_edit.textChanged.connect(lambda _text: self._search_timer.start())
+        self.search_edit.returnPressed.connect(self._on_search)  # Enter: buscar ya
         top_bar.addWidget(self.search_edit)
 
         # ── FEATURE: ordenamiento ─────────────────────────────────────────
@@ -231,6 +261,14 @@ class MainWindow(QMainWindow):
         ml.addLayout(pg_bar)
 
         root.addWidget(main_area, stretch=1)
+
+        # Barra de estado: progreso de indexación / miniaturas en segundo plano
+        self.task_status = TaskStatusWidget()
+        self.task_status.cancel_clicked.connect(self._cancel_background)
+        status_bar = QStatusBar()
+        status_bar.setStyleSheet("QStatusBar{background:#13131F;border-top:1px solid #2D2D3F;}")
+        status_bar.addPermanentWidget(self.task_status, 1)
+        self.setStatusBar(status_bar)
 
     # ── Sidebar de etiquetas ──────────────────────────────────────────────────
 
@@ -380,21 +418,23 @@ class MainWindow(QMainWindow):
             retire_thread(self._loader)
             self._loader = None
 
+    def _gallery_query(self) -> dict:
+        return {
+            "tag_ids": self._active_tags or None,
+            "search": self.search_edit.text().strip() or None,
+            "limit": self._page_size,
+            "sort_field": self._sort_field,
+            "sort_order": self._sort_order,
+        }
+
     def _load_photos(self):
+        self._search_timer.stop()
         self._build_timer.stop()
         self._stop_loader()
         clear_layout(self.grid_layout)
         self._thumbnails.clear()
 
-        search = self.search_edit.text().strip() or None
-        self._current_page = services.get_gallery_page(
-            tag_ids=self._active_tags or None,
-            search=search,
-            limit=self._page_size,
-            offset=self._offset,
-            sort_field=self._sort_field,
-            sort_order=self._sort_order,
-        )
+        self._current_page = services.get_gallery_page(offset=self._offset, **self._gallery_query())
 
         self.count_lbl.setText(f"{self._current_page.total:,} fotos")
         self._update_pagination()
@@ -415,12 +455,23 @@ class MainWindow(QMainWindow):
                     thumb.set_selected(True)
             else:
                 thumb.clicked.connect(self._open_photo)
+            cached = QPixmapCache.find(_pixmap_key(photo))
+            if cached is not None:
+                thumb.set_pixmap(cached)
             self.grid_layout.addWidget(thumb, idx // self._grid_cols, idx % self._grid_cols)
             self._thumbnails[photo.id] = thumb
 
         if not self._pending_photos and self._current_page is not None:
             self._build_timer.stop()
-            loader = ThumbnailLoader(self._current_page.photos)
+            page = self._current_page
+            missing = [p for p in page.photos if QPixmapCache.find(_pixmap_key(p)) is None]
+            prefetch: list[Photo] = []
+            if page.has_next:
+                prefetch = services.get_gallery_photos(
+                    offset=page.offset + page.limit, **self._gallery_query()
+                )
+            self._photos_by_id = {p.id: p for p in page.photos}
+            loader = ThumbnailLoader(missing, prefetch=prefetch)
             loader.loaded.connect(self._on_thumb_loaded)
             loader.finished.connect(lambda ldr=loader: self._on_loader_finished(ldr))
             self._loader = loader
@@ -432,8 +483,12 @@ class MainWindow(QMainWindow):
 
     def _on_thumb_loaded(self, photo_id: int, img: QImage):
         # QPixmap solo se crea aquí, en el hilo de la UI
+        pix = QPixmap.fromImage(img)
+        photo = self._photos_by_id.get(photo_id)
+        if photo is not None:
+            QPixmapCache.insert(_pixmap_key(photo), pix)
         if photo_id in self._thumbnails:
-            self._thumbnails[photo_id].set_pixmap(QPixmap.fromImage(img))
+            self._thumbnails[photo_id].set_pixmap(pix)
 
     def _on_search(self):
         self._offset = 0
@@ -482,13 +537,92 @@ class MainWindow(QMainWindow):
         dlg.exec()
 
     def _open_index_dialog(self):
-        dlg = IndexDialog(self)
-        dlg.indexing_done.connect(self._on_index_done)
+        dlg = IndexDialog(self, busy=self._bg_kind == "index")
+        dlg.start_requested.connect(self.start_indexing)
         dlg.exec()
 
-    def _on_index_done(self):
+    # ── Tareas en segundo plano (barra de estado) ─────────────────────────────
+
+    def is_indexing(self) -> bool:
+        return self._bg_kind == "index"
+
+    def _retire_background(self) -> None:
+        if self._bg_worker is not None:
+            w = self._bg_worker
+            signals = [getattr(w, name) for name in ("progress", "completed", "error") if hasattr(w, name)]
+            disconnect_all(*signals)
+            retire_thread(w)
+        self._bg_worker = None
+        self._bg_kind = None
+
+    def _cancel_background(self) -> None:
+        if self._bg_worker is not None:
+            self.task_status.set_cancelling()
+            self._bg_worker.stop()  # Termina el archivo actual y emite completed
+
+    def start_indexing(self, folder: str) -> None:
+        """Indexa en segundo plano: se puede seguir usando la app mientras tanto."""
+        if self._bg_kind == "index":
+            QMessageBox.information(self, "Indexación en curso", "Ya hay una indexación en curso.")
+            return
+        if self._bg_kind == "thumbs":
+            self._retire_background()  # La indexación tiene prioridad
+        w = IndexWorker(folder)
+        w.progress.connect(self._on_index_progress)
+        w.completed.connect(self._on_index_completed)
+        w.error.connect(self._on_background_error)
+        self._bg_worker, self._bg_kind = w, "index"
+        self.task_status.start(f"Indexando {folder}…")
+        w.start()
+
+    def _on_index_progress(self, current: int, total: int, path: str) -> None:
+        self.task_status.set_progress(current, total, f"Indexando [{current:,}/{total:,}] {Path(path).name}")
+
+    def _on_index_completed(self, result: indexer.IndexResult) -> None:
+        self._bg_worker, self._bg_kind = None, None
+        txt = (
+            f"{'Indexación cancelada' if result.cancelled else '✓ Indexación lista'}: "
+            f"{result.added:,} nuevas, {result.updated:,} actualizadas, "
+            f"{result.unchanged:,} sin cambios"
+        )
+        if result.errors:
+            txt += f", {result.errors:,} errores (ver log)"
+        self.task_status.finish(txt)
         self._refresh_tags()
         self._load_photos()
+        if result.new_ids:
+            # Las miniaturas de lo nuevo se generan ya, sin esperar a que se vean
+            self.start_thumbnail_generation(result.new_ids, quiet_done=True)
+
+    def start_thumbnail_generation(
+        self, photo_ids: list[int] | None = None, quiet_done: bool = False
+    ) -> bool:
+        """Genera miniaturas en segundo plano (None = toda la colección). False si hay otra tarea."""
+        if self._bg_worker is not None:
+            return False
+        w = TaskWorker(partial(services.pregenerate_thumbnails, photo_ids))
+        w.progress.connect(self._on_thumbs_progress)
+        w.completed.connect(self._on_thumbs_completed)
+        w.error.connect(self._on_background_error)
+        self._bg_worker, self._bg_kind = w, "thumbs"
+        self.task_status.start("Preparando miniaturas…")
+        w.start()
+        return True
+
+    def _on_thumbs_progress(self, current: int, total: int) -> None:
+        self.task_status.set_progress(current, total, f"Generando miniaturas [{current:,}/{total:,}]")
+
+    def _on_thumbs_completed(self, r: services.ThumbnailBatchResult) -> None:
+        self._bg_worker, self._bg_kind = None, None
+        txt = f"✓ Miniaturas: {r.generated:,} generadas, {r.already_cached:,} ya estaban"
+        if r.failed:
+            txt += f", {r.failed:,} no se pudieron generar"
+        self.task_status.finish(txt)
+
+    def _on_background_error(self, message: str) -> None:
+        self._bg_worker, self._bg_kind = None, None
+        self.task_status.finish(f"Error: {message}", hide_after_ms=20_000)
+        QMessageBox.critical(self, "Error", message)
 
     def _open_tag_manager(self):
         TagManagerDialog(self).exec()
@@ -515,8 +649,8 @@ class MainWindow(QMainWindow):
         self._load_photos()
 
     def _update_stats(self):
-        stats = services.get_stats()
-        self.stats_lbl.setText(f"{stats.total_photos:,} fotos  •  {stats.total_tags} etiquetas")
+        photos, tags = services.get_totals()
+        self.stats_lbl.setText(f"{photos:,} fotos  •  {tags} etiquetas")
 
     def _open_quick_tag(self):
         setup = QuickTagSetupDialog(self)
@@ -535,6 +669,19 @@ class MainWindow(QMainWindow):
         win.exec()
 
     def closeEvent(self, event):
+        if self._bg_kind == "index":
+            if (
+                QMessageBox.question(
+                    self,
+                    "Indexación en curso",
+                    "Hay una indexación en curso. ¿Cancelarla y salir?\n\nLo ya indexado se conserva.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                != QMessageBox.StandardButton.Yes
+            ):
+                event.ignore()
+                return
+        self._retire_background()
         self._build_timer.stop()
         self._stop_loader()
         wait_all_threads()

@@ -81,8 +81,17 @@ class SettingsDialog(QDialog):
         btn_purge.setToolTip("Elimina miniaturas de archivos que ya no están indexados")
         btn_purge.clicked.connect(self._purge_orphans)
 
+        btn_gen = QPushButton("⚙  Generar todas")
+        btn_gen.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;")
+        btn_gen.setToolTip(
+            "Genera en segundo plano las miniaturas que falten de toda la colección, "
+            "para que la galería cargue al instante"
+        )
+        btn_gen.clicked.connect(self._generate_all)
+
         cache_row.addWidget(btn_clear)
         cache_row.addWidget(btn_purge)
+        cache_row.addWidget(btn_gen)
         layout.addLayout(cache_row)
 
         sep2 = QFrame()
@@ -144,11 +153,40 @@ class SettingsDialog(QDialog):
         )
 
     def _purge_orphans(self):
-        n = services.purge_cache_orphans()
+        n = run_with_progress(
+            self,
+            "Purgar huérfanos",
+            "Buscando miniaturas que ya no se usan…",
+            lambda progress_callback=None, should_stop=None: services.purge_cache_orphans(),
+        )
+        if n is None:
+            return
         self._refresh_cache_label()
         QMessageBox.information(
-            self, "Purga completada", f"Se eliminaron {n} miniaturas huérfanas del caché."
+            self, "Purga completada", f"Se eliminaron {n:,} miniaturas huérfanas del caché."
         )
+
+    def _generate_all(self):
+        window = self.parent()
+        start = getattr(window, "start_thumbnail_generation", None)
+        if start is None:
+            return
+        if (
+            QMessageBox.question(
+                self,
+                "Generar miniaturas",
+                "Se generarán en segundo plano las miniaturas que falten de toda la colección "
+                "(puede tardar horas la primera vez y ocupar varios GB en el caché).\n\n"
+                "Puedes seguir usando la app y cancelarlo desde la barra de abajo. ¿Empezar?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        if not start(None):
+            QMessageBox.information(
+                self, "Ocupado", "Hay otra tarea en segundo plano. Inténtalo cuando termine."
+            )
 
     def _sync_xmp(self):
         r = run_with_progress(

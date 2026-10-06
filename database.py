@@ -11,6 +11,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 
 import backup
 import config
@@ -31,7 +32,12 @@ def get_connection() -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA cache_size=-8000")
+        conn.execute("PRAGMA cache_size=-32000")  # ~32 MB por conexión
+        # Con WAL, NORMAL es seguro ante cortes de la app (solo un corte de luz
+        # puede perder la última transacción, nunca corromper la DB) y escribe
+        # mucho más rápido que FULL.
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
         _local.conn = conn
     return conn
 
@@ -80,7 +86,8 @@ class DatabaseTooNewError(RuntimeError):
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
-    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    # table_xinfo (no table_info): también lista las columnas calculadas (photos.folder)
+    return {r[1] for r in conn.execute(f"PRAGMA table_xinfo({table})").fetchall()}
 
 
 def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, typedef: str) -> None:
@@ -179,9 +186,34 @@ def _m002_internal_trash(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_deleted_at    ON deleted_photos(deleted_at)")
 
 
+def _m003_mtime_and_sort_indexes(conn: sqlite3.Connection) -> None:
+    """mtime para indexación incremental + índices para ordenar la galería."""
+    # NULL = registro de antes de v3: se vuelve a leer una vez en la próxima indexación
+    _add_column_if_missing(conn, "photos", "mtime", "REAL")
+    # Sirve a ORDER BY year, month, filename, id en ambos sentidos (el rowid va
+    # implícito al final de todo índice)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_date     ON photos(year, month, filename)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_filename ON photos(filename)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_filesize ON photos(filesize)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_added    ON photos(added_at)")
+    # Los índices de solo año / solo mes quedan cubiertos por idx_photos_date
+    conn.execute("DROP INDEX IF EXISTS idx_photos_year")
+    conn.execute("DROP INDEX IF EXISTS idx_photos_month")
+    # Carpeta de cada foto como columna calculada (VIRTUAL: no ocupa espacio en
+    # la tabla) e indexada: la lista de carpetas pasa a ser un recorrido del
+    # índice. rtrim(path, <caracteres de path salvo '\'>) = todo hasta la última '\'.
+    if "folder" not in _columns(conn, "photos"):
+        conn.execute(
+            r"ALTER TABLE photos ADD COLUMN folder TEXT "
+            r"GENERATED ALWAYS AS (rtrim(path, replace(path, '\', ''))) VIRTUAL"
+        )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m001_baseline,
     _m002_internal_trash,
+    _m003_mtime_and_sort_indexes,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -325,7 +357,7 @@ def _seed_initial_data(conn):
 
 _PHOTO_COLUMNS = (
     "p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, "
-    "p.filesize, p.width, p.height, p.added_at"
+    "p.filesize, p.width, p.height, p.added_at, p.mtime"
 )
 
 
@@ -346,6 +378,53 @@ def photo_exists(path: str) -> bool:
     return conn.execute("SELECT 1 FROM photos WHERE path = ?", (path,)).fetchone() is not None
 
 
+_UPSERT_SQL = """
+    INSERT INTO photos (path, filename, media_type, year, month,
+                        filesize, width, height, duration, mtime)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(path) DO UPDATE SET
+        filename   = excluded.filename,
+        media_type = excluded.media_type,
+        year       = excluded.year,
+        month      = excluded.month,
+        width      = excluded.width,
+        height     = excluded.height,
+        duration   = excluded.duration,
+        -- El md5 deja de valer si el archivo cambió. Un mtime NULL es de antes
+        -- de v3: si el tamaño coincide se conserva para no recalcular todo.
+        md5 = CASE
+                WHEN photos.filesize IS excluded.filesize
+                 AND (photos.mtime IS NULL OR photos.mtime = excluded.mtime)
+                THEN photos.md5
+                ELSE NULL
+              END,
+        filesize   = excluded.filesize,
+        mtime      = excluded.mtime
+"""
+
+
+@dataclass(frozen=True)
+class PhotoRecord:
+    """Datos que el indexador guarda de un archivo."""
+
+    path: str
+    filename: str
+    year: int | None
+    month: int | None
+    filesize: int
+    width: int | None = None
+    height: int | None = None
+    media_type: str = "image"
+    duration: float | None = None
+    mtime: float | None = None
+
+    def params(self) -> tuple:
+        return (
+            self.path, self.filename, self.media_type, self.year, self.month,
+            self.filesize, self.width, self.height, self.duration, self.mtime,
+        )  # fmt: skip
+
+
 def upsert_photo(
     path: str,
     filename: str,
@@ -356,28 +435,46 @@ def upsert_photo(
     height: int | None = None,
     media_type: str = "image",
     duration: float | None = None,
+    mtime: float | None = None,
 ) -> int:
+    rec = PhotoRecord(path, filename, year, month, filesize, width, height, media_type, duration, mtime)
     with transaction() as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO photos (path, filename, media_type, year, month,
-                                filesize, width, height, duration)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(path) DO UPDATE SET
-                filename   = excluded.filename,
-                media_type = excluded.media_type,
-                year       = excluded.year,
-                month      = excluded.month,
-                filesize   = excluded.filesize,
-                width      = excluded.width,
-                height     = excluded.height,
-                duration   = excluded.duration
-            RETURNING id
-        """,
-            (path, filename, media_type, year, month, filesize, width, height, duration),
-        )
-        row = cur.fetchone()
-        return row[0]
+        conn.execute(_UPSERT_SQL, rec.params())
+        return conn.execute("SELECT id FROM photos WHERE path = ?", (path,)).fetchone()[0]
+
+
+def upsert_photos(records: list[PhotoRecord]) -> None:
+    """Inserta/actualiza muchos registros en UNA transacción (indexación por lotes)."""
+    if not records:
+        return
+    with transaction() as conn:
+        conn.executemany(_UPSERT_SQL, [r.params() for r in records])
+
+
+def set_mtimes(pairs: list[tuple[float, str]]) -> None:
+    """[(mtime, ruta)] — anota el mtime sin tocar el resto del registro."""
+    if not pairs:
+        return
+    with transaction() as conn:
+        conn.executemany("UPDATE photos SET mtime = ? WHERE path = ?", pairs)
+
+
+def get_photo_ids_by_paths(paths: list[str]) -> list[int]:
+    ids: list[int] = []
+    conn = get_connection()
+    for chunk in _chunks(paths):
+        ph = ",".join("?" * len(chunk))
+        ids.extend(r[0] for r in conn.execute(f"SELECT id FROM photos WHERE path IN ({ph})", chunk))
+    return ids
+
+
+def get_index_state(folder: str) -> dict[str, tuple[int | None, float | None]]:
+    """{ruta: (tamaño, mtime)} de lo ya indexado dentro de `folder` (indexación incremental)."""
+    rows = get_connection().execute(
+        "SELECT path, filesize, mtime FROM photos WHERE path LIKE ? ESCAPE '!'",
+        (folder_like_pattern(folder),),
+    )
+    return {r[0]: (r[1], r[2]) for r in rows}
 
 
 def update_photo_md5(photo_id: int, md5: str):
@@ -400,6 +497,7 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
         height=row["height"] if "height" in keys else None,
         added_at=row["added_at"] if "added_at" in keys else None,
         md5=row["md5"] if "md5" in keys else None,
+        mtime=row["mtime"] if "mtime" in keys else None,
     )
 
 
@@ -502,11 +600,74 @@ def get_photo_count(
 
 def get_folder_counts() -> list[tuple[str, int]]:
     """[(carpeta, n.º de archivos directamente en ella)] ordenado por carpeta."""
+    # rtrim(path, <todos los caracteres de path salvo '\'>) corta todo lo que
+    # sigue a la última barra: es dirname() en SQL, y el GROUP BY lo hace SQLite.
+    # `folder` es una columna calculada e indexada (migración v3)
+    rows = get_connection().execute("SELECT folder, COUNT(*) FROM photos GROUP BY folder")
     counts: dict[str, int] = {}
-    for (path,) in get_connection().execute("SELECT path FROM photos"):
-        parent = os.path.dirname(path)
-        counts[parent] = counts.get(parent, 0) + 1
+    for folder, n in rows:
+        # `folder` termina en "\" (o es ""): dirname(folder + "x") da exactamente
+        # lo mismo que dirname(ruta original), incluidas raíces "G:\" y UNC.
+        key = os.path.dirname(folder + "x")
+        counts[key] = counts.get(key, 0) + n
     return sorted(counts.items())
+
+
+def get_root_counts() -> list[tuple[str, int]]:
+    """[(unidad, registros)] p. ej. [("G:\\", 171840)]."""
+    rows = (
+        get_connection()
+        .execute(r"""
+        SELECT CASE WHEN path GLOB '[A-Za-z]:\*' THEN substr(path, 1, 3) END AS root, COUNT(*)
+        FROM photos GROUP BY root
+    """)
+        .fetchall()
+    )
+    counts: dict[str, int] = {}
+    for root, n in rows:
+        if root is not None:
+            counts[root] = counts.get(root, 0) + n
+    if any(root is None for root, _n in rows):
+        # Rutas sin letra de unidad (UNC \\servidor\recurso, relativas…): pocas, en Python
+        for (path,) in get_connection().execute(r"SELECT path FROM photos WHERE path NOT GLOB '[A-Za-z]:\*'"):
+            anchor = Path(path).anchor or "(sin unidad)"
+            counts[anchor] = counts.get(anchor, 0) + 1
+    return sorted(counts.items())
+
+
+def get_totals() -> tuple[int, int]:
+    conn = get_connection()
+    return (
+        conn.execute("SELECT COUNT(*) FROM photos").fetchone()[0],
+        conn.execute("SELECT COUNT(*) FROM tags").fetchone()[0],
+    )
+
+
+def get_paths_with_mtime() -> list[tuple[str, float | None]]:
+    return [(r[0], r[1]) for r in get_connection().execute("SELECT path, mtime FROM photos")]
+
+
+def get_photos_by_ids(photo_ids: list[int]) -> list[Photo]:
+    out: list[Photo] = []
+    conn = get_connection()
+    for chunk in _chunks(photo_ids):
+        ph = ",".join("?" * len(chunk))
+        out.extend(
+            _row_to_photo(r)
+            for r in conn.execute(f"SELECT {_PHOTO_COLUMNS} FROM photos p WHERE p.id IN ({ph})", chunk)
+        )
+    return out
+
+
+def get_duplicate_candidates_without_md5() -> list[Photo]:
+    """Fotos sin md5 cuyo tamaño comparte otra foto (las únicas que pueden ser duplicados exactos)."""
+    rows = get_connection().execute(f"""
+        SELECT {_PHOTO_COLUMNS}, p.md5 FROM photos p
+        WHERE p.md5 IS NULL AND p.filesize > 0
+          AND p.filesize IN (SELECT filesize FROM photos GROUP BY filesize HAVING COUNT(*) > 1)
+        ORDER BY p.path
+    """)
+    return [_row_to_photo(r) for r in rows]
 
 
 def get_photo_by_id(photo_id: int) -> Photo | None:
