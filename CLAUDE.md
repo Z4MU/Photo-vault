@@ -61,7 +61,10 @@ ui/
   images.py             load_preview_pixmap, load_full_image, is_animated
   charts.py             build_bar_chart_svg (sin Qt, testeable)
   gallery.py            GalleryModel, GalleryDelegate, GalleryView (galería virtualizada)
-  sidebar.py            TagFilterPanel, FolderTreePanel, TimelinePanel
+  sidebar.py            FolderTreePanel, TimelinePanel, SavedSearchPanel
+  tag_panel.py          TagFilterPanel (incluir/excluir, Y/O, buscador, jerarquía)
+  filter_bar.py         FilterBar (tipo, años, orientación, resolución, duración, estrellas…)
+  gallery_actions.py    GalleryActionsMixin: menú contextual y acciones sobre la selección
   viewer.py             ViewerWindow, ImageView (visor a pantalla completa)
   video_player.py       VideoPlayer (QtMultimedia)
   photo_info.py         InfoPanel (panel de información del visor)
@@ -107,12 +110,13 @@ main.py → ui/ → services.py → database.py → SQLite
 
 ## 4. Modelos (`models.py`)
 
-- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5, mtime`. `mtime` es el del archivo al indexarlo (None = registro de antes de v3 aún no re-indexado). Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
-- `Tag` — `id, name, category, color, hidden, sidebar_hidden`.
+- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5, mtime, rating (0–5), favorite, note`. `stars` = "★★★☆☆". `mtime` es el del archivo al indexarlo (None = registro de antes de v3 aún no re-indexado). Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
+- `Tag` — `id, name, category, color, hidden, sidebar_hidden, parent_id`.
+- `SavedSearch` — `id, name, query` (dict de `services.GalleryQuery.to_dict()`).
 - `GalleryPage` — `photos, total, offset, limit, sort_field, sort_order` + `page_number`, `total_pages`, `has_prev`, `has_next`.
 - `Stats` — `total_photos, total_tags, years, by_month, by_type, top_tags`.
 - `DuplicateGroup` — `md5, photos` + `size`, `wasted_bytes`.
-- `SortField` (`DATE`, `FILENAME`, `FILESIZE`, `ADDED_AT`) y `SortOrder` (`ASC`, `DESC`).
+- `SortField` (`DATE`, `FILENAME`, `FILESIZE`, `ADDED_AT`, `RATING`) y `SortOrder` (`ASC`, `DESC`).
 - `sort_to_sql(field, order)` traduce a SQL usando el **allowlist `_SORT_SQL`**. Nunca interpolar ordenamiento desde input del usuario.
   - Todo orden termina en `p.id` (paginación estable con nombres/tamaños repetidos) y ASC/DESC son exactamente inversos, para que un índice sirva a ambos. Fecha: `year, month, filename, id`.
 
@@ -126,14 +130,18 @@ main.py → ui/ → services.py → database.py → SQLite
 - Todo hilo worker (`QThread`) debe llamar `db.close_connection()` al terminar (ya lo hacen `IndexWorker`, `ImageLoadQueue`, `MD5Worker`, `TaskWorker`).
 - Escrituras con `with transaction() as conn:` (commit/rollback automático).
 
-### Esquema (versión 3)
+### Esquema (versión 4)
 
 ```sql
 photos(id PK, path UNIQUE, filename, media_type, year, month, filesize,
        width, height, duration, md5, added_at,
        mtime REAL,                                   -- v3: indexación incremental
-       folder GENERATED ALWAYS AS (rtrim(path, replace(path,'\',''))) VIRTUAL)  -- v3
-tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden)
+       folder GENERATED ALWAYS AS (rtrim(path, replace(path,'\',''))) VIRTUAL,  -- v3
+       rating INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0, note TEXT)  -- v4
+tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden,
+     parent_id → tags ON DELETE SET NULL)                                            -- v4
+tag_aliases(alias PK COLLATE NOCASE, tag_id → tags ON DELETE CASCADE)               -- v4
+saved_searches(id PK, name UNIQUE COLLATE NOCASE, query_json, created_at)          -- v4
 photo_tags(photo_id → photos ON DELETE CASCADE, tag_id → tags ON DELETE CASCADE,
            PK(photo_id, tag_id))
 categories(name PK COLLATE NOCASE)
@@ -142,9 +150,11 @@ deleted_photos(id PK, batch_id, reason, deleted_at, path,   -- v2: papelera inte
                photo_json, tags_json)
 ```
 
-Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
+Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photos(rating, year, month, filename)` (v4), `photos(favorite) WHERE favorite = 1` (parcial, v4), `tag_aliases(tag_id)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
 
-Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real).
+Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real), v4 `_m004_ratings_notes_tag_tree` (0,4 s).
+
+- ⚠️ `COLLATE NOCASE` de SQLite solo ignora mayúsculas **ASCII** ("Mías" ≠ "MÍAS"). Donde importa (nombres de búsquedas guardadas) se compara en Python con `casefold()`.
 
 - `photos.folder` es una columna **calculada** (no se escribe nunca): la carpeta de la foto con la `\` final. `PRAGMA table_info` no la muestra; `_columns()` usa `table_xinfo`.
 - El `upsert` pone `md5 = NULL` si cambió el tamaño o el `mtime` (antes un md5 viejo sobrevivía a cambios del archivo).
@@ -156,21 +166,31 @@ Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and
 
 ### Papelera interna
 - `delete_photos(ids, reason)`: un lote (`batch_id` uuid) por operación; `reason` es texto para el usuario ("Carpeta des-indexada: …").
-- `restore_trash_batch(batch_id)` → `(restaurados, fusionados)`: si la ruta ya volvió a indexarse, le suma las etiquetas; los tags borrados se recrean con la categoría/color **del momento del borrado**.
+- La papelera guarda también `rating`, `favorite` y `note` (`_TRASH_PHOTO_FIELDS`).
+- `restore_trash_batch(batch_id)` → `(restaurados, fusionados)`: si la ruta ya volvió a indexarse, le suma las etiquetas (y valoración/nota con `_merge_extras`); los tags borrados se recrean con la categoría/color **del momento del borrado**.
 - `services.purge_old_trash()` corre en `_startup()` y elimina lo que tenga más de `TRASH_KEEP_DAYS` (30) días.
 - No guarda tags borrados con "Eliminar etiqueta" (eso se confirma mostrando cuántas fotos la tienen).
 
 ### Reubicar (cambiar prefijo de ruta)
 - `get_relocation_plan(old, new)` → `[(photo_id, ruta_nueva, id_existente)]`; `apply_relocation(plan)` → `(movidos, fusionados)`.
 - `services.preview_relocation()` revisa en disco una muestra de 25 rutas nuevas (`looks_right` si existen ≥ 50 %) para detectar errores de tipeo. La UI exige vista previa antes de aplicar y pide confirmación extra si `looks_right` es falso.
-- Si la ruta nueva ya estaba indexada (se re-indexó), se fusionan: etiquetas al registro existente y el viejo se quita.
+- Si la ruta nueva ya estaba indexada (se re-indexó), se fusionan: etiquetas, valoración más alta, favorita y nota al registro existente, y el viejo se quita.
 
 ### Filtros de consulta
+`PhotoFilter` (fase 6) agrega: `tag_groups` (Y de grupos; cada grupo = etiqueta + descendientes), `any_tag_ids` (O), `exclude_tag_ids` (NO), `media_type`, `year_from/to`, `min_pixels`, `orientation` (con 2 % de tolerancia para "cuadrada"), `min/max_duration`, `min_rating`, `favorites_only`, `has_note`; `search` busca en el nombre **o en la nota**. La galería usa `query_photos(filtro, orden, limit, offset)` y `count_filtered(filtro)`.
+
 Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo ids, mismo orden que `get_photos`), `count_before_date(filtro, año, mes, orden)` (fila a la que saltar; `mes=None` = el año, `NO_MONTH` = las de ese año sin mes; respeta dónde pone SQLite los NULL en ASC/DESC) y `get_date_histogram(filtro)`.
 
 `get_photos()` / `get_photo_count()` aceptan: `tag_ids` (AND), `hidden_tag_ids` (exclusión), `search` (LIKE en filename), `folder` (carpeta y subcarpetas), `untagged_only`, más `limit/offset/sort_field/sort_order`. Ambas arman el WHERE con **`_build_where(PhotoFilter(...))`**: un filtro nuevo se agrega ahí (una sola vez) y en `PhotoFilter`.
 
 **Filtro de carpeta:** siempre con `folder_like_pattern(folder)` + `LIKE ? ESCAPE '!'`. Normaliza la ruta, agrega el separador final (`D:\Fotos` no incluye `D:\Fotos2`) y escapa `%`/`_`. El escape es `!` porque `\` es el separador de Windows. Nunca volver a `LIKE folder + '%'`.
+
+### Etiquetas: jerarquía, alias, fusión (v4)
+- `update_tag(id, nombre, categoría, color, parent_id=_KEEP, aliases=None)`: todo en **una** transacción; un padre que formaría un ciclo o un alias que choca con otro nombre/alias lanza y no cambia nada.
+- `resolve_tag_name(nombre)` busca nombre **o alias**: `services.add_tag`/`bulk_add_tag`/importar usan `_tag_id_for_name` (escribir un alias agrega la etiqueta real).
+- `merge_tags(origen, destino)`: fotos, hijas y alias pasan al destino y el nombre viejo queda como alias. Si el destino descendía del origen, sube al lugar del origen (si no, habría un ciclo). `services.merge_tags` además corrige las búsquedas guardadas que usaban el origen.
+- La expansión padre → descendientes se hace en `services.GalleryQuery.photo_filter()` (`tag_descendants()`). `tag_path_names()` = `{id: [raíz, …, nombre]}`.
+- Valoración/favoritas/notas: `set_rating(ids, n)`, `set_favorite(ids, bool)`, `set_note(id, texto)`; para exportar/importar `get_photo_extras()` / `merge_photo_extras()` (solo agrega: la valoración más alta, la nota si no había).
 
 ### Configuración del usuario
 `get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado). (`page_size` quedó sin uso desde la fase 5.)
@@ -222,6 +242,7 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 - `index_folder(folder, progress_callback, should_stop, force=False)` → `IndexResult(added, updated, unchanged, errors, cancelled, new_ids)`.
 - **Listado:** `scan_media_files()` con `os.scandir` (en Windows el tamaño y el mtime vienen en el listado; antes `rglob`+`is_file`+`stat`). Las rutas salen con el mismo formato que `str(Path(...))`, aunque la carpeta llegue con `/` (test: `test_rutas_iguales_a_las_de_versiones_anteriores`). **Si cambia el formato de las rutas, la DB se duplicaría.**
 - **Incremental:** con `get_index_state(folder)` → `{ruta: (tamaño, mtime, año)}`; mismo tamaño y mtime = `unchanged`, no se abre el archivo. `force=True` relee todo. Un registro con año imposible (> año actual + 1, de reglas viejas) se relee aunque no haya cambiado.
+- **Dimensiones** con la rotación EXIF aplicada (orientación 5–8 intercambia ancho y alto): así se ven las fotos de celular. Lo indexado antes de la fase 6 se corrige con **Releer todos los archivos** (`IndexDialog` → `index_folder(force=True)`).
 - **Registros de antes de v3** (`mtime` NULL) con el mismo tamaño: solo se les anota el mtime (`set_mtimes`), sin abrir el archivo. Primera re-indexación de `G:\Fotos` (171.840): ~2 s; sin esto, ~90 min.
 - **Una sola apertura por imagen** (`_read_image_info`: EXIF + tamaño); escritura en lotes de `BATCH_SIZE` (500) con `upsert_photos` en una transacción por lote. Al cancelar se guarda lo leído.
 - Medido con la colección real: archivo sin cambios 0,06 ms; releído 2,6 ms (antes 31 ms en frío).
@@ -299,12 +320,20 @@ Nombres de archivo, tags y rutas pueden traer `<`, `&`… En `QLabel` con HTML u
 - **Búsqueda con debounce** de 300 ms (`SEARCH_DEBOUNCE_MS`); Enter busca ya.
 - Sidebar: `services.get_totals()` (2 COUNT) en lugar de `get_stats()` completo.
 
-### Sidebar (`ui/sidebar.py`)
-Pestañas **Etiquetas** (`TagFilterPanel`, filtro AND), **Carpetas** (`FolderTreePanel`, árbol de `services.get_folder_tree()`; un clic filtra y aparece un chip 📁 ✕ arriba) y **Fechas** (`TimelinePanel`, `services.get_date_histogram` con los filtros actuales; se recalcula solo si la pestaña está visible). Clic en un año/mes → `go_to_date` (cambia a orden por fecha si hace falta y selecciona la primera foto).
+### Sidebar (`ui/sidebar.py`, `ui/tag_panel.py`)
+Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton` que alterna nada → incluir ✓ → excluir ✕; combo "todas (Y) / alguna (O)"; buscador por nombre o alias; contador de fotos; las hijas van debajo del padre con sangría), **⭐ Álbum** (`SavedSearchPanel`: `services.BUILTIN_ALBUMS` + búsquedas guardadas, con contadores calculados solo con la pestaña visible; clic derecho renombra/elimina), **Carpetas** (`FolderTreePanel`, árbol de `services.get_folder_tree()`; un clic filtra y aparece un chip 📁 ✕ arriba) y **Fechas** (`TimelinePanel`, `services.get_date_histogram` con los filtros actuales; se recalcula solo si la pestaña está visible). Clic en un año/mes → `go_to_date` (cambia a orden por fecha si hace falta y selecciona la primera foto).
+
+### Filtros, búsquedas guardadas, estrellas (fase 6)
+- `services.GalleryQuery` lleva **todo** lo que define la galería (etiquetas incluir/excluir/O, texto, carpeta, orden y los atributos de `FilterBar`); `to_dict`/`from_dict` la guardan como JSON (ignora claves desconocidas: las búsquedas viejas siguen abriendo). `attribute_filter_count()` es el número del botón "⚙ Filtros (n)".
+- `MainWindow.apply_gallery_query(q)` pone cada control según una consulta (búsqueda guardada); los controles se actualizan sin emitir señales y se recarga una sola vez.
+- `FilterBar.set_values(q)` no emite `changed`; duración sin tipo implica "videos".
+- Acciones sobre la selección en `GalleryActionsMixin` (`ui/gallery_actions.py`): teclas **1–5 / 0** (estrellas), **F** (favorita), menú contextual con submenú de valoración. Más de `CONFIRM_OVER` (500) fotos pide confirmación. Después se llama `reload_keep_position()`.
 
 ### Visor (`ui/viewer.py`)
 - `ViewerWindow(source, fila)` recorre cualquier `PhotoSequence` (`count()` + `photo_at()`; `GalleryModel` lo cumple, `ListSequence` para listas). Pantalla completa por defecto; al cerrar, la galería selecciona `current_row` y recarga si `tags_were_changed`.
-- Fotos: `ImageView` (`QGraphicsView`) con zoom (rueda, +/−, 1:1, ajustar), arrastre y rotación de **solo la vista**. Decodifica hasta `config.VIEWER_MAX_SIDE` (6000) en su propia `ImageLoadQueue` con `load_full_image` (Pillow si Qt no puede: HEIC). Mientras carga muestra la miniatura de `QPixmapCache`; guarda 3 imágenes y precarga la anterior y la siguiente.
+- Teclas propias de la fase 6: **1–5 / 0** estrellas, **F** favorita, **Z** alterna ajustar/100 %, **F11** pantalla completa. Cambian el mismo objeto `Photo` que tiene la galería en memoria (se ve sin recargar) y marcan `tags_were_changed`.
+- `InfoPanel` tiene la **nota** (`QPlainTextEdit`): se guarda 800 ms después de dejar de escribir, al cambiar de foto y al cerrar (`shutdown`).
+- Fotos: `ImageView` (`QGraphicsView`) con zoom (rueda, +/−, Z), arrastre y rotación de **solo la vista**. Decodifica hasta `config.VIEWER_MAX_SIDE` (6000) en su propia `ImageLoadQueue` con `load_full_image` (Pillow si Qt no puede: HEIC). Mientras carga muestra la miniatura de `QPixmapCache`; guarda 3 imágenes y precarga la anterior y la siguiente.
 - GIF/WebP animados con `QMovie` (`is_animated`). Videos con `VideoPlayer` (QtMultimedia, backend FFmpeg del wheel de PyQt6; si falla, botón "Abrir con…").
 - `InfoPanel` (tecla I): datos de la DB, EXIF de cámara leído en un `TaskWorker` (`services.get_photo_details` → `indexer.read_exif_details`) y `TagEditor`. Si la DB no tiene la resolución (HEIC viejos) usa la de la imagen cargada.
 - Atajos en `SHORTCUTS_HELP` (F1 los muestra junto con los de la galería). Son `QShortcut` del diálogo: un `QLineEdit` con foco (agregar etiqueta) se queda con las letras y flechas.
@@ -331,10 +360,10 @@ Pestañas **Etiquetas** (`TagFilterPanel`, filtro AND), **Carpetas** (`FolderTre
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
 | `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
 | `SettingsDialog` | Tamaño de caché, limpiar caché, purgar huérfanos. |
-| `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/eliminar tags (confirma con el n.º de fotos), flags hidden, exportar/importar JSON. |
-| `EditTagDialog` | Cambiar nombre, categoría y color; avisa si el nombre ya existe (`TagNameConflictError`). |
+| `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/**fusionar** (⇢)/eliminar tags (confirma con el n.º de fotos), buscador, árbol con contadores y alias, flags hidden, exportar/importar JSON. |
+| `EditTagDialog` | Cambiar nombre, categoría, color, **etiqueta padre** (sin ciclos: no ofrece descendientes) y **alias**; avisa si el nombre o un alias ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
-| `IndexDialog` | Solo elige la carpeta y emite `start_requested(folder)`; la indexación corre en `MainWindow` (segundo plano). Con `busy=True` deshabilita el botón. |
+| `IndexDialog` | Solo elige la carpeta y emite `start_requested(folder, releer_todo)`; la indexación corre en `MainWindow` (segundo plano). Con `busy=True` deshabilita el botón. |
 | `DeindexDialog` ("🗂 Carpetas") | Lista de carpetas con **Reubicar** y **Eliminar** (a la papelera; confirma con n.º de registros/tags); buscar archivos faltantes (**buscar en hilo → resumen → confirmar → papelera**); botones *Reubicar carpeta o unidad…* y *Papelera de PhotoVault (N)*. |
 | `RelocateDialog` | Ruta vieja (combo con las unidades indexadas y si están disponibles) → ruta nueva; vista previa obligatoria con comprobación en disco. |
 | `TrashDialog` | Lotes de la papelera interna: restaurar, eliminar lote, vaciar. |
@@ -352,21 +381,26 @@ Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existe
 - Paleta en `config.COLORS`: fondo `#0D0D1A`, paneles `#13131F` / `#1E1E2E`, bordes `#2D2D3F` / `#3A3A5A`, acento `#4A9EFF`, peligro `#FF4A4A`, advertencia `#FFD700`, éxito `#4AFF9E`.
 - Mantener esta paleta en cualquier UI nueva. (Los estilos en línea existentes todavía usan los hex literales.)
 
-### Formato de exportación de tags (JSON, versión 2)
+### Formato de exportación de tags (JSON, versión 3)
 ```json
 { "version": 2, "app": "PhotoVault", "exported_at": "2026-10-04T12:00:00",
-  "tags": [{"name": "...", "category": "...", "color": "#RRGGBB", "hidden": false, "sidebar_hidden": false}],
+  "tags": [{"name": "...", "category": "...", "color": "#RRGGBB", "hidden": false, "sidebar_hidden": false,
+            "parent": "nombre del padre", "aliases": ["..."]}],
   "categories": ["..."],
-  "assignments": [{"path": "G:\\...\\a.jpg", "filename": "a.jpg", "filesize": 123, "tags": ["x", "y"]}] }
+  "assignments": [{"path": "G:\\...\\a.jpg", "filename": "a.jpg", "filesize": 123, "tags": ["x", "y"],
+                   "rating": 4, "favorite": true, "note": "..."}] }
 ```
-- Se sigue aceptando la versión 1 (sin `assignments`).
+- Se siguen aceptando las versiones 1 (sin `assignments`) y 2 (sin padre/alias/valoración). `parent`, `aliases`, `rating`, `favorite` y `note` son opcionales; `assignments` incluye también fotos sin etiquetas pero con valoración, favorita o nota.
+- Importar padre/alias solo si la etiqueta no tenía; valoración/favorita/nota solo se agregan.
+- Las búsquedas guardadas **no** se exportan (usan ids de etiquetas de esta DB).
 - La importación solo crea tags que no existan (nunca sobrescribe) y **solo agrega** asignaciones, nunca quita.
 - Emparejamiento de fotos: ruta exacta → si no, `(nombre, tamaño)` cuando hay **una sola** coincidencia (cambio de unidad/carpeta). Si hay varias, no adivina (`photos_missing`).
 - La UI pregunta si importar las asignaciones (Sí / No / Cancelar).
 
 ### Sidecars XMP (`xmp_sidecar.py`)
 - Opcional (Configuración, desactivado por defecto). Con la opción activa, `services._sync_sidecars(ids)` se llama tras **cada** función que cambia etiquetas (`add_tag`, `add_tag_by_id`, `remove_tag`, `bulk_*`, `update_tag`, `delete_tag`, `rename/delete_category`, `import_tags`). Si agregas otra función que cambie etiquetas, llama `_sync_sidecars` también.
-- Escribe `<foto>.<ext>.xmp` (digiKam/darktable); lee también `<foto>.xmp` (Lightroom). `dc:subject` + `lr:hierarchicalSubject` (`categoria|tag`).
+- Escribe `<foto>.<ext>.xmp` (digiKam/darktable); lee también `<foto>.xmp` (Lightroom). `dc:subject` + `lr:hierarchicalSubject` (`categoria|padre|tag`) + `xmp:Rating` (atributo; al leer se acepta también como elemento). Un sidecar con solo valoración también se escribe; `set_rating` sincroniza.
+- Al comparar "sin cambios" la categoría se reduce al primer nivel (así se lee): si no, cada foto con padre se reescribiría siempre.
 - Marca `photovault:managed="True"`: **solo se modifican/borran sidecars propios**; uno de otro programa nunca se toca (`SKIPPED_FOREIGN`). Sin etiquetas → se borra el propio.
 - No crea carpetas (si la de la foto no existe → `ERROR`, p. ej. disco desconectado). Escribe a `.tmp` y renombra.
 - `sync_all_sidecars` (escribir todo) e `import_from_sidecars` (leer los .xmp de todas las fotos indexadas, propios o ajenos) corren con `run_with_progress`.
@@ -446,7 +480,7 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
 3. `get_photos_for_tagging` carga todas las fotos coincidentes (843 ms para 171k); `QuickTagWindow` podría usar `GalleryModel` como el visor (fase 7).
-10. `services.py` pasa de 1.000 líneas: dividirlo por área (galería, etiquetas, mantenimiento) en un commit propio.
+10. `services.py` (~1.300 líneas), `database.py` (~1.700) y `ui/main_window.py` (~740) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
 11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
 9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
@@ -498,3 +532,5 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - Nombres tipo UUID daban años imposibles (2054…) → año ≤ actual + 1 y fechas compactas inválidas se descartan; se releen al re-indexar (`test_fecha_imposible_se_relee_aunque_el_archivo_no_cambie`).
 - Ctrl+A sobre 172k fotos tardaba 1,2 s → `visualRegionForSelection`.
 - Workers soltados (`= None`) en su `completed` mientras aún cerraban la conexión → `retire_thread`.
+- Ancho/alto sin la rotación EXIF (fotos verticales de celular como horizontales) → se intercambian al indexar (`test_dimensiones_con_la_orientacion_aplicada`).
+- "Mías" y "MÍAS" eran búsquedas distintas (`NOCASE` solo ASCII) → `casefold()`.

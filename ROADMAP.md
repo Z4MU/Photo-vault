@@ -153,16 +153,33 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 6 — Organización y filtros → v2.1
+## Fase 6 — Organización y filtros → v2.1 ✅
+*Medido con una copia de la DB real (171.843 fotos); migración a v4: 0,4 s.*
 
-- [ ] #39 ⭐ [M] Filtros AND / OR / NOT
-- [ ] #40 ⭐ [B] Filtros por tipo, fecha, resolución, orientación, duración
-- [ ] #41 [M] Búsquedas guardadas / álbumes inteligentes
-- [ ] #42 [B] Contador por tag y buscador en el sidebar
-- [ ] #43 [M] Renombrar y fusionar tags
-- [ ] #44 [M] Alias y tags jerárquicos
-- [ ] #45 [B] Favoritos y estrellas
-- [ ] #46 [B] Notas por foto
+| Operación | Tiempo |
+|---|---|
+| Contar con ★★★ o más / favoritas / 2018–2020 | 1 ms |
+| Contar verticales / ≥ 12 MP / videos < 30 s | 13–15 ms |
+| Incluir 5 etiquetas (O) / excluir 5 etiquetas | 0,6 ms / 18 ms |
+| Primera pantalla ordenada por valoración | 3 ms |
+| Ctrl+A y ★★ a toda la colección | 0,9 s |
+| Refrescar el panel de etiquetas (con contadores) | 47 ms |
+
+- [x] #39 ⭐ [M] Filtros Y / O / NO: cada etiqueta del sidebar alterna incluir ✓ → excluir ✕ → nada; "todas (Y)" o "alguna (O)"
+- [x] #40 ⭐ [B] Barra de filtros: tipo, años, orientación, resolución, duración, valoración, favoritas, sin etiquetar, con nota
+- [x] #41 [M] Búsquedas guardadas (Ctrl+S) + álbumes inteligentes fijos (pestaña ⭐ Álbum, con contadores)
+- [x] #42 [B] Contador de fotos por etiqueta y buscador (también por alias) en el sidebar y en el gestor
+- [x] #43 [M] Fusionar etiquetas (el nombre viejo queda como alias; las búsquedas guardadas se actualizan)
+- [x] #44 [M] Alias y etiquetas jerárquicas (filtrar por el padre incluye a las hijas; sin ciclos)
+- [x] #45 [B] Favoritas (F) y estrellas (1–5, 0 quita) en galería, visor y menú; ordenar por valoración
+- [x] #46 [B] Notas por foto (panel del visor; el buscador también busca en las notas)
+- [x] Nada se pierde: papelera, reubicar, exportar JSON (v3) y `.xmp` (`xmp:Rating`, `cat|padre|hija`) llevan lo nuevo
+- [x] *(bug)* Ancho/alto se guardaban sin aplicar la rotación EXIF (fotos de celular "horizontales"): corregido al indexar; opción **Releer todos los archivos** para lo ya indexado
+- [x] *(bug)* `COLLATE NOCASE` solo ignora mayúsculas ASCII: "Mías" y "MÍAS" eran dos búsquedas distintas
+- [x] 33 tests nuevos (255 en total) + prueba de humo con la DB real
+- Visor: **Z** alterna ajustar/100 % (antes 0 y 1, ahora son estrellas) y **F** es favorita (pantalla completa: F11).
+
+**Pendiente para el usuario:** indexar `G:\Fotos` con **Releer todos los archivos** (unos minutos) para que el filtro de orientación vea bien las fotos verticales de celular indexadas antes.
 
 ---
 
