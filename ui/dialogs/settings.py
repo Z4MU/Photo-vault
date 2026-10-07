@@ -1,6 +1,6 @@
 """
 PhotoVault - ui/dialogs/settings.py
-Configuración: página, caché de miniaturas, sidecars XMP.
+Configuración: caché de miniaturas, sidecars XMP.
 """
 
 import logging
@@ -13,7 +13,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
 )
 
@@ -31,40 +30,17 @@ logger = logging.getLogger(__name__)
 
 
 class SettingsDialog(QDialog):
-    def __init__(self, current_page_size: int, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuración")
-        self.setFixedSize(480, 520)
+        self.setFixedSize(480, 430)
         self.setStyleSheet(DARK_STYLE)
-        self.page_size = current_page_size
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(14)
-        layout.addWidget(QLabel("<b>Configuración de visualización</b>"))
-
-        r1 = QHBoxLayout()
-        r1.addWidget(QLabel("Fotos por página:"))
-        self.spin = QSpinBox()
-        self.spin.setRange(services.PAGE_SIZE_MIN, services.PAGE_SIZE_MAX)
-        self.spin.setSingleStep(10)
-        self.spin.setValue(self.page_size)
-        self.spin.setFixedWidth(80)
-        r1.addWidget(self.spin)
-        r1.addStretch()
-        layout.addLayout(r1)
-
-        info = QLabel("💡 Recomendado: 50-100 para colecciones grandes.")
-        info.setStyleSheet("color:#666;font-size:11px;")
-        layout.addWidget(info)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet("color:#2D2D3F;")
-        layout.addWidget(sep)
-
         layout.addWidget(QLabel("<b>Caché de miniaturas</b>"))
         self.cache_lbl = QLabel()
         self._refresh_cache_label()
@@ -220,7 +196,6 @@ class SettingsDialog(QDialog):
         )
 
     def _apply(self):
-        self.page_size = self.spin.value()
         was_enabled = services.is_xmp_enabled()
         services.set_xmp_enabled(self.chk_xmp.isChecked())
         if self.chk_xmp.isChecked() and not was_enabled:

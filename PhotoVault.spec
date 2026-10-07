@@ -42,6 +42,9 @@ hidden_imports = [
     'PyQt6.QtSvgWidgets',
     'PyQt6.QtPrintSupport',
     'PyQt6.QtNetwork',
+    # Video integrado en el visor (import con try en ui/video_player.py)
+    'PyQt6.QtMultimedia',
+    'PyQt6.QtMultimediaWidgets',
     # Pillow
     'PIL._tkinter_finder',
     'PIL.Image',

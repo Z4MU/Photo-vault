@@ -150,10 +150,87 @@ def _extract_date_from_exif(path: str) -> tuple[int | None, int | None]:
     return None, None
 
 
+# Datos de cámara para el panel de información del visor (IFD0 y IFD Exif)
+_TAG_MAKE = 271
+_TAG_MODEL = 272
+_TAG_EXPOSURE = 33434
+_TAG_FNUMBER = 33437
+_TAG_ISO = 34855
+_TAG_FOCAL = 37386
+_TAG_LENS = 42036
+
+
+def _rational(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def read_exif_details(path: str) -> dict[str, str]:
+    """
+    {etiqueta: valor} legibles de la cámara (marca/modelo, objetivo, fecha de
+    captura, exposición…). Solo lo que el archivo tenga; {} si no hay EXIF.
+    """
+    out: dict[str, str] = {}
+    try:
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return out
+            ifd = exif.get_ifd(_EXIF_IFD)
+    except Exception as e:
+        logger.debug("Sin EXIF en %s: %s", path, e)
+        return out
+
+    def text(value) -> str:
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        return str(value).strip().strip("\x00").strip() if value is not None else ""
+
+    make, model = text(exif.get(_TAG_MAKE)), text(exif.get(_TAG_MODEL))
+    if model and make and not model.lower().startswith(make.lower()):
+        model = f"{make} {model}"
+    if model or make:
+        out["Cámara"] = model or make
+    if lens := text(ifd.get(_TAG_LENS)):
+        out["Objetivo"] = lens
+    taken = text(ifd.get(_TAG_DATETIME_ORIGINAL))
+    try:
+        out["Tomada"] = datetime.strptime(taken[:19], "%Y:%m:%d %H:%M:%S").strftime("%d/%m/%Y %H:%M")
+    except ValueError:
+        pass
+    settings: list[str] = []
+    if (exp := _rational(ifd.get(_TAG_EXPOSURE))) and exp > 0:
+        settings.append(f"1/{round(1 / exp)} s" if exp < 1 else f"{exp:g} s")
+    if fnum := _rational(ifd.get(_TAG_FNUMBER)):
+        settings.append(f"f/{fnum:.1f}".replace(".0", ""))
+    iso = ifd.get(_TAG_ISO)
+    if isinstance(iso, tuple):
+        iso = iso[0] if iso else None
+    if iso:
+        settings.append(f"ISO {iso}")
+    if focal := _rational(ifd.get(_TAG_FOCAL)):
+        settings.append(f"{focal:g} mm")
+    if settings:
+        out["Ajustes"] = " · ".join(settings)
+    return out
+
+
+# Patrones compactos (YYYYMMDD sin separadores): si el mes o el día no son
+# válidos, los 8 dígitos no eran una fecha (UUIDs, contadores) y se descartan.
+_COMPACT_PATTERNS = {1, 2}
+
+
+def max_plausible_year() -> int:
+    """Un año más que el actual: una foto no puede ser del futuro (UUIDs como 20547205-…)."""
+    return datetime.now().year + 1
+
+
 def _extract_date_from_string(text: str):
-    for pattern in _COMPILED_PATTERNS:
-        m = pattern.search(text)
-        if m:
+    max_year = max_plausible_year()
+    for idx, pattern in enumerate(_COMPILED_PATTERNS):
+        for m in pattern.finditer(text):
             groups = m.groups()
             try:
                 year = int(groups[0])
@@ -166,9 +243,14 @@ def _extract_date_from_string(text: str):
                     month = int(groups[1])
                 except ValueError:
                     month = None
+            day = int(groups[2]) if len(groups) > 2 and groups[2] else None
 
             # Validar rangos — rechaza años inverosímiles y meses imposibles
-            if not (1990 <= year <= 2099):
+            if not (1990 <= year <= max_year):
+                continue
+            if idx in _COMPACT_PATTERNS and not (
+                month is not None and 1 <= month <= 12 and day is not None and 1 <= day <= 31
+            ):
                 continue
             if month is not None and not (1 <= month <= 12):
                 month = None  # año válido, mes inválido → guardar solo año
@@ -347,6 +429,7 @@ def index_folder(
 
     files = scan_media_files(folder, should_stop)
     known = db.get_index_state(folder)
+    max_year = max_plausible_year()
     result = IndexResult()
     pending: list[db.PhotoRecord] = []
     # Registros de antes de v3 (mtime NULL) con el mismo tamaño: solo se les
@@ -371,11 +454,13 @@ def index_folder(
 
         previous = known.get(f.path)
         if not force and previous is not None:
-            old_size, old_mtime = previous
-            if old_size == f.size and old_mtime == f.mtime:
+            old_size, old_mtime, old_year = previous
+            # Una fecha imposible (regla vieja, p. ej. un UUID "20547205-…") obliga a releer
+            implausible = old_year is not None and old_year > max_year
+            if not implausible and old_size == f.size and old_mtime == f.mtime:
                 result.unchanged += 1
                 continue
-            if old_mtime is None and old_size == f.size:
+            if not implausible and old_mtime is None and old_size == f.size:
                 mtime_only.append((f.mtime, f.path))
                 result.unchanged += 1
                 if len(mtime_only) >= BATCH_SIZE:

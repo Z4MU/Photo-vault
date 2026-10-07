@@ -4,7 +4,11 @@ Hilos (QThread) y utilidades para correr tareas largas sin congelar la UI.
 """
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+from collections import OrderedDict
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any
 
 from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -14,7 +18,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-import config
 import database as db
 import indexer
 import logging_setup
@@ -117,60 +120,85 @@ def _load_thumbnail_image(photo: Photo, size: int) -> QImage | None:
     return img
 
 
-class ThumbnailLoader(StoppableThread):
+class ImageLoadQueue(StoppableThread):
     """
-    Carga las miniaturas de la página actual en paralelo (THUMB_WORKERS hilos)
-    y emite `loaded` a medida que están. Después sigue generando en caché las
-    de `prefetch` (la página siguiente) sin emitir nada, para que al pasar de
-    página aparezcan al instante.
+    Cola persistente de carga de imágenes (miniaturas de la galería, fotos del
+    visor). `request(key, arg)` desde el hilo de la UI; `load_fn(arg)` corre en
+    `workers` hilos y se emite `loaded(key, QImage)` (QImage nula = falló).
+
+    Se atiende primero lo último que se pidió (LIFO): al hacer scroll rápido,
+    lo que está en pantalla ahora va antes que lo que ya pasó. Si se acumulan
+    más de `max_pending`, se descartan los pedidos más viejos y `request`
+    devuelve sus claves (para que quien pidió pueda volver a pedirlas).
     """
 
-    loaded = pyqtSignal(int, QImage)
+    loaded = pyqtSignal(str, QImage)
 
-    def __init__(self, photos: list[Photo], prefetch: list[Photo] | None = None, size: int | None = None):
+    def __init__(self, load_fn: Callable[[Any], QImage | None], workers: int, max_pending: int = 400):
         super().__init__()
-        self.photos = photos
-        self.prefetch = prefetch or []
-        self.size = size or config.THUMB_SIZE_GALLERY
+        self._load_fn = load_fn
+        self._workers = max(1, workers)
+        self._max_pending = max_pending
+        self._cond = threading.Condition()
+        self._pending: OrderedDict[str, Any] = OrderedDict()
+
+    def request(self, key: str, arg: Any) -> list[str]:
+        dropped: list[str] = []
+        with self._cond:
+            if key in self._pending:
+                self._pending.move_to_end(key)
+            else:
+                self._pending[key] = arg
+                while len(self._pending) > self._max_pending:
+                    dropped.append(self._pending.popitem(last=False)[0])
+            self._cond.notify()
+        return dropped
+
+    def clear(self) -> None:
+        """Descarta lo pendiente (lo que ya se está cargando igual se emite)."""
+        with self._cond:
+            self._pending.clear()
+
+    def pending_count(self) -> int:
+        with self._cond:
+            return len(self._pending)
+
+    def stop(self):
+        super().stop()
+        with self._cond:
+            self._cond.notify_all()
 
     def run(self):
         try:
-            with ThreadPoolExecutor(max_workers=services.THUMB_WORKERS) as pool:
-                futures = {pool.submit(self._safe_load, p): p for p in self.photos}
-                for fut in as_completed(futures):
-                    if self._stop_flag:
-                        break
-                    img = fut.result()
-                    if img is not None:
-                        self.loaded.emit(futures[fut].id, img)
-                if self._stop_flag:
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    return
-                # Precarga: solo dejar las miniaturas en el caché de disco
-                for chunk_start in range(0, len(self.prefetch), services.THUMB_WORKERS):
-                    if self._stop_flag:
-                        break
-                    chunk = self.prefetch[chunk_start : chunk_start + services.THUMB_WORKERS]
-                    list(pool.map(self._safe_cache, chunk))
+            with ThreadPoolExecutor(max_workers=self._workers) as pool:
+                while True:
+                    with self._cond:
+                        while not self._pending and not self._stop_flag:
+                            self._cond.wait()
+                        if self._stop_flag:
+                            return
+                        n = min(self._workers, len(self._pending))
+                        batch = [self._pending.popitem(last=True) for _ in range(n)]
+                    for (key, _arg), img in zip(batch, pool.map(self._safe_load, batch), strict=True):
+                        if self._stop_flag:
+                            return
+                        self.loaded.emit(key, img if img is not None else QImage())
         finally:
             db.close_connection()
 
-    def _safe_load(self, photo: Photo) -> QImage | None:
+    def _safe_load(self, item: tuple[str, Any]) -> QImage | None:
         if self._stop_flag:
             return None
         try:
-            return _load_thumbnail_image(photo, self.size)
+            return self._load_fn(item[1])
         except Exception:
-            logger.exception("Error cargando miniatura de %s", photo.path)
+            logger.exception("Error cargando imagen %s", item[0])
             return None
 
-    def _safe_cache(self, photo: Photo) -> None:
-        if self._stop_flag:
-            return
-        try:
-            thumbnail_cache.get_photo_thumbnail(photo, size=self.size)
-        except Exception:
-            logger.exception("Error precargando miniatura de %s", photo.path)
+
+def thumbnail_queue() -> ImageLoadQueue:
+    """Cola de miniaturas de la galería: arg = (Photo, tamaño)."""
+    return ImageLoadQueue(lambda arg: _load_thumbnail_image(*arg), workers=services.THUMB_WORKERS)
 
 
 class MD5Worker(StoppableThread):

@@ -16,6 +16,7 @@ from pathlib import Path
 from send2trash import send2trash
 
 import database as db
+import indexer
 import thumbnail_cache
 import xmp_sidecar
 from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag, TrashBatch
@@ -84,6 +85,125 @@ def get_gallery_page(
         sort_field=sort_field,
         sort_order=sort_order,
     )
+
+
+@dataclass(frozen=True)
+class GalleryQuery:
+    """Lo que muestra la galería: filtros + orden. Las etiquetas ocultas se excluyen siempre."""
+
+    tag_ids: tuple[int, ...] = ()
+    search: str | None = None
+    folder: str | None = None
+    sort_field: SortField = SortField.DATE
+    sort_order: SortOrder = SortOrder.DESC
+
+    def photo_filter(self) -> db.PhotoFilter:
+        return db.PhotoFilter(
+            tag_ids=list(self.tag_ids) or None,
+            hidden_tag_ids=db.get_hidden_tag_ids(),
+            search=self.search or None,
+            folder=self.folder or None,
+        )
+
+
+def count_gallery(q: GalleryQuery) -> int:
+    f = q.photo_filter()
+    return db.get_photo_count(f.tag_ids, f.hidden_tag_ids, f.search, f.folder)
+
+
+def get_gallery_chunk(q: GalleryQuery, offset: int, limit: int) -> list[Photo]:
+    """Un tramo de la galería (la vista virtualizada pide los que se ven)."""
+    return get_gallery_photos(
+        tag_ids=list(q.tag_ids) or None,
+        search=q.search or None,
+        limit=limit,
+        offset=offset,
+        sort_field=q.sort_field,
+        sort_order=q.sort_order,
+        folder=q.folder or None,
+    )
+
+
+def get_gallery_ids(q: GalleryQuery, offset: int = 0, limit: int = -1) -> list[int]:
+    """Ids de un tramo (o de todo) sin cargar las fotos: selecciones de miles de fotos."""
+    return db.get_photo_ids(q.photo_filter(), q.sort_field, q.sort_order, limit=limit, offset=offset)
+
+
+NO_MONTH = db.NO_MONTH
+
+
+def gallery_row_of_date(q: GalleryQuery, year: int | None, month: int | None = None) -> int:
+    """
+    Fila de la primera foto de ese año/mes (solo con orden por fecha).
+    month=None: el año completo; month=NO_MONTH: las de ese año sin mes.
+    """
+    if q.sort_field != SortField.DATE:
+        raise ValueError("Saltar a una fecha requiere ordenar por fecha")
+    return db.count_before_date(q.photo_filter(), year, month, q.sort_order)
+
+
+@dataclass(frozen=True)
+class DateBucket:
+    year: int | None
+    month: int | None
+    count: int
+
+
+def get_date_histogram(q: GalleryQuery) -> list[DateBucket]:
+    """Fotos por año/mes con los filtros de la galería; lo más nuevo primero, sin fecha al final."""
+    rows = db.get_date_histogram(q.photo_filter())
+    rows.sort(key=lambda r: (r[0] is None, -(r[0] or 0), r[1] is None, -(r[1] or 0)))
+    return [DateBucket(y, m, n) for y, m, n in rows]
+
+
+@dataclass
+class FolderNode:
+    """Carpeta del árbol: `count` = archivos directamente en ella, `total` = con subcarpetas."""
+
+    name: str
+    path: str
+    count: int = 0
+    total: int = 0
+    children: list["FolderNode"] = field(default_factory=list)
+
+
+def build_folder_tree(folder_counts: list[tuple[str, int]]) -> list[FolderNode]:
+    """Árbol de carpetas a partir de [(carpeta, n)]. Devuelve las raíces (unidades)."""
+    roots: dict[str, FolderNode] = {}
+    index: dict[str, FolderNode] = {}
+    for folder, n in folder_counts:
+        parts = Path(folder).parts
+        if not parts:
+            continue
+        node = None
+        for i in range(len(parts)):
+            path = os.path.join(*parts[: i + 1])
+            child = index.get(path)
+            if child is None:
+                child = FolderNode(name=parts[i].rstrip("\\/") or parts[i], path=path)
+                index[path] = child
+                if node is None:
+                    roots[path] = child
+                else:
+                    node.children.append(child)
+            child.total += n
+            node = child
+        assert node is not None
+        node.count += n
+    for node in index.values():
+        node.children.sort(key=lambda c: c.name.lower())
+    return sorted(roots.values(), key=lambda c: c.name.lower())
+
+
+def get_folder_tree() -> list[FolderNode]:
+    return build_folder_tree(db.get_folder_counts())
+
+
+def get_photo_details(photo: Photo) -> dict[str, str]:
+    """Datos de cámara (EXIF) para el panel de información. Lee el archivo: llamar desde un hilo."""
+    if photo.is_video:
+        return {}
+    return indexer.read_exif_details(photo.path)
 
 
 def get_photos_for_tagging(
@@ -281,22 +401,23 @@ def get_totals() -> tuple[int, int]:
 
 # ── Preferencias ──────────────────────────────────────────────────────────────
 
-PAGE_SIZE_DEFAULT = 100
-PAGE_SIZE_MIN = 10
-PAGE_SIZE_MAX = 500
+THUMB_DISPLAY_DEFAULT = 200
+THUMB_DISPLAY_MIN = 100
+THUMB_DISPLAY_MAX = 400
 
 
-def get_page_size() -> int:
-    raw = db.get_setting("page_size")
+def get_thumb_display_size() -> int:
+    """Tamaño de las miniaturas en la galería (slider), en píxeles."""
+    raw = db.get_setting("thumb_size")
     try:
-        value = int(raw) if raw is not None else PAGE_SIZE_DEFAULT
+        value = int(raw) if raw is not None else THUMB_DISPLAY_DEFAULT
     except ValueError:
-        value = PAGE_SIZE_DEFAULT
-    return max(PAGE_SIZE_MIN, min(PAGE_SIZE_MAX, value))
+        value = THUMB_DISPLAY_DEFAULT
+    return max(THUMB_DISPLAY_MIN, min(THUMB_DISPLAY_MAX, value))
 
 
-def set_page_size(value: int) -> None:
-    db.set_setting("page_size", str(max(PAGE_SIZE_MIN, min(PAGE_SIZE_MAX, int(value)))))
+def set_thumb_display_size(value: int) -> None:
+    db.set_setting("thumb_size", str(max(THUMB_DISPLAY_MIN, min(THUMB_DISPLAY_MAX, int(value)))))
 
 
 # ── Exportar / importar etiquetas ─────────────────────────────────────────────

@@ -10,7 +10,7 @@ los tests puedan redirigirlas con monkeypatch. Cambia el valor aquí, no allá.
 from pathlib import Path
 
 APP_NAME = "PhotoVault"
-APP_VERSION = "1.3.0"
+APP_VERSION = "2.0.0"
 
 # ── Datos del usuario (fuera del repo) ────────────────────────────────────────
 DATA_DIR = Path.home() / ".photovault"
@@ -22,7 +22,10 @@ LOG_DIR = DATA_DIR / "logs"
 # ── Miniaturas (lado máximo en píxeles) ───────────────────────────────────────
 THUMB_SIZE_SMALL = 100  # vista de duplicados
 THUMB_SIZE_GALLERY = 200  # galería
-THUMB_SIZE_LARGE = 480  # etiquetado rápido, detalle de videos
+THUMB_SIZE_LARGE = 480  # etiquetado rápido, galería con miniaturas grandes
+# Visor: lado máximo al decodificar (permite zoom al 100 % en fotos de hasta ~27 MP
+# sin pasar de ~150 MB por imagen en memoria)
+VIEWER_MAX_SIDE = 6000
 
 # ── Paleta del tema oscuro (también usada en ui/dark.qss) ─────────────────────
 COLORS = {

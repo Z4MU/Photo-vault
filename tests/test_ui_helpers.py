@@ -135,30 +135,71 @@ def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
     win.close()
 
 
-def test_cargador_de_miniaturas_en_paralelo_con_precarga(qapp, tmp_path, db_path):
+def _wait_for(qapp, cond, timeout_s: float = 20.0) -> bool:
+    import time
+
+    end = time.monotonic() + timeout_s
+    while time.monotonic() < end:
+        qapp.processEvents()
+        if cond():
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def test_cola_de_miniaturas_carga_y_reporta_fallos(qapp, tmp_path, db_path):
     import database as db
-    import thumbnail_cache as tc
 
     db.init_db()
-    photos = []
-    for i in range(10):
+    for i in range(6):
         p = tmp_path / f"{i}.jpg"
         Image.new("RGB", (400, 300)).save(p)
         db.upsert_photo(str(p), p.name, 2020, 1, p.stat().st_size, mtime=p.stat().st_mtime)
+    (tmp_path / "roto.jpg").write_bytes(b"x")
+    db.upsert_photo(str(tmp_path / "roto.jpg"), "roto.jpg", 2020, 1, 1)
     photos = db.get_photos(limit=-1)
-    page, nxt = photos[:6], photos[6:]
 
-    got: dict[int, tuple[int, int]] = {}
-    loader = workers.ThumbnailLoader(page, prefetch=nxt)
-    loader.loaded.connect(lambda pid, img: got.__setitem__(pid, (img.width(), img.height())))
-    loader.start()
-    assert loader.wait(20_000)
-    qapp.processEvents()
+    q = workers.thumbnail_queue()
+    got: dict[str, tuple[int, int]] = {}
+    q.loaded.connect(lambda key, img: got.__setitem__(key, (img.width(), img.height())))
+    q.start()
+    try:
+        for p in photos:
+            q.request(f"k{p.id}", (p, 200))
+        assert _wait_for(qapp, lambda: len(got) == len(photos))
+    finally:
+        q.stop()
+        assert q.wait(5000)
+    broken = next(p for p in photos if p.filename == "roto.jpg")
+    assert got.pop(f"k{broken.id}") == (0, 0)  # QImage nula = falló
+    assert all(0 < max(wh) <= 200 for wh in got.values())
 
-    assert set(got) == {p.id for p in page}
-    assert all(max(wh) <= 200 for wh in got.values())
-    # La página siguiente quedó en el caché de disco, sin emitirse
-    assert all(tc.is_cached(p.path, mtime=p.mtime) for p in nxt)
+
+def test_cola_atiende_lo_ultimo_primero_y_descarta_lo_viejo(qapp):
+    order: list[str] = []
+
+    def load(arg: str) -> QImage:
+        order.append(arg)
+        return QImage(1, 1, QImage.Format.Format_RGB32)
+
+    q = workers.ImageLoadQueue(load, 1, 3)
+    # Sin arrancar el hilo: se acumulan
+    assert q.request("a", "a") == []
+    q.request("b", "b")
+    q.request("c", "c")
+    assert q.request("d", "d") == ["a"]  # pasó del máximo: se descarta el más viejo
+    q.request("b", "b")  # volver a pedir lo sube al frente
+    loaded: list[str] = []
+    q.loaded.connect(lambda key, _img: loaded.append(key))
+    q.start()
+    try:
+        assert _wait_for(qapp, lambda: len(loaded) == 3)
+    finally:
+        q.stop()
+        assert q.wait(5000)
+    assert order == ["b", "d", "c"]
+    q.clear()
+    assert q.pending_count() == 0
 
 
 def test_index_dialog_pide_indexar_y_se_cierra(qapp, tmp_path):

@@ -70,24 +70,24 @@ def test_tags_ocultos_se_pueden_listar_para_restaurarlos():
     assert services.count_sidebar_hidden_tags() == 1
 
 
-# ── Tamaño de página ─────────────────────────────────────────────────────────
+# ── Tamaño de miniaturas (slider de la galería) ──────────────────────────────
 
 
-def test_tamano_de_pagina_por_defecto():
-    assert services.get_page_size() == services.PAGE_SIZE_DEFAULT
+def test_tamano_de_miniatura_por_defecto():
+    assert services.get_thumb_display_size() == services.THUMB_DISPLAY_DEFAULT
 
 
-def test_tamano_de_pagina_persiste():
-    services.set_page_size(250)
+def test_tamano_de_miniatura_persiste():
+    services.set_thumb_display_size(260)
     db.close_connection()
     db.init_db()
-    assert services.get_page_size() == 250
+    assert services.get_thumb_display_size() == 260
 
 
-@pytest.mark.parametrize("raw, expected", [("9999", 500), ("1", 10), ("basura", 100)])
-def test_tamano_de_pagina_se_acota(raw, expected):
-    db.set_setting("page_size", raw)
-    assert services.get_page_size() == expected
+@pytest.mark.parametrize("raw, expected", [("9999", 400), ("1", 100), ("basura", 200)])
+def test_tamano_de_miniatura_se_acota(raw, expected):
+    db.set_setting("thumb_size", raw)
+    assert services.get_thumb_display_size() == expected
 
 
 def test_contador_para_etiquetado_rapido():

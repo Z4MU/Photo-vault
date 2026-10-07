@@ -468,13 +468,13 @@ def get_photo_ids_by_paths(paths: list[str]) -> list[int]:
     return ids
 
 
-def get_index_state(folder: str) -> dict[str, tuple[int | None, float | None]]:
-    """{ruta: (tamaño, mtime)} de lo ya indexado dentro de `folder` (indexación incremental)."""
+def get_index_state(folder: str) -> dict[str, tuple[int | None, float | None, int | None]]:
+    """{ruta: (tamaño, mtime, año)} de lo ya indexado dentro de `folder` (indexación incremental)."""
     rows = get_connection().execute(
-        "SELECT path, filesize, mtime FROM photos WHERE path LIKE ? ESCAPE '!'",
+        "SELECT path, filesize, mtime, year FROM photos WHERE path LIKE ? ESCAPE '!'",
         (folder_like_pattern(folder),),
     )
-    return {r[0]: (r[1], r[2]) for r in rows}
+    return {r[0]: (r[1], r[2], r[3]) for r in rows}
 
 
 def update_photo_md5(photo_id: int, md5: str):
@@ -596,6 +596,69 @@ def get_photo_count(
     )
     row = get_connection().execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
     return row[0]
+
+
+def _and(where_sql: str, condition: str) -> str:
+    return f"{where_sql} AND ({condition})" if where_sql else f"WHERE {condition}"
+
+
+def get_photo_ids(
+    f: PhotoFilter,
+    sort_field: SortField = SortField.DATE,
+    sort_order: SortOrder = SortOrder.DESC,
+    limit: int = -1,
+    offset: int = 0,
+) -> list[int]:
+    """Solo los ids, en el mismo orden que get_photos (selecciones grandes de la galería)."""
+    where_sql, params = _build_where(f)
+    rows = get_connection().execute(
+        f"SELECT p.id FROM photos p {where_sql} ORDER BY {sort_to_sql(sort_field, sort_order)} LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    )
+    return [r[0] for r in rows]
+
+
+NO_MONTH = 0  # count_before_date: "las fotos de ese año que no tienen mes"
+
+
+def count_before_date(f: PhotoFilter, year: int | None, month: int | None, order: SortOrder) -> int:
+    """
+    Cuántas fotos van antes de la primera de (year, month) en el orden por fecha:
+    es la fila a la que saltar en la galería. month=None = el año completo;
+    year=None = las fotos sin fecha; month=NO_MONTH = las de ese año sin mes.
+    SQLite pone los NULL primero en ASC y al final en DESC, y estas
+    condiciones respetan eso.
+    """
+    extra: list[object]
+    if order == SortOrder.DESC:
+        if year is None:
+            cond, extra = "p.year IS NOT NULL", []
+        elif month is None:
+            cond, extra = "p.year > ?", [year]
+        elif month == NO_MONTH:
+            cond, extra = "p.year > ? OR (p.year = ? AND p.month IS NOT NULL)", [year, year]
+        else:
+            cond, extra = "p.year > ? OR (p.year = ? AND p.month > ?)", [year, year, month]
+    else:
+        if year is None:
+            return 0
+        if month is None or month == NO_MONTH:
+            cond, extra = "p.year IS NULL OR p.year < ?", [year]
+        else:
+            cond = "p.year IS NULL OR p.year < ? OR (p.year = ? AND (p.month IS NULL OR p.month < ?))"
+            extra = [year, year, month]
+    where_sql, params = _build_where(f)
+    sql = f"SELECT COUNT(*) FROM photos p {_and(where_sql, cond)}"
+    return get_connection().execute(sql, [*params, *extra]).fetchone()[0]
+
+
+def get_date_histogram(f: PhotoFilter) -> list[tuple[int | None, int | None, int]]:
+    """[(año, mes, n.º de fotos)] para la línea de tiempo (con los filtros actuales)."""
+    where_sql, params = _build_where(f)
+    rows = get_connection().execute(
+        f"SELECT p.year, p.month, COUNT(*) FROM photos p {where_sql} GROUP BY p.year, p.month", params
+    )
+    return [(r[0], r[1], r[2]) for r in rows]
 
 
 def get_folder_counts() -> list[tuple[str, int]]:

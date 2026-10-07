@@ -204,3 +204,18 @@ def test_archivo_ilegible_cuenta_error_sin_detener(tmp_path):
 def test_heic_soportado():
     pytest.importorskip("pillow_heif")
     assert indexer._HEIF_AVAILABLE
+
+
+def test_fecha_imposible_se_relee_aunque_el_archivo_no_cambie(tmp_path, db_path):
+    db.init_db()
+    p = tmp_path / "20547205-28df-4d24-b17f-53d8a999289f.jpg"
+    Image.new("RGB", (10, 10)).save(p)
+    indexer.index_folder(str(tmp_path))
+    st = p.stat()
+    # Como lo dejó una versión vieja: año 2054 con el mismo tamaño y mtime
+    db.upsert_photo(str(p), p.name, 2054, None, st.st_size, mtime=st.st_mtime)
+    r = indexer.index_folder(str(tmp_path))
+    assert (r.updated, r.unchanged) == (1, 0)
+    photo = db.get_photos(limit=-1)[0]
+    assert photo.year is not None and photo.year <= indexer.max_plausible_year()
+    assert indexer.index_folder(str(tmp_path)).unchanged == 1

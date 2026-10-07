@@ -1,14 +1,11 @@
 """
 PhotoVault - ui/dialogs/photo.py
-Detalle de una foto y etiquetado en lote.
+Editor de etiquetas de una foto (panel del visor) y etiquetado en lote.
 """
 
-import html
 import logging
-from pathlib import Path
 
-from PyQt6.QtCore import Qt, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QPixmap
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -16,120 +13,83 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
 
-import config
 import services
-import thumbnail_cache
-from models import Photo, Tag
-from ui.images import load_preview_pixmap
+from models import Tag
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 
 logger = logging.getLogger(__name__)
 
 
-# ─── Dialog: Ver/editar foto ──────────────────────────────────────────────────
+# ─── Editor de etiquetas de una foto ──────────────────────────────────────────
 
 
-class PhotoDetailDialog(QDialog):
+class TagEditor(QWidget):
+    """Chips de las etiquetas de una foto (✕ quita) + combo para agregar. Lo usa el visor."""
+
     tags_changed = pyqtSignal()
 
-    def __init__(self, photo: Photo, parent=None):
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.photo = photo
-        self.setWindowTitle("Detalle")
-        self.setMinimumSize(900, 600)
-        self.setStyleSheet(DARK_STYLE)
-        self._build_ui()
-        self._load_tags()
-
-    def _build_ui(self):
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(12)
-
-        if self.photo.is_video:
-            left = QWidget()
-            left.setMinimumWidth(500)
-            ll = QVBoxLayout(left)
-            ll.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = thumbnail_cache.get_photo_thumbnail(self.photo, size=config.THUMB_SIZE_LARGE)
-            lbl = QLabel()
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            if thumb:
-                pix = QPixmap()
-                pix.loadFromData(thumb)
-                lbl.setPixmap(pix)
-            else:
-                lbl.setText("🎬")
-                lbl.setStyleSheet("font-size:64px;")
-            ll.addWidget(lbl)
-            btn = QPushButton("▶  Reproducir")
-            btn.setStyleSheet(
-                "QPushButton{background:#4A9EFF22;color:#4A9EFF;"
-                "border:1px solid #4A9EFF;border-radius:8px;padding:10px 20px;font-size:14px;}"
-                "QPushButton:hover{background:#4A9EFF44;}"
-            )
-            btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(self.photo.path)))
-            ll.addWidget(btn)
-            layout.addWidget(left)
-        else:
-            img = QLabel()
-            img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            img.setMinimumWidth(500)
-            preview = load_preview_pixmap(self.photo.path, 560)
-            if preview is not None:
-                img.setPixmap(preview)
-            else:
-                img.setText("No se pudo cargar la imagen")
-            layout.addWidget(img)
-
-        right = QVBoxLayout()
-        right.setSpacing(10)
-        right.addWidget(QLabel(f"<b>{html.escape(Path(self.photo.path).name)}</b>"))
-        right.addWidget(QLabel("Etiquetas:"))
+        self.photo_id: int | None = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
 
         self.tags_container = QWidget()
-        self.tags_layout = QHBoxLayout(self.tags_container)
+        self.tags_layout = QVBoxLayout(self.tags_container)
         self.tags_layout.setContentsMargins(0, 0, 0, 0)
-        self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        scroll = QScrollArea()
-        scroll.setWidget(self.tags_container)
-        scroll.setWidgetResizable(True)
-        scroll.setFixedHeight(80)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        right.addWidget(scroll)
+        self.tags_layout.setSpacing(4)
+        self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(self.tags_container)
 
-        right.addWidget(QLabel("Agregar etiqueta:"))
         row = QHBoxLayout()
         self.tag_combo = QComboBox()
         self.tag_combo.setEditable(True)
         self.tag_combo.setPlaceholderText("Buscar o nueva etiqueta…")
-        row.addWidget(self.tag_combo)
-        btn_add = QPushButton("＋ Agregar")
+        line = self.tag_combo.lineEdit()
+        if line is not None:
+            line.returnPressed.connect(self._add_tag)
+        row.addWidget(self.tag_combo, stretch=1)
+        btn_add = QPushButton("＋")
+        btn_add.setToolTip("Agregar etiqueta (Enter)")
+        btn_add.setFixedWidth(34)
         btn_add.clicked.connect(self._add_tag)
         row.addWidget(btn_add)
-        right.addLayout(row)
-        right.addStretch()
-        layout.addLayout(right)
+        lay.addLayout(row)
 
-    def _load_tags(self):
+    def set_photo(self, photo_id: int | None) -> None:
+        self.photo_id = photo_id
+        self.reload()
+
+    def reload(self) -> None:
         clear_layout(self.tags_layout)
-        for tag in services.get_photo_tags(self.photo.id):
-            self.tags_layout.addWidget(self._chip(tag))
+        if self.photo_id is not None:
+            tags = services.get_photo_tags(self.photo_id)
+            for tag in tags:
+                self.tags_layout.addWidget(self._chip(tag))
+            if not tags:
+                empty = QLabel("Sin etiquetas")
+                empty.setStyleSheet("color:#666;font-size:11px;")
+                self.tags_layout.addWidget(empty)
+        text = self.tag_combo.currentText()
+        self.tag_combo.blockSignals(True)
         self.tag_combo.clear()
         for t in services.get_all_tags():
             self.tag_combo.addItem(t.name, userData=t.id)
+        self.tag_combo.setCurrentIndex(-1)
+        self.tag_combo.setEditText(text if self.photo_id is None else "")
+        self.tag_combo.blockSignals(False)
 
     def _chip(self, tag: Tag) -> QPushButton:
         btn = QPushButton(f"{tag.name}  ✕")
+        btn.setToolTip(f"Quitar «{tag.name}» ({tag.category})")
         btn.setStyleSheet(
-            f"QPushButton{{background:{tag.color}33;color:{tag.color};"
+            f"QPushButton{{background:{tag.color}33;color:{tag.color};text-align:left;"
             f"border:1px solid {tag.color};border-radius:10px;padding:2px 8px;font-size:11px;}}"
             f"QPushButton:hover{{background:{tag.color}66;}}"
         )
@@ -138,15 +98,16 @@ class PhotoDetailDialog(QDialog):
 
     def _add_tag(self):
         text = self.tag_combo.currentText().strip().lower()
-        if text:
-            services.add_tag(self.photo.id, text)
-            self._load_tags()
+        if text and self.photo_id is not None:
+            services.add_tag(self.photo_id, text)
+            self.reload()
             self.tags_changed.emit()
 
     def _remove_tag(self, tag_id: int):
-        services.remove_tag(self.photo.id, tag_id)
-        self._load_tags()
-        self.tags_changed.emit()
+        if self.photo_id is not None:
+            services.remove_tag(self.photo_id, tag_id)
+            self.reload()
+            self.tags_changed.emit()
 
 
 # ─── Dialog: Etiquetado en lote ───────────────────────────────────────────────
