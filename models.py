@@ -14,6 +14,7 @@ class SortField(Enum):
     FILENAME = "nombre"
     FILESIZE = "tamaño"
     ADDED_AT = "agregado"
+    RATING = "valoración"
 
 
 class SortOrder(Enum):
@@ -35,6 +36,12 @@ _SORT_SQL: dict[tuple, str] = {
     (SortField.FILESIZE, SortOrder.ASC): "p.filesize ASC, p.id ASC",
     (SortField.ADDED_AT, SortOrder.DESC): "p.added_at DESC, p.id DESC",
     (SortField.ADDED_AT, SortOrder.ASC): "p.added_at ASC, p.id ASC",
+    # idx_photos_rating (v4); dentro de cada valoración, por fecha
+    (
+        SortField.RATING,
+        SortOrder.DESC,
+    ): "p.rating DESC, p.year DESC, p.month DESC, p.filename DESC, p.id DESC",
+    (SortField.RATING, SortOrder.ASC): "p.rating ASC, p.year ASC, p.month ASC, p.filename ASC, p.id ASC",
 }
 
 
@@ -60,6 +67,13 @@ class Photo:
     added_at: str | None = None
     md5: str | None = None  # Solo se carga donde hace falta (duplicados)
     mtime: float | None = None  # mtime del archivo al indexarlo (None = antes de v3)
+    rating: int = 0  # 0 = sin valorar, 1–5 estrellas (v4)
+    favorite: bool = False
+    note: str | None = None
+
+    @property
+    def stars(self) -> str:
+        return "★" * self.rating + "☆" * (5 - self.rating) if self.rating else ""
 
     @property
     def is_video(self) -> bool:
@@ -87,6 +101,16 @@ class Tag:
     color: str = "#4A9EFF"
     hidden: bool = False
     sidebar_hidden: bool = False
+    parent_id: int | None = None  # etiqueta padre (v4): filtrar por el padre incluye a los hijos
+
+
+@dataclass
+class SavedSearch:
+    """Búsqueda guardada / álbum inteligente: `query` es GalleryQuery.to_dict()."""
+
+    id: int
+    name: str
+    query: dict
 
 
 @dataclass

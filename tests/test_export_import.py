@@ -38,7 +38,7 @@ def test_exporta_asignaciones(tmp_path, photo):
     s = services.export_tags(str(out))
     data = json.loads(out.read_text(encoding="utf-8"))
 
-    assert data["version"] == 2
+    assert data["version"] == 3
     assert s.assignments == 1
     assert data["assignments"] == [
         {"path": r"G:\a.jpg", "filename": "a.jpg", "filesize": 100, "tags": ["familia", "playa"]}

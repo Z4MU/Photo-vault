@@ -7,19 +7,13 @@ import xml.etree.ElementTree as ET
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
 from PyQt6.QtGui import QImage, QImageReader  # noqa: E402
-from PyQt6.QtWidgets import QApplication, QLabel  # noqa: E402
+from PyQt6.QtWidgets import QLabel  # noqa: E402
 
 import ui  # noqa: E402
 from ui import images, workers  # noqa: E402
 from ui.charts import build_bar_chart_svg  # noqa: E402
-
-
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
 
 
 def test_todos_los_modulos_de_ui_importan():

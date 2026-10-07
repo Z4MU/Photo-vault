@@ -16,11 +16,6 @@ import services  # noqa: E402
 from ui import gallery, images, workers  # noqa: E402
 
 
-@pytest.fixture(scope="module")
-def qapp():
-    return QApplication.instance() or QApplication([])
-
-
 @pytest.fixture(autouse=True)
 def _clean_pixmap_cache():
     QPixmapCache.clear()
@@ -264,8 +259,8 @@ def test_panel_de_fechas(qapp, tmp_path):
     assert got == [(2012, None), (2012, services.NO_MONTH)]
 
 
-def test_panel_de_etiquetas(qapp, tmp_path):
-    from ui.sidebar import TagFilterPanel
+def test_panel_de_etiquetas_incluir_excluir(qapp, tmp_path):
+    from ui.tag_panel import EXCLUDE, INCLUDE, NONE, TagFilterPanel
 
     ids = make_photos(tmp_path, 2)
     services.add_tag(ids[0], "playa")
@@ -273,17 +268,48 @@ def test_panel_de_etiquetas(qapp, tmp_path):
     panel.refresh()
     hits: list[int] = []
     panel.filter_changed.connect(lambda: hits.append(1))
-    chk = next(c for c in panel.checkboxes() if c.text() == "playa")
-    chk.setChecked(True)
-    assert hits == [1] and panel.active_tag_ids() == [chk.property("tag_id")]
+    btn = next(b for b in panel.buttons() if b.tag.name == "playa")
+    tid = btn.tag.id
+    btn.click()
+    assert btn.state == INCLUDE and panel.included_ids() == [tid] and hits == [1]
+    btn.click()
+    assert btn.state == EXCLUDE and panel.excluded_ids() == [tid] and panel.included_ids() == []
+    btn.click()
+    assert btn.state == NONE and panel.excluded_ids() == [] and hits == [1, 1, 1]
+    panel.set_filter([tid], [], match_any=True)
+    assert btn.state == INCLUDE and panel.match_any() and hits == [1, 1, 1]  # sin emitir
     panel.clear()
-    assert panel.active_tag_ids() == [] and hits == [1]
-    # Un tag activo que se borra deja de filtrar
-    chk = next(c for c in panel.checkboxes() if c.text() == "playa")
-    chk.setChecked(True)
-    services.delete_tag(chk.property("tag_id"))
+    assert panel.included_ids() == []
+    # Una etiqueta activa que se borra deja de filtrar
+    panel.set_filter([], [tid], False)
+    services.delete_tag(tid)
     panel.refresh()
-    assert panel.active_tag_ids() == []
+    assert panel.excluded_ids() == []
+
+
+def test_panel_de_etiquetas_buscador_contador_y_jerarquia(qapp, tmp_path):
+    from ui.tag_panel import TagFilterPanel
+
+    ids = make_photos(tmp_path, 3)
+    viajes = services.add_tag(ids[0], "viajes")
+    playa = services.add_tag(ids[1], "playa")
+    services.add_tag(ids[2], "playa")
+    services.update_tag(
+        playa.id, "playa", viajes.category, playa.color, parent_id=viajes.id, aliases=["costa"]
+    )
+    panel = TagFilterPanel()
+    panel.refresh()
+    texts = [b.text() for b in panel.buttons()]
+    assert texts.index("viajes") + 1 == texts.index("    └ playa")  # la hija va debajo, con sangría
+    from PyQt6.QtWidgets import QLabel
+
+    count_of = {b.tag.name: row.findChildren(QLabel)[0].text() for row, b, _t in panel._rows}
+    assert count_of["playa"] == "2" and count_of["viajes"] == "1"
+    panel.search_edit.setText("cost")  # alias
+    visible = [b.tag.name for row, b, _t in panel._rows if not row.isHidden()]
+    assert visible == ["playa"]
+    panel.search_edit.setText("")
+    assert len([1 for row, _b, _t in panel._rows if not row.isHidden()]) == len(panel._rows)
 
 
 # ─── Ventana principal ────────────────────────────────────────────────────────
@@ -435,6 +461,7 @@ def test_visor_etiquetas_desde_el_panel(qapp, media):
     from ui.viewer import ListSequence, ViewerWindow
 
     v = ViewerWindow(ListSequence([media["big"]]), 0, fullscreen=False)
+    v.show()
     try:
         v.toggle_info()
         editor = v.info.tag_editor
@@ -459,6 +486,7 @@ def test_visor_muestra_la_resolucion_si_la_db_no_la_tiene(qapp, tmp_path):
     photo = db.get_photo_by_id(pid)
     assert photo is not None and photo.width is None
     v = ViewerWindow(ListSequence([photo]), 0, fullscreen=False)
+    v.show()
     try:
         assert wait_for(qapp, lambda: "Resolución" in v.info.form_values())
         assert v.info.form_values()["Resolución"] == "300 × 200"
@@ -470,6 +498,7 @@ def test_visor_sin_fotos(qapp):
     from ui.viewer import ListSequence, ViewerWindow
 
     v = ViewerWindow(ListSequence([]), 0, fullscreen=False)
+    v.show()
     assert v.stack.currentWidget() is v.message
     v.close()
 

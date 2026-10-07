@@ -6,8 +6,8 @@ Panel de información del visor: datos del archivo, cámara (EXIF) y etiquetas.
 import logging
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QFormLayout, QLabel, QScrollArea, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QFormLayout, QLabel, QPlainTextEdit, QScrollArea, QVBoxLayout, QWidget
 
 import services
 from models import Photo
@@ -44,6 +44,10 @@ def basic_info(photo: Photo) -> list[tuple[str, str]]:
     rows.append(("Tamaño", format_size(photo.filesize)))
     if photo.is_video and photo.duration_str:
         rows.append(("Duración", photo.duration_str))
+    if photo.rating or photo.favorite:
+        rows.append(
+            ("Valoración", " ".join(x for x in (photo.stars, "♥ favorita" if photo.favorite else "") if x))
+        )
     rows.append(("Carpeta", os.path.dirname(photo.path)))
     return rows
 
@@ -87,6 +91,21 @@ class InfoPanel(QWidget):
         self.tag_editor = TagEditor()
         self.tag_editor.tags_changed.connect(self.tags_changed)
         lay.addWidget(self.tag_editor)
+
+        lay.addWidget(_section("NOTA"))
+        self.note_edit = QPlainTextEdit()
+        self.note_edit.setPlaceholderText("Escribe una nota… (se guarda sola y se puede buscar)")
+        self.note_edit.setFixedHeight(90)
+        self.note_edit.setStyleSheet(
+            "QPlainTextEdit{background:#1E1E2E;color:#D0D0E8;border:1px solid #3A3A5A;"
+            "border-radius:6px;padding:4px;font-size:12px;}"
+        )
+        self.note_edit.textChanged.connect(self._on_note_edited)
+        lay.addWidget(self.note_edit)
+        self._note_timer = QTimer(self)
+        self._note_timer.setSingleShot(True)
+        self._note_timer.setInterval(800)
+        self._note_timer.timeout.connect(self.save_note)
         lay.addStretch()
         self.scroll_box.setWidget(inner)
         outer.addWidget(self.scroll_box)
@@ -114,7 +133,12 @@ class InfoPanel(QWidget):
         return out
 
     def set_photo(self, photo: Photo | None) -> None:
+        self.save_note()  # la nota de la foto anterior, si quedó algo sin guardar
         self._photo = photo
+        self.note_edit.blockSignals(True)
+        self.note_edit.setPlainText((photo.note or "") if photo is not None else "")
+        self.note_edit.setEnabled(photo is not None)
+        self.note_edit.blockSignals(False)
         self._retire_worker()
         self._fill(self.camera_form, [])
         self.camera_title.setVisible(False)
@@ -163,5 +187,20 @@ class InfoPanel(QWidget):
             retire_thread(self._worker)
             self._worker = None
 
+    def _on_note_edited(self) -> None:
+        self._note_timer.start()
+
+    def save_note(self) -> None:
+        """Guarda la nota si cambió (al dejar de escribir, al cambiar de foto y al cerrar)."""
+        self._note_timer.stop()
+        if self._photo is None:
+            return
+        text = self.note_edit.toPlainText().strip() or None
+        if text != (self._photo.note or None):
+            services.set_note(self._photo.id, text)
+            self._photo.note = text  # mismo objeto que la galería: se ve sin recargar
+            self.tags_changed.emit()
+
     def shutdown(self) -> None:
+        self.save_note()
         self._retire_worker()

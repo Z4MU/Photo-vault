@@ -1,14 +1,14 @@
 """
 PhotoVault - ui/main_window.py
-Ventana principal: sidebar (etiquetas, carpetas, fechas), galería continua y visor.
+Ventana principal: sidebar (etiquetas, carpetas, fechas, búsquedas), filtros,
+galería continua y visor. Las acciones sobre la selección están en ui/gallery_actions.py.
 """
 
 import logging
-import os
 from functools import partial
 from pathlib import Path
 
-from PyQt6.QtCore import QPoint, Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QPixmapCache, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
-    QMenu,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -32,18 +31,19 @@ from PyQt6.QtWidgets import (
 import database as db
 import indexer
 import services
-from models import Photo, SortField, SortOrder
-from ui import system
+from models import SortField, SortOrder
 from ui.dialogs.duplicates import DuplicatesDialog
 from ui.dialogs.folders import DeindexDialog, IndexDialog
-from ui.dialogs.photo import BulkTagDialog
 from ui.dialogs.quick_tag import QuickTagSetupDialog, QuickTagWindow
 from ui.dialogs.settings import SettingsDialog
 from ui.dialogs.stats import StatsDialog
 from ui.dialogs.tags import TagManagerDialog
+from ui.filter_bar import FilterBar
 from ui.gallery import GalleryDelegate, GalleryModel, GalleryView, format_date, thumb_source_size
-from ui.sidebar import FolderTreePanel, TagFilterPanel, TimelinePanel
+from ui.gallery_actions import GalleryActionsMixin
+from ui.sidebar import FolderTreePanel, SavedSearchPanel, TimelinePanel
 from ui.style import DARK_STYLE
+from ui.tag_panel import TagFilterPanel
 from ui.viewer import SHORTCUTS_HELP, ViewerWindow
 from ui.widgets import TaskStatusWidget
 from ui.workers import (
@@ -69,9 +69,13 @@ GALLERY_SHORTCUTS_HELP = [
     ("Clic  ·  Ctrl+clic  ·  Shift+clic", "Seleccionar  ·  agregar  ·  rango"),
     ("Ctrl+A  ·  Esc", "Seleccionar todo  ·  quitar selección"),
     ("Ctrl+T", "Etiquetar la selección"),
+    ("1 … 5  ·  0", "Valorar con estrellas  ·  quitar la valoración"),
+    ("F", "Marcar / quitar favorita"),
     ("Ctrl+C  ·  Ctrl+Shift+C", "Copiar rutas  ·  copiar archivos"),
     ("Ctrl+E", "Mostrar en el Explorador"),
-    ("Ctrl+F  ·  Ctrl+G", "Buscar  ·  ir a una posición"),
+    ("Ctrl+F  ·  Ctrl+G", "Buscar (nombre o nota)  ·  ir a una posición"),
+    ("Ctrl+Shift+F", "Mostrar / ocultar la barra de filtros"),
+    ("Ctrl+S", "Guardar la búsqueda actual"),
     ("Ctrl + / Ctrl − / Ctrl+0", "Miniaturas más grandes / más chicas / normales"),
     ("F5", "Recargar"),
     ("Clic derecho", "Más acciones"),
@@ -79,7 +83,7 @@ GALLERY_SHORTCUTS_HELP = [
 ]
 
 
-class MainWindow(QMainWindow):
+class MainWindow(QMainWindow, GalleryActionsMixin):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoVault")
@@ -206,17 +210,24 @@ class MainWindow(QMainWindow):
         self.folder_panel.folder_selected.connect(self.set_folder_filter)
         self.timeline_panel = TimelinePanel()
         self.timeline_panel.date_selected.connect(self.go_to_date)
+        self.saved_panel = SavedSearchPanel()
+        self.saved_panel.search_selected.connect(self.apply_gallery_query)
+        self.saved_panel.save_requested.connect(self.save_current_search)
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
             "QTabWidget::pane{border:none;}"
-            "QTabBar::tab{background:#1E1E2E;color:#8888AA;padding:5px 9px;border:none;"
+            "QTabBar::tab{background:#1E1E2E;color:#8888AA;padding:5px 6px;border:none;font-size:11px;"
             "border-top-left-radius:6px;border-top-right-radius:6px;margin-right:2px;}"
             "QTabBar::tab:selected{background:#2D2D3F;color:#D0D0E8;}"
         )
-        self.tabs.addTab(self.tag_panel, "🏷 Etiquetas")
-        self.tabs.addTab(self.folder_panel, "📁 Carpetas")
-        self.tabs.addTab(self.timeline_panel, "📅 Fechas")
+        for panel, text, tip in (
+            (self.tag_panel, "🏷 Etiq.", "Filtrar por etiquetas"),
+            (self.folder_panel, "📁 Carp.", "Árbol de carpetas"),
+            (self.timeline_panel, "📅 Fechas", "Línea de tiempo"),
+            (self.saved_panel, "⭐ Álbum", "Álbumes y búsquedas guardadas"),
+        ):
+            self.tabs.setTabToolTip(self.tabs.addTab(panel, text), tip)
         self.tabs.currentChanged.connect(self._on_tab_changed)
         sb.addWidget(self.tabs, stretch=1)
 
@@ -235,10 +246,19 @@ class MainWindow(QMainWindow):
         box.setSpacing(6)
         top_bar = QHBoxLayout()
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("🔍 Buscar por nombre…  (Ctrl+F)")
+        self.search_edit.setPlaceholderText("🔍 Buscar por nombre o nota…  (Ctrl+F)")
         self.search_edit.textChanged.connect(lambda _text: self._search_timer.start())
         self.search_edit.returnPressed.connect(self._on_search)  # Enter: buscar ya
         top_bar.addWidget(self.search_edit, stretch=1)
+
+        self.btn_filters = QPushButton("⚙ Filtros")
+        self.btn_filters.setCheckable(True)
+        self.btn_filters.setToolTip(
+            "Tipo, años, orientación, resolución, duración, estrellas… (Ctrl+Shift+F)"
+        )
+        self.btn_filters.setStyleSheet("QPushButton:checked{color:#4A9EFF;border-color:#4A9EFF;}")
+        self.btn_filters.toggled.connect(self._toggle_filter_bar)
+        top_bar.addWidget(self.btn_filters)
 
         top_bar.addWidget(QLabel("Ordenar:"))
         self.sort_field_combo = QComboBox()
@@ -276,6 +296,11 @@ class MainWindow(QMainWindow):
         top_bar.addWidget(self.btn_bulk_tag)
         box.addLayout(top_bar)
 
+        self.filter_bar = FilterBar()
+        self.filter_bar.changed.connect(self._apply_query)
+        self.filter_bar.setVisible(False)
+        box.addWidget(self.filter_bar)
+
         info_bar = QHBoxLayout()
         self.count_lbl = QLabel("0 fotos")
         self.count_lbl.setStyleSheet("color:#8888AA;")
@@ -311,6 +336,8 @@ class MainWindow(QMainWindow):
             "Ctrl+=": lambda: self._step_thumb_size(1),
             "Ctrl+-": lambda: self._step_thumb_size(-1),
             "Ctrl+0": lambda: self.size_slider.setValue(services.THUMB_DISPLAY_DEFAULT),
+            "Ctrl+Shift+F": self.btn_filters.toggle,
+            "Ctrl+S": self.save_current_search,
         }
         for key, slot in window_keys.items():
             QShortcut(QKeySequence(key), self, slot)
@@ -320,7 +347,10 @@ class MainWindow(QMainWindow):
             "Ctrl+C": lambda: self._copy_selection(as_files=False),
             "Ctrl+Shift+C": lambda: self._copy_selection(as_files=True),
             "Ctrl+E": self._reveal_current,
+            "F": self.toggle_favorite_selection,
         }
+        for r in range(6):
+            gallery_keys[str(r)] = partial(self.set_rating_selection, r)
         for key, slot in gallery_keys.items():
             QShortcut(QKeySequence(key), self.view, slot, context=Qt.ShortcutContext.WidgetShortcut)
 
@@ -328,12 +358,58 @@ class MainWindow(QMainWindow):
 
     def _query(self) -> services.GalleryQuery:
         return services.GalleryQuery(
-            tag_ids=tuple(self.tag_panel.active_tag_ids()),
+            tag_ids=tuple(self.tag_panel.included_ids()),
+            exclude_tag_ids=tuple(self.tag_panel.excluded_ids()),
+            match_any=self.tag_panel.match_any(),
             search=self.search_edit.text().strip() or None,
             folder=self._folder,
             sort_field=self._sort_field,
             sort_order=self._sort_order,
+            **self.filter_bar.values(),
         )
+
+    def apply_gallery_query(self, q: services.GalleryQuery) -> None:
+        """Muestra una consulta completa (búsqueda guardada o álbum): pone cada control como corresponde."""
+        self.tag_panel.set_filter(list(q.tag_ids), list(q.exclude_tag_ids), q.match_any)
+        self.filter_bar.set_values(q)
+        if q.attribute_filter_count():
+            self.btn_filters.setChecked(True)
+        self.search_edit.blockSignals(True)
+        self.search_edit.setText(q.search or "")
+        self.search_edit.blockSignals(False)
+        for combo, value in ((self.sort_field_combo, q.sort_field), (self.sort_order_combo, q.sort_order)):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(value))
+            combo.blockSignals(False)
+        self._sort_field, self._sort_order = q.sort_field, q.sort_order
+        self.set_folder_filter(q.folder)  # aplica la consulta
+
+    def save_current_search(self) -> None:
+        q = self._query()
+        name, ok = QInputDialog.getText(self, "Guardar búsqueda", "Nombre de la búsqueda:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        if services.saved_search_exists(name) and (
+            QMessageBox.question(
+                self,
+                "Ya existe",
+                f"Ya hay una búsqueda llamada «{name}». ¿Reemplazarla?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        services.save_search(name, q)
+        self.saved_panel.refresh()
+        self.task_status.finish(f"💾 Búsqueda «{name}» guardada (pestaña ⭐ Álbum)", hide_after_ms=4000)
+
+    def _toggle_filter_bar(self, visible: bool) -> None:
+        self.filter_bar.setVisible(visible)
+
+    def _update_filter_button(self) -> None:
+        n = self.model.query().attribute_filter_count()
+        self.btn_filters.setText(f"⚙ Filtros ({n})" if n else "⚙ Filtros")
 
     def _apply_query(self) -> None:
         """Nueva consulta (filtros/orden cambiaron): vuelve al principio."""
@@ -344,6 +420,7 @@ class MainWindow(QMainWindow):
 
     def reload_keep_position(self) -> None:
         """Recarga la misma consulta (cambiaron etiquetas, se indexó…) sin perder el lugar."""
+        self.saved_panel.mark_dirty()
         scroll = self.view.vbar().value()
         current = self.view.currentIndex().row()
         self.model.set_query(self._query())
@@ -355,6 +432,7 @@ class MainWindow(QMainWindow):
     def _after_model_reset(self) -> None:
         self._update_count()
         self._update_position_label()
+        self._update_filter_button()
         self.timeline_panel.mark_dirty()
         if self.tabs.currentWidget() is self.timeline_panel:
             self.timeline_panel.refresh(self.model.query())
@@ -380,6 +458,8 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _index: int) -> None:
         if self.tabs.currentWidget() is self.timeline_panel and self.timeline_panel.is_dirty():
             self.timeline_panel.refresh(self.model.query())
+        if self.tabs.currentWidget() is self.saved_panel and self.saved_panel.is_dirty():
+            self.saved_panel.refresh()
 
     # ── Filtros ───────────────────────────────────────────────────────────────
 
@@ -395,6 +475,7 @@ class MainWindow(QMainWindow):
 
     def _clear_filters(self) -> None:
         self.tag_panel.clear()
+        self.filter_bar.clear()
         self.search_edit.blockSignals(True)
         self.search_edit.clear()
         self.search_edit.blockSignals(False)
@@ -461,105 +542,6 @@ class MainWindow(QMainWindow):
 
     def _save_thumb_size(self) -> None:
         services.set_thumb_display_size(self.size_slider.value())
-
-    # ── Selección ─────────────────────────────────────────────────────────────
-
-    def _on_selection_changed(self, *_args) -> None:
-        n = self.view.selected_count()
-        self.btn_bulk_tag.setEnabled(n > 0)
-        self.btn_bulk_tag.setText(f"🏷 Etiquetar {n:,} fotos" if n else "🏷 Etiquetar selección")
-        self._update_count()
-
-    def selected_ids(self) -> list[int]:
-        return self.model.ids_in_ranges(self.view.selected_ranges())
-
-    def _selected_or_current_photos(self, limit: int = 2000) -> list[Photo]:
-        ranges = self.view.selected_ranges()
-        if not ranges:
-            idx = self.view.currentIndex()
-            ranges = [(idx.row(), idx.row())] if idx.isValid() else []
-        photos: list[Photo] = []
-        for start, end in ranges:
-            for row in range(start, min(end, start + limit - len(photos) - 1) + 1):
-                p = self.model.photo_at(row)
-                if p is not None:
-                    photos.append(p)
-            if len(photos) >= limit:
-                break
-        return photos
-
-    def _open_bulk_tag(self) -> None:
-        ids = self.selected_ids()
-        if not ids:
-            QMessageBox.information(self, "Sin selección", "Selecciona al menos una foto.")
-            return
-        if BulkTagDialog(ids, self).exec():
-            self._refresh_after_tag_change()
-
-    def _copy_selection(self, as_files: bool) -> None:
-        photos = self._selected_or_current_photos()
-        system.copy_paths([p.path for p in photos], as_files=as_files)
-        if photos:
-            what = "archivos" if as_files else "rutas"
-            self.task_status.finish(f"📋 {len(photos):,} {what} copiadas al portapapeles", hide_after_ms=3000)
-
-    def _reveal_current(self) -> None:
-        photos = self._selected_or_current_photos(limit=1)
-        if photos:
-            system.reveal_in_explorer(photos[0].path)
-
-    def _on_drag_refused(self, n: int) -> None:
-        self.task_status.finish(
-            f"Son {n:,} fotos: para arrastrar a otra app selecciona como máximo 500", hide_after_ms=5000
-        )
-
-    # ── Menú contextual ───────────────────────────────────────────────────────
-
-    def build_context_menu(self, row: int) -> QMenu:
-        menu = QMenu(self)
-        menu.setStyleSheet(DARK_STYLE)
-        photo = self.model.photo_at(row)
-        n = self.view.selected_count()
-        if photo is None:
-            return menu
-        menu.addAction("👁  Abrir en el visor\tEnter", lambda: self.open_viewer(row))
-        menu.addAction("↗  Abrir con la app predeterminada", lambda: system.open_external(photo.path))
-        menu.addAction("📂  Mostrar en el Explorador\tCtrl+E", lambda: system.reveal_in_explorer(photo.path))
-        menu.addSeparator()
-        label = "rutas" if n > 1 else "ruta"
-        menu.addAction(f"📋  Copiar {label}\tCtrl+C", lambda: self._copy_selection(as_files=False))
-        menu.addAction("📄  Copiar archivos\tCtrl+Shift+C", lambda: self._copy_selection(as_files=True))
-        menu.addSeparator()
-        menu.addAction(
-            f"🏷  Etiquetar {n:,} fotos…\tCtrl+T" if n > 1 else "🏷  Etiquetar…\tCtrl+T", self._open_bulk_tag
-        )
-        folder = os.path.dirname(photo.path)
-        menu.addAction(
-            f"📁  Ver solo la carpeta «{Path(folder).name or folder}»", lambda: self.set_folder_filter(folder)
-        )
-        if photo.year:
-            menu.addAction(
-                f"📅  Ir a {format_date(photo.year, photo.month)} en la línea de tiempo",
-                lambda: self._show_in_timeline(photo),
-            )
-        menu.addSeparator()
-        menu.addAction("☑  Seleccionar todo\tCtrl+A", self.view.selectAll)
-        return menu
-
-    def _show_context_menu(self, pos: QPoint) -> None:
-        idx = self.view.indexAt(pos)
-        if not idx.isValid():
-            return
-        sm = self.view.selectionModel()
-        if sm is not None and not sm.isSelected(idx):
-            self.view.select_row(idx.row())  # Clic derecho fuera de la selección: selecciona esa
-        viewport = self.view.viewport()
-        if viewport is not None:
-            self.build_context_menu(idx.row()).exec(viewport.mapToGlobal(pos))
-
-    def _show_in_timeline(self, photo: Photo) -> None:
-        self.tabs.setCurrentWidget(self.timeline_panel)
-        self.go_to_date(photo.year, photo.month)
 
     # ── Visor ─────────────────────────────────────────────────────────────────
 
@@ -670,14 +652,17 @@ class MainWindow(QMainWindow):
             self.task_status.set_cancelling()
             self._bg_worker.stop()  # Termina el archivo actual y emite completed
 
-    def start_indexing(self, folder: str) -> None:
-        """Indexa en segundo plano: se puede seguir usando la app mientras tanto."""
+    def start_indexing(self, folder: str, force: bool = False) -> None:
+        """
+        Indexa en segundo plano: se puede seguir usando la app mientras tanto.
+        force=True relee todos los archivos (fechas y dimensiones con las reglas actuales).
+        """
         if self._bg_kind == "index":
             QMessageBox.information(self, "Indexación en curso", "Ya hay una indexación en curso.")
             return
         if self._bg_kind == "thumbs":
             self._retire_background()  # La indexación tiene prioridad
-        w = IndexWorker(folder)
+        w = IndexWorker(folder, force=force)
         w.progress.connect(self._on_index_progress)
         w.completed.connect(self._on_index_completed)
         w.error.connect(self._on_background_error)

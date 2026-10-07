@@ -113,6 +113,7 @@ _EXIF_IFD = 0x8769
 _TAG_DATETIME_ORIGINAL = 36867
 _TAG_DATETIME_DIGITIZED = 36868
 _TAG_DATETIME = 306
+_TAG_ORIENTATION = 0x0112
 
 
 def _parse_exif_date(value) -> tuple[int, int] | None:
@@ -299,6 +300,10 @@ def _read_image_info(path: str) -> tuple[int | None, int | None, int | None, int
             width, height = img.width, img.height
             try:
                 exif = img.getexif()
+                # Fotos de celular giradas por EXIF (5–8 = 90°/270°): ancho y alto
+                # como se ven, no como están guardados (filtro de orientación, fase 6)
+                if exif and exif.get(_TAG_ORIENTATION) in (5, 6, 7, 8):
+                    width, height = height, width
                 if exif:
                     exif_ifd = exif.get_ifd(_EXIF_IFD)
                     for value in (

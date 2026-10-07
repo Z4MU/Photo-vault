@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -48,12 +49,12 @@ class IndexDialog(QDialog):
     empezar y se puede seguir usando la app.
     """
 
-    start_requested = pyqtSignal(str)
+    start_requested = pyqtSignal(str, bool)  # carpeta, releer todo
 
     def __init__(self, parent=None, busy: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Indexar carpeta")
-        self.setFixedSize(520, 190)
+        self.setFixedSize(520, 230)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui(busy)
 
@@ -76,6 +77,12 @@ class IndexDialog(QDialog):
         info.setWordWrap(True)
         info.setStyleSheet("color:#8888AA;font-size:11px;")
         layout.addWidget(info)
+        self.chk_force = QCheckBox("Releer todos los archivos (lento)")
+        self.chk_force.setToolTip(
+            "Vuelve a leer fecha y dimensiones de cada archivo con las reglas actuales "
+            "(p. ej. orientación de fotos de celular). Con 170.000 fotos tarda varios minutos."
+        )
+        layout.addWidget(self.chk_force)
         self.btn_start = QPushButton("▶  Iniciar indexación")
         self.btn_start.clicked.connect(self._start)
         if busy:
@@ -93,7 +100,7 @@ class IndexDialog(QDialog):
         if not folder or not Path(folder).is_dir():
             QMessageBox.warning(self, "Error", "Selecciona una carpeta válida.")
             return
-        self.start_requested.emit(folder)
+        self.start_requested.emit(folder, self.chk_force.isChecked())
         self.accept()
 
 

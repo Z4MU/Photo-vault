@@ -174,6 +174,10 @@ class GalleryModel(QAbstractListModel):
             if photo.width and photo.height:
                 parts.append(f"{photo.width}×{photo.height}")
             parts.append(format_size(photo.filesize))
+            if photo.rating or photo.favorite:
+                parts.append(" ".join(x for x in (photo.stars, "♥ favorita" if photo.favorite else "") if x))
+            if photo.note:
+                parts.append(f"📝 {photo.note[:120]}")
             return "\n".join(parts)
         return None
 
@@ -317,6 +321,8 @@ class GalleryDelegate(QStyledItemDelegate):
 
         if photo is not None and photo.is_video:
             self._paint_video_badge(painter, img_rect, photo)
+        if photo is not None:
+            self._paint_marks(painter, img_rect, photo)
 
         if photo is not None:
             painter.setFont(self._name_font)
@@ -327,6 +333,28 @@ class GalleryDelegate(QStyledItemDelegate):
             )
             painter.drawText(name_rect, Qt.AlignmentFlag.AlignCenter, name)
         painter.restore()
+
+    def _paint_marks(self, painter: QPainter, img_rect: QRect, photo: Photo) -> None:
+        """♥ favorita (arriba a la derecha), 📝 nota (arriba a la izquierda), ★ valoración (abajo a la izquierda)."""
+        painter.setFont(self._badge_font)
+        fm = painter.fontMetrics()
+
+        def pill(x: int, y: int, text: str, color: str, align_right: bool = False) -> None:
+            w = fm.horizontalAdvance(text) + 10
+            rect = QRect(x - w if align_right else x, y, w, 16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(0, 0, 0, 170))
+            painter.drawRoundedRect(rect, 3, 3)
+            painter.setPen(QColor(color))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+
+        if photo.favorite:
+            pill(img_rect.right() - 4, img_rect.top() + 4, "♥", "#FF4A6A", align_right=True)
+        if photo.note:
+            pill(img_rect.left() + 4, img_rect.top() + 4, "📝", "#D0D0E8")
+        if photo.rating:
+            stars = "★" * photo.rating if self.thumb >= 140 else f"★{photo.rating}"
+            pill(img_rect.left() + 4, img_rect.bottom() - 20, stars, config.COLORS["warning"])
 
     def _paint_video_badge(self, painter: QPainter, img_rect: QRect, photo: Photo) -> None:
         r = 18 if self.thumb >= 140 else 12

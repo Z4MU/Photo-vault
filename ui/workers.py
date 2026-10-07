@@ -69,8 +69,11 @@ def retire_thread(thread: StoppableThread | None) -> None:
 def wait_all_threads(timeout_ms: int = 5000) -> None:
     """Al cerrar la app: esperar a que terminen los hilos retirados."""
     for t in list(_retired_threads):
-        if not t.wait(timeout_ms):
-            logger.warning("Un hilo no terminó a tiempo al cerrar: %r", t)
+        try:
+            if not t.wait(timeout_ms):
+                logger.warning("Un hilo no terminó a tiempo al cerrar: %r", t)
+        except RuntimeError:  # el objeto de Qt ya se destruyó: no hay nada que esperar
+            _retired_threads.discard(t)
 
 
 def disconnect_all(*signals) -> None:
@@ -86,9 +89,10 @@ class IndexWorker(StoppableThread):
     completed = pyqtSignal(object)  # indexer.IndexResult
     error = pyqtSignal(str)
 
-    def __init__(self, folder: str):
+    def __init__(self, folder: str, force: bool = False):
         super().__init__()
         self.folder = folder
+        self.force = force
 
     def run(self):
         try:
@@ -96,6 +100,7 @@ class IndexWorker(StoppableThread):
                 self.folder,
                 progress_callback=lambda c, t, p: self.progress.emit(c, t, p),
                 should_stop=self.is_stopping,
+                force=self.force,
             )
             self.completed.emit(result)
         except Exception as e:

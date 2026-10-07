@@ -27,6 +27,17 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     db.close_connection()
 
 
+@pytest.fixture(scope="session")
+def qapp():
+    """QApplication sin ventanas (QT_QPA_PLATFORM=offscreen) para los tests de UI."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    return QApplication.instance() or QApplication([])
+
+
 @pytest.fixture
 def db_path(isolated_paths: Path) -> Path:
     return isolated_paths / "photovault.db"

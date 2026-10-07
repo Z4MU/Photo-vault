@@ -1,6 +1,6 @@
 """
 PhotoVault - ui/dialogs/tags.py
-Gestión de etiquetas y categorías.
+Gestión de etiquetas (con jerarquía, alias y fusión) y categorías.
 """
 
 import html
@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -132,14 +133,14 @@ class CategoryManagerDialog(QDialog):
 
 
 class EditTagDialog(QDialog):
-    """Editar nombre, categoría y color de una etiqueta existente."""
+    """Editar nombre, categoría, color, etiqueta padre y alias."""
 
     def __init__(self, tag: Tag, parent=None):
         super().__init__(parent)
         self.tag = tag
         self._color = tag.color
         self.setWindowTitle(f"Editar etiqueta: {tag.name}")
-        self.setFixedSize(420, 220)
+        self.setFixedSize(460, 330)
         self.setStyleSheet(DARK_STYLE)
 
         layout = QVBoxLayout(self)
@@ -164,6 +165,25 @@ class EditTagDialog(QDialog):
         row.addWidget(self.color_btn)
         layout.addLayout(row)
 
+        prow = QHBoxLayout()
+        prow.addWidget(QLabel("Etiqueta padre:"))
+        self.parent_combo = QComboBox()
+        self.parent_combo.setToolTip("Filtrar por el padre muestra también las fotos de sus hijas")
+        self.parent_combo.addItem("— ninguna —", None)
+        excluded = services.tag_descendants().get(tag.id, set()) | {tag.id}  # sin ciclos
+        paths = services.tag_path_names()
+        for t in sorted(services.get_all_tags(), key=lambda t: " › ".join(paths.get(t.id, [t.name]))):
+            if t.id not in excluded:
+                self.parent_combo.addItem(" › ".join(paths.get(t.id, [t.name])), t.id)
+        self.parent_combo.setCurrentIndex(max(0, self.parent_combo.findData(tag.parent_id)))
+        prow.addWidget(self.parent_combo, stretch=1)
+        layout.addLayout(prow)
+
+        layout.addWidget(QLabel("Alias (separados por coma):"))
+        self.alias_edit = QLineEdit(", ".join(services.get_tag_aliases().get(tag.id, [])))
+        self.alias_edit.setPlaceholderText("p. ej. costa, mar — escribirlos agrega esta etiqueta")
+        layout.addWidget(self.alias_edit)
+
         layout.addStretch()
         btns = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar")
@@ -183,8 +203,15 @@ class EditTagDialog(QDialog):
 
     def _save(self):
         try:
-            services.update_tag(self.tag.id, self.name_edit.text(), self.cat_combo.currentText(), self._color)
-        except ValueError as e:  # incluye TagNameConflictError
+            services.update_tag(
+                self.tag.id,
+                self.name_edit.text(),
+                self.cat_combo.currentText(),
+                self._color,
+                parent_id=self.parent_combo.currentData(),
+                aliases=[a for a in self.alias_edit.text().split(",") if a.strip()],
+            )
+        except ValueError as e:  # incluye TagNameConflictError y ciclos de padres
             QMessageBox.warning(self, "No se pudo guardar", str(e))
             return
         self.accept()
@@ -240,6 +267,13 @@ class TagManagerDialog(QDialog):
         btns_row.addWidget(btn_imp)
         layout.addLayout(btns_row)
 
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Buscar etiqueta (nombre o alias)…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._apply_search)
+        layout.addWidget(self.search_edit)
+        self._rows: list[tuple[QWidget, str]] = []
+
         self.scroll_box = QScrollArea()
         self.scroll_box.setWidgetResizable(True)
         self.container = QWidget()
@@ -267,16 +301,31 @@ class TagManagerDialog(QDialog):
 
     def _refresh(self):
         clear_layout(self.grid)
-        for tag in services.get_all_tags():
+        self._rows = []
+        counts = services.get_tag_photo_counts()
+        aliases = services.get_tag_aliases()
+        paths = services.tag_path_names()
+        tags = sorted(
+            services.get_all_tags(), key=lambda t: (t.category, " › ".join(paths.get(t.id, [t.name])))
+        )
+        for tag in tags:
+            path = paths.get(tag.id, [tag.name])
             row = QWidget()
             hl = QHBoxLayout(row)
-            hl.setContentsMargins(4, 2, 4, 2)
+            hl.setContentsMargins(4 + 16 * (len(path) - 1), 2, 4, 2)
             dot = QLabel("●")
             dot.setStyleSheet(f"color:{tag.color};font-size:16px;")
             hl.addWidget(dot)
+            extra = ""
+            if len(path) > 1:
+                extra += f"<span style='color:#666;'> ‹ {html.escape(' › '.join(path[:-1]))}</span>"
+            if aliases.get(tag.id):
+                alias_txt = html.escape(", ".join(aliases[tag.id]))
+                extra += f"<br><span style='color:#888;font-size:10px;'>alias: {alias_txt}</span>"
             lbl = QLabel(
                 f"<b>{html.escape(tag.name)}</b>  "
-                f"<span style='color:#666;'>[{html.escape(tag.category)}]</span>"
+                f"<span style='color:#666;'>[{html.escape(tag.category)}] · {counts.get(tag.id, 0):,} fotos</span>"
+                f"{extra}"
             )
             lbl.setTextFormat(Qt.TextFormat.RichText)
             hl.addWidget(lbl, stretch=1)
@@ -286,6 +335,14 @@ class TagManagerDialog(QDialog):
             btn_e.setStyleSheet("color:#4A9EFF;border:1px solid #4A9EFF;border-radius:4px;padding:0;")
             btn_e.clicked.connect(lambda _, t=tag: self._edit(t))
             hl.addWidget(btn_e)
+            btn_m = QPushButton("⇢")
+            btn_m.setFixedSize(28, 28)
+            btn_m.setToolTip(
+                "Fusionar con otra etiqueta (sus fotos pasan a la otra y este nombre queda como alias)"
+            )
+            btn_m.setStyleSheet("color:#FFD700;border:1px solid #FFD700;border-radius:4px;padding:0;")
+            btn_m.clicked.connect(lambda _, t=tag: self._merge(t))
+            hl.addWidget(btn_m)
             chk1 = QCheckBox("Ocultar fotos")
             chk1.setChecked(tag.hidden)
             chk1.stateChanged.connect(lambda s, tid=tag.id: services.set_tag_hidden(tid, bool(s)))
@@ -301,7 +358,45 @@ class TagManagerDialog(QDialog):
             hl.addWidget(btn_d)
             row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
             self.grid.addWidget(row)
+            self._rows.append((row, " ".join([*path, *aliases.get(tag.id, [])]).lower()))
         self.grid.addStretch()
+        self._apply_search(self.search_edit.text())
+
+    def _apply_search(self, text: str) -> None:
+        text = text.strip().lower()
+        for row, haystack in self._rows:
+            row.setVisible(not text or text in haystack)
+
+    def _merge(self, tag: Tag):
+        paths = services.tag_path_names()
+        others = sorted(
+            (t for t in services.get_all_tags() if t.id != tag.id),
+            key=lambda t: " › ".join(paths.get(t.id, [t.name])),
+        )
+        if not others:
+            return
+        labels = [" › ".join(paths.get(t.id, [t.name])) for t in others]
+        choice, ok = QInputDialog.getItem(
+            self, "Fusionar etiqueta", f"Fusionar «{tag.name}» en:", labels, 0, False
+        )
+        if not ok:
+            return
+        target = others[labels.index(choice)]
+        n = services.count_photos_with_tag(tag.id)
+        msg = (
+            f"Las {n:,} fotos con «{tag.name}» pasarán a tener «{target.name}», "
+            f"y «{tag.name}» dejará de existir como etiqueta.\n\n"
+            f"Escribir «{tag.name}» seguirá funcionando: queda como alias de «{target.name}»."
+        )
+        buttons = QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        if QMessageBox.question(self, "Confirmar fusión", msg, buttons) != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            services.merge_tags(tag.id, target.id)
+        except ValueError as e:
+            QMessageBox.warning(self, "No se pudo fusionar", str(e))
+            return
+        self._refresh()
 
     def _edit(self, tag: Tag):
         if EditTagDialog(tag, self).exec():

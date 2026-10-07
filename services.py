@@ -9,7 +9,7 @@ import logging
 import os
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -19,7 +19,17 @@ import database as db
 import indexer
 import thumbnail_cache
 import xmp_sidecar
-from models import DuplicateGroup, GalleryPage, Photo, SortField, SortOrder, Stats, Tag, TrashBatch
+from models import (
+    DuplicateGroup,
+    GalleryPage,
+    Photo,
+    SavedSearch,
+    SortField,
+    SortOrder,
+    Stats,
+    Tag,
+    TrashBatch,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,41 +97,114 @@ def get_gallery_page(
     )
 
 
+ORIENTATIONS = ("landscape", "portrait", "square")
+
+
 @dataclass(frozen=True)
 class GalleryQuery:
-    """Lo que muestra la galería: filtros + orden. Las etiquetas ocultas se excluyen siempre."""
+    """
+    Lo que muestra la galería: filtros + orden. Las etiquetas ocultas se
+    excluyen siempre. Se puede guardar (to_dict/from_dict) como búsqueda.
+
+    Etiquetas: `tag_ids` = incluir; con `match_any` basta con una (OR), si no,
+    todas (AND); `exclude_tag_ids` = ninguna (NOT). Una etiqueta incluye a sus
+    descendientes (filtrar por "viajes" muestra también "viajes › playa").
+    """
 
     tag_ids: tuple[int, ...] = ()
+    exclude_tag_ids: tuple[int, ...] = ()
+    match_any: bool = False
     search: str | None = None
     folder: str | None = None
     sort_field: SortField = SortField.DATE
     sort_order: SortOrder = SortOrder.DESC
+    # Atributos (fase 6)
+    media_type: str | None = None  # "image" | "video"
+    year_from: int | None = None
+    year_to: int | None = None
+    min_megapixels: float | None = None
+    orientation: str | None = None  # ORIENTATIONS
+    min_duration: float | None = None
+    max_duration: float | None = None
+    min_rating: int | None = None
+    favorites_only: bool = False
+    untagged_only: bool = False
+    has_note: bool = False
 
     def photo_filter(self) -> db.PhotoFilter:
+        desc = tag_descendants()
+
+        def expand(tid: int) -> list[int]:
+            return sorted({tid} | desc.get(tid, set()))
+
+        included = [t for t in self.tag_ids if t in desc]
+        excluded = [t for t in self.exclude_tag_ids if t in desc]  # las borradas se ignoran
+        groups = None if self.match_any else [expand(t) for t in included] or None
+        any_ids = sorted({x for t in included for x in expand(t)}) if self.match_any and included else None
         return db.PhotoFilter(
-            tag_ids=list(self.tag_ids) or None,
             hidden_tag_ids=db.get_hidden_tag_ids(),
             search=self.search or None,
             folder=self.folder or None,
+            untagged_only=self.untagged_only,
+            tag_groups=groups,
+            any_tag_ids=any_ids,
+            exclude_tag_ids=sorted({x for t in excluded for x in expand(t)}) or None,
+            media_type=self.media_type,
+            year_from=self.year_from,
+            year_to=self.year_to,
+            min_pixels=int(self.min_megapixels * 1_000_000) if self.min_megapixels else None,
+            orientation=self.orientation if self.orientation in ORIENTATIONS else None,
+            min_duration=self.min_duration,
+            max_duration=self.max_duration,
+            min_rating=self.min_rating or None,
+            favorites_only=self.favorites_only,
+            has_note=self.has_note,
         )
+
+    def attribute_filter_count(self) -> int:
+        """Cuántos filtros de atributos (barra de filtros) están activos."""
+        return sum(
+            [
+                self.media_type is not None,
+                self.year_from is not None or self.year_to is not None,
+                bool(self.min_megapixels),
+                self.orientation is not None,
+                self.min_duration is not None or self.max_duration is not None,
+                bool(self.min_rating),
+                self.favorites_only,
+                self.untagged_only,
+                self.has_note,
+            ]
+        )
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["sort_field"] = self.sort_field.name
+        d["sort_order"] = self.sort_order.name
+        d["tag_ids"] = list(self.tag_ids)
+        d["exclude_tag_ids"] = list(self.exclude_tag_ids)
+        return {
+            k: v for k, v in d.items() if v not in (None, False, [], ()) or k in ("sort_field", "sort_order")
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "GalleryQuery":
+        known = {f.name for f in fields(cls)}
+        data = {k: v for k, v in d.items() if k in known}
+        data["tag_ids"] = tuple(int(t) for t in data.get("tag_ids", ()))
+        data["exclude_tag_ids"] = tuple(int(t) for t in data.get("exclude_tag_ids", ()))
+        data["sort_field"] = SortField.__members__.get(str(data.get("sort_field")), SortField.DATE)
+        data["sort_order"] = SortOrder.__members__.get(str(data.get("sort_order")), SortOrder.DESC)
+        return cls(**data)
 
 
 def count_gallery(q: GalleryQuery) -> int:
-    f = q.photo_filter()
-    return db.get_photo_count(f.tag_ids, f.hidden_tag_ids, f.search, f.folder)
+    return db.count_filtered(q.photo_filter())
 
 
 def get_gallery_chunk(q: GalleryQuery, offset: int, limit: int) -> list[Photo]:
     """Un tramo de la galería (la vista virtualizada pide los que se ven)."""
-    return get_gallery_photos(
-        tag_ids=list(q.tag_ids) or None,
-        search=q.search or None,
-        limit=limit,
-        offset=offset,
-        sort_field=q.sort_field,
-        sort_order=q.sort_order,
-        folder=q.folder or None,
-    )
+    return db.query_photos(q.photo_filter(), q.sort_field, q.sort_order, limit=limit, offset=offset)
 
 
 def get_gallery_ids(q: GalleryQuery, offset: int = 0, limit: int = -1) -> list[int]:
@@ -254,11 +337,17 @@ def get_photo_tags(photo_id: int) -> list[Tag]:
     return db.get_photo_tags(photo_id)
 
 
+def _tag_id_for_name(name: str) -> int:
+    """Etiqueta con ese nombre o alias; si no hay ninguna, la crea."""
+    return db.resolve_tag_name(name) or db.create_tag(name)
+
+
 def add_tag(photo_id: int, tag_name: str) -> Tag:
+    """Agrega una etiqueta por nombre. Un alias agrega la etiqueta a la que apunta."""
     tag_name = tag_name.strip().lower()
     if not tag_name:
         raise ValueError("El nombre de etiqueta no puede estar vacío.")
-    tag_id = db.create_tag(tag_name)
+    tag_id = _tag_id_for_name(tag_name)
     db.add_tag_to_photo(photo_id, tag_id)
     _sync_sidecars([photo_id])
     tag = db.get_tag(tag_id)
@@ -287,7 +376,7 @@ def bulk_add_tag(photo_ids: list[int], tag_name: str) -> int:
     """
     if not photo_ids or not tag_name.strip():
         return 0
-    tag_id = db.create_tag(tag_name.strip().lower())
+    tag_id = _tag_id_for_name(tag_name.strip().lower())
     db.add_tag_to_photos(photo_ids, tag_id)
     _sync_sidecars(photo_ids)
     return len(photo_ids)
@@ -325,10 +414,92 @@ def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> 
     return db.create_tag(name, category, color)
 
 
-def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
-    """Lanza db.TagNameConflictError si el nombre ya lo usa otra etiqueta."""
-    db.update_tag(tag_id, name, category, color)
-    _sync_sidecars(db.get_photo_ids_with_tag(tag_id))
+_KEEP_PARENT = db._KEEP
+
+
+def update_tag(
+    tag_id: int,
+    name: str,
+    category: str,
+    color: str,
+    parent_id: int | None | object = _KEEP_PARENT,
+    aliases: list[str] | None = None,
+) -> None:
+    """
+    Cambia la etiqueta en una sola transacción. Lanza db.TagNameConflictError
+    si el nombre o un alias ya lo usa otra etiqueta, y ValueError si el padre
+    formaría un ciclo.
+    """
+    db.update_tag(tag_id, name, category, color, parent_id=parent_id, aliases=aliases)
+    affected = set(db.get_photo_ids_with_tag(tag_id))
+    for child in tag_descendants().get(tag_id, set()):  # su ruta en el .xmp cambia
+        affected.update(db.get_photo_ids_with_tag(child))
+    _sync_sidecars(sorted(affected))
+
+
+def tag_descendants() -> dict[int, set[int]]:
+    """{tag_id: ids de todas sus descendientes} (vacío si no tiene hijas)."""
+    parents = db.get_tag_parents()
+    children: dict[int, list[int]] = defaultdict(list)
+    for tid, parent in parents.items():
+        if parent is not None:
+            children[parent].append(tid)
+    out: dict[int, set[int]] = {}
+    for tid in parents:
+        seen: set[int] = set()
+        stack = list(children.get(tid, []))
+        while stack:
+            c = stack.pop()
+            if c not in seen and c != tid:
+                seen.add(c)
+                stack.extend(children.get(c, []))
+        out[tid] = seen
+    return out
+
+
+def tag_path_names() -> dict[int, list[str]]:
+    """{tag_id: [raíz, …, nombre]} (para mostrar "padre › hija" y para el .xmp)."""
+    tags = {t.id: t for t in db.get_all_tags()}
+    out: dict[int, list[str]] = {}
+    for tid, tag in tags.items():
+        path = [tag.name]
+        seen = {tid}
+        parent = tag.parent_id
+        while parent is not None and parent in tags and parent not in seen:
+            seen.add(parent)
+            path.insert(0, tags[parent].name)
+            parent = tags[parent].parent_id
+        out[tid] = path
+    return out
+
+
+def get_tag_aliases() -> dict[int, list[str]]:
+    return db.get_tag_aliases()
+
+
+def get_tag_photo_counts() -> dict[int, int]:
+    return db.get_tag_photo_counts()
+
+
+def merge_tags(source_id: int, target_id: int) -> int:
+    """
+    Fusiona `source` en `target` (ver db.merge_tags): el nombre viejo queda
+    como alias. Las búsquedas guardadas que usaban `source` pasan a `target`.
+    Devuelve cuántas fotos tenían `source`.
+    """
+    affected = db.get_photo_ids_with_tag(source_id)
+    n = db.merge_tags(source_id, target_id)
+    for saved in list_saved_searches():
+        q = GalleryQuery.from_dict(saved.query)
+
+        def swap(ids: tuple[int, ...]) -> tuple[int, ...]:
+            return tuple(dict.fromkeys(target_id if t == source_id else t for t in ids))
+
+        new = replace(q, tag_ids=swap(q.tag_ids), exclude_tag_ids=swap(q.exclude_tag_ids))
+        if new != q:
+            db.update_saved_search_json(saved.id, json.dumps(new.to_dict(), ensure_ascii=False))
+    _sync_sidecars(affected)
+    return n
 
 
 def get_tag(tag_id: int) -> Tag | None:
@@ -387,6 +558,71 @@ def delete_category(name: str):
     _sync_sidecars(affected)
 
 
+# ── Valoración, favoritas y notas ─────────────────────────────────────────────
+
+
+def set_rating(photo_ids: list[int], rating: int) -> None:
+    """0 = quitar la valoración; 1–5 estrellas. Se escribe en el .xmp (xmp:Rating)."""
+    if not photo_ids:
+        return
+    db.set_rating(photo_ids, rating)
+    _sync_sidecars(photo_ids)
+
+
+def toggle_favorite(photo_ids: list[int]) -> bool:
+    """Si todas eran favoritas, las quita; si no, las marca todas. Devuelve el estado nuevo."""
+    if not photo_ids:
+        return False
+    new_state = db.count_favorites(photo_ids) < len(photo_ids)
+    db.set_favorite(photo_ids, new_state)
+    return new_state
+
+
+def set_note(photo_id: int, note: str | None) -> None:
+    db.set_note(photo_id, note)
+
+
+# ── Búsquedas guardadas y álbumes inteligentes ────────────────────────────────
+
+# Álbumes que siempre están (no se pueden borrar): nombre → consulta
+BUILTIN_ALBUMS: list[tuple[str, GalleryQuery]] = [
+    ("♥ Favoritas", GalleryQuery(favorites_only=True)),
+    ("★★★★ o más", GalleryQuery(min_rating=4, sort_field=SortField.RATING)),
+    ("🏷 Sin etiquetar", GalleryQuery(untagged_only=True)),
+    ("🎬 Videos", GalleryQuery(media_type="video")),
+    ("📝 Con notas", GalleryQuery(has_note=True)),
+]
+
+
+def list_saved_searches() -> list[SavedSearch]:
+    out = []
+    for sid, name, raw in db.list_saved_searches():
+        try:
+            query = json.loads(raw)
+        except ValueError:
+            logger.warning("Búsqueda guardada %r con JSON inválido; se ignora", name)
+            continue
+        out.append(SavedSearch(id=sid, name=name, query=query if isinstance(query, dict) else {}))
+    return out
+
+
+def save_search(name: str, q: GalleryQuery) -> int:
+    """Guarda (o reemplaza, si ya hay una con ese nombre) la búsqueda actual."""
+    return db.save_search(name, json.dumps(q.to_dict(), ensure_ascii=False))
+
+
+def saved_search_exists(name: str) -> bool:
+    return any(s.name.casefold() == name.strip().casefold() for s in list_saved_searches())
+
+
+def rename_saved_search(search_id: int, name: str) -> None:
+    db.rename_saved_search(search_id, name)
+
+
+def delete_saved_search(search_id: int) -> None:
+    db.delete_saved_search(search_id)
+
+
 # ── Estadísticas ──────────────────────────────────────────────────────────────
 
 
@@ -422,7 +658,7 @@ def set_thumb_display_size(value: int) -> None:
 
 # ── Exportar / importar etiquetas ─────────────────────────────────────────────
 
-EXPORT_VERSION = 2
+EXPORT_VERSION = 3
 
 
 @dataclass
@@ -439,15 +675,31 @@ class ImportResult:
     photos_by_name: int = 0  # encontradas por nombre + tamaño (ruta distinta)
     photos_missing: int = 0  # no encontradas en la DB
     pairs_added: int = 0  # asignaciones foto↔etiqueta nuevas
+    extras_added: int = 0  # fotos a las que se les agregó valoración/favorita/nota (v3)
 
 
 def export_tags(path: str) -> ExportSummary:
     """
-    Exporta etiquetas, categorías y las asignaciones foto↔etiqueta a un JSON
-    (formato versión 2). Es un respaldo completo del trabajo de etiquetado.
+    Exporta etiquetas (con padre y alias), categorías y, por foto, sus
+    etiquetas, valoración, favorita y nota a un JSON (formato versión 3).
+    Es un respaldo completo del trabajo de organización.
     """
     tags = db.get_all_tags()
-    assignments = db.get_all_assignments()
+    names = {t.id: t.name for t in tags}
+    aliases = db.get_tag_aliases()
+    by_path: dict[str, dict] = {
+        p: {"path": p, "filename": fn, "filesize": size, "tags": tag_names}
+        for p, fn, size, tag_names in db.get_all_assignments()
+    }
+    for p, (fn, size, rating, favorite, note) in db.get_photo_extras().items():
+        entry = by_path.setdefault(p, {"path": p, "filename": fn, "filesize": size, "tags": []})
+        if rating:
+            entry["rating"] = rating
+        if favorite:
+            entry["favorite"] = True
+        if note:
+            entry["note"] = note
+    assignments = [by_path[p] for p in sorted(by_path)]
     data = {
         "version": EXPORT_VERSION,
         "app": "PhotoVault",
@@ -459,13 +711,13 @@ def export_tags(path: str) -> ExportSummary:
                 "color": t.color,
                 "hidden": t.hidden,
                 "sidebar_hidden": t.sidebar_hidden,
+                **({"parent": names[t.parent_id]} if t.parent_id in names else {}),
+                **({"aliases": aliases[t.id]} if aliases.get(t.id) else {}),
             }
             for t in tags
         ],
         "categories": db.get_all_categories(),
-        "assignments": [
-            {"path": p, "filename": fn, "filesize": size, "tags": names} for p, fn, size, names in assignments
-        ],
+        "assignments": assignments,
     }
     # Escribir a .tmp y renombrar: nunca queda un archivo a medias
     target = Path(path)
@@ -478,7 +730,7 @@ def export_tags(path: str) -> ExportSummary:
 
 def _read_export(path: str) -> dict:
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(data, dict) or data.get("version") not in (1, 2):
+    if not isinstance(data, dict) or data.get("version") not in (1, 2, 3):
         raise ValueError("Formato de archivo no reconocido.")
     return data
 
@@ -491,8 +743,11 @@ def read_export_summary(path: str) -> ExportSummary:
 
 def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
     """
-    Importa un JSON de export_tags (versión 1 o 2).
-    - Etiquetas: solo crea las que no existen; nunca sobrescribe.
+    Importa un JSON de export_tags (versión 1, 2 o 3).
+    - Etiquetas: solo crea las que no existen; nunca sobrescribe. Padre y
+      alias (v3) solo se ponen si la etiqueta no tenía y no chocan con nada.
+    - Valoración/favorita/nota (v3): solo se agregan (la valoración más alta,
+      la nota si la foto no tenía).
     - Asignaciones (v2): empareja cada foto por ruta exacta; si no está, por
       nombre + tamaño cuando hay UNA sola coincidencia (sirve si cambió la
       letra de la unidad o se movió la carpeta). Solo agrega, nunca quita.
@@ -514,11 +769,13 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
         db.create_tag(name, tag_data.get("category", "general"), tag_data.get("color", "#4A9EFF"))
         existing_names.add(name)
         result.created += 1
+    _import_tag_tree(data.get("tags", []))
 
     if include_assignments and data.get("assignments"):
         by_path, by_name = db.get_photo_lookup()
         tag_ids = db.get_tag_ids_by_name()
         pairs: list[tuple[int, int]] = []
+        extras: list[tuple[int, int, bool, str | None]] = []
         touched: list[int] = []
         for a in data["assignments"]:
             pid = by_path.get(a.get("path", ""))
@@ -536,14 +793,44 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
             for name in a.get("tags", []):
                 name = str(name).strip().lower()
                 if name not in tag_ids:
-                    tag_ids[name] = db.create_tag(name)
-                    result.created += 1
+                    alias_of = db.resolve_tag_name(name)
+                    tag_ids[name] = alias_of if alias_of is not None else db.create_tag(name)
+                    result.created += alias_of is None
                 pairs.append((pid, tag_ids[name]))
+            rating = a.get("rating") or 0
+            if rating or a.get("favorite") or a.get("note"):
+                extras.append(
+                    (pid, max(0, min(5, int(rating))), bool(a.get("favorite")), a.get("note") or None)
+                )
         result.pairs_added = db.add_assignments(pairs)
+        result.extras_added = db.merge_photo_extras(extras)
         _sync_sidecars(touched)
 
     logger.info("Importación desde %s: %s", path, result)
     return result
+
+
+def _import_tag_tree(tags_data: list[dict]) -> None:
+    """Padre y alias del JSON v3, sin pisar lo que ya haya en la DB."""
+    current = {t.name: t for t in db.get_all_tags()}
+    aliases = db.get_tag_aliases()
+    for tag_data in tags_data:
+        name = str(tag_data.get("name", "")).strip().lower()
+        tag = current.get(name)
+        if tag is None:
+            continue
+        parent = current.get(str(tag_data.get("parent", "")).strip().lower())
+        if parent is not None and tag.parent_id is None:
+            try:
+                db.set_tag_parent(tag.id, parent.id)
+            except ValueError as e:
+                logger.warning("No se importó el padre de %s: %s", name, e)
+        new_aliases = [a for a in tag_data.get("aliases", []) if isinstance(a, str)]
+        if new_aliases and not aliases.get(tag.id):
+            try:
+                db.set_tag_aliases(tag.id, new_aliases)
+            except ValueError as e:
+                logger.warning("No se importaron los alias de %s: %s", name, e)
 
 
 # ── Sidecars XMP ──────────────────────────────────────────────────────────────
@@ -563,8 +850,13 @@ def _write_photo_sidecar(photo_id: int) -> xmp_sidecar.WriteResult | None:
     photo = db.get_photo_by_id(photo_id)
     if photo is None:
         return None
-    tags: list[tuple[str, str | None]] = [(t.name, t.category) for t in db.get_photo_tags(photo_id)]
-    return xmp_sidecar.write_sidecar(photo.path, tags)
+    photo_tags = db.get_photo_tags(photo_id)
+    paths = tag_path_names() if any(t.parent_id for t in photo_tags) else {}
+    tags: list[tuple[str, str | None]] = []
+    for t in photo_tags:
+        parents = paths.get(t.id, [t.name])[:-1]
+        tags.append((t.name, "|".join([t.category, *parents]) if t.category else None))
+    return xmp_sidecar.write_sidecar(photo.path, tags, photo.rating)
 
 
 def _sync_sidecars(photo_ids: list[int]) -> None:
@@ -586,8 +878,8 @@ class SidecarSyncResult:
 def sync_all_sidecars(
     progress_callback: ProgressCallback | None = None, should_stop: StopCheck | None = None
 ) -> SidecarSyncResult:
-    """Escribe el sidecar de todas las fotos con etiquetas."""
-    ids = db.get_tagged_photo_ids()
+    """Escribe el sidecar de todas las fotos con etiquetas o valoración."""
+    ids = sorted(set(db.get_tagged_photo_ids()) | set(db.get_rated_photo_ids()))
     result = SidecarSyncResult()
     for i, pid in enumerate(ids):
         if should_stop and should_stop():
@@ -613,6 +905,7 @@ class SidecarImportResult:
     with_xmp: int = 0
     pairs_added: int = 0
     tags_created: int = 0
+    ratings_added: int = 0
 
 
 def import_from_sidecars(
@@ -626,22 +919,31 @@ def import_from_sidecars(
     tag_ids = db.get_tag_ids_by_name()
     result = SidecarImportResult()
     pairs: list[tuple[int, int]] = []
+    ratings: list[tuple[int, int, bool, str | None]] = []
     for i, (pid, path) in enumerate(rows):
         if should_stop and should_stop():
             break
         result.checked += 1
         if progress_callback and (i % 200 == 0 or i + 1 == len(rows)):
             progress_callback(i + 1, len(rows))
-        tags = xmp_sidecar.read_sidecar(path)
-        if not tags:
+        full = xmp_sidecar.read_sidecar_full(path)
+        if not full or not (full[0] or full[1]):
             continue
+        tags, rating = full
         result.with_xmp += 1
+        if rating:
+            ratings.append((pid, rating, False, None))
         for name, category in tags:
             if name not in tag_ids:
-                tag_ids[name] = db.create_tag(name, category or "general")
-                result.tags_created += 1
+                alias_of = db.resolve_tag_name(name)
+                if alias_of is not None:
+                    tag_ids[name] = alias_of
+                else:
+                    tag_ids[name] = db.create_tag(name, category or "general")
+                    result.tags_created += 1
             pairs.append((pid, tag_ids[name]))
     result.pairs_added = db.add_assignments(pairs)
+    result.ratings_added = db.merge_photo_extras(ratings)
     logger.info("Importación desde sidecars: %s", result)
     return result
 

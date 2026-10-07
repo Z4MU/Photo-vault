@@ -6,6 +6,7 @@ rotar (solo la vista), GIF animados, video integrado y panel de información.
 
 import logging
 from collections import OrderedDict
+from functools import partial
 from typing import Protocol
 
 from PyQt6.QtCore import QRectF, Qt, pyqtSignal
@@ -24,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 import config
+import services
 from models import Photo
 from ui import system
 from ui.gallery import thumb_key
@@ -182,10 +184,12 @@ SHORTCUTS_HELP = [
     ("← / →, RePág / AvPág", "Foto anterior / siguiente"),
     ("Inicio / Fin", "Primera / última"),
     ("Rueda, + / −", "Zoom"),
-    ("0  ·  1", "Ajustar a la ventana  ·  Tamaño real"),
+    ("Z", "Alternar: ajustar a la ventana / tamaño real"),
+    ("1 … 5  ·  0", "Valorar con estrellas  ·  quitar la valoración"),
+    ("F", "Marcar / quitar favorita"),
     ("R  ·  Shift+R", "Rotar a la derecha / izquierda (solo la vista)"),
     ("I", "Panel de información y etiquetas"),
-    ("F  ·  F11", "Pantalla completa"),
+    ("F11", "Pantalla completa"),
     ("Espacio  ·  M", "Video: reproducir / pausa  ·  silencio"),
     ("Shift+← / →", "Video: −5 s / +5 s"),
     ("Ctrl+E  ·  Ctrl+C  ·  Ctrl+O", "Mostrar en Explorador · Copiar ruta · Abrir con app"),
@@ -274,6 +278,10 @@ class ViewerWindow(QDialog):
         self.name_lbl.setTextFormat(Qt.TextFormat.PlainText)
         self.name_lbl.setStyleSheet("color:#D0D0E8;font-size:12px;border:none;")
         bl.addWidget(self.name_lbl, stretch=1)
+        self.marks_lbl = QLabel("")
+        self.marks_lbl.setToolTip("Valoración (1–5, 0 quita) y favorita (F)")
+        self.marks_lbl.setStyleSheet("color:#FFD700;font-size:13px;border:none;padding:0 6px;")
+        bl.addWidget(self.marks_lbl)
         self.status_lbl = QLabel("")
         self.status_lbl.setStyleSheet("color:#8888AA;font-size:11px;border:none;padding:0 8px;")
         bl.addWidget(self.status_lbl)
@@ -282,11 +290,12 @@ class ViewerWindow(QDialog):
         bl.addWidget(self.zoom_lbl)
         button("⟲", "Rotar a la izquierda (Shift+R)", lambda: self.rotate(-90))
         button("⟳", "Rotar a la derecha (R)", lambda: self.rotate(90))
-        button("⤢", "Ajustar a la ventana (0)", self.image_view.fit)
-        button("1:1", "Tamaño real (1)", lambda: self.image_view.set_zoom(1.0))
+        button("⤢", "Ajustar a la ventana (Z)", self.image_view.fit)
+        button("1:1", "Tamaño real (Z)", lambda: self.image_view.set_zoom(1.0))
         self.btn_info = button("ℹ", "Información y etiquetas (I)", self.toggle_info, checkable=True)
         button("📂", "Mostrar en el Explorador (Ctrl+E)", self.reveal)
-        button("⛶", "Pantalla completa (F)", self.toggle_fullscreen)
+        self.btn_fav = button("♡", "Favorita (F)", self.toggle_favorite)
+        button("⛶", "Pantalla completa (F11)", self.toggle_fullscreen)
         button("✕", "Cerrar (Esc)", self.close)
         center.addWidget(bar)
         root.addLayout(center, stretch=1)
@@ -307,12 +316,11 @@ class ViewerWindow(QDialog):
             "+": lambda: self.image_view.zoom_by(1.25),
             "=": lambda: self.image_view.zoom_by(1.25),
             "-": lambda: self.image_view.zoom_by(0.8),
-            "0": self.image_view.fit,
-            "1": lambda: self.image_view.set_zoom(1.0),
+            "Z": self.toggle_zoom,
             "R": lambda: self.rotate(90),
             "Shift+R": lambda: self.rotate(-90),
             "I": self.toggle_info,
-            "F": self.toggle_fullscreen,
+            "F": self.toggle_favorite,
             "F11": self.toggle_fullscreen,
             "Space": self.video.toggle_play,
             "M": self.video.toggle_mute,
@@ -322,6 +330,8 @@ class ViewerWindow(QDialog):
             "Ctrl+C": self.copy_path,
             "Ctrl+O": self.open_external,
         }
+        for r in range(6):
+            bindings[str(r)] = partial(self.set_rating, r)
         for key, slot in bindings.items():
             QShortcut(QKeySequence(key), self, slot)
 
@@ -354,6 +364,7 @@ class ViewerWindow(QDialog):
         self.name_lbl.setText(photo.filename)
         self.status_lbl.setText("")
         self.info.set_photo(photo)
+        self._update_marks()
         self.image_view.reset()
 
         if photo.is_video:
@@ -470,6 +481,38 @@ class ViewerWindow(QDialog):
 
     def _on_tags_changed(self) -> None:
         self.tags_were_changed = True
+
+    # ── Valoración y favorita ─────────────────────────────────────────────────
+
+    def toggle_zoom(self) -> None:
+        if self.image_view.is_fit():
+            self.image_view.set_zoom(1.0)
+        else:
+            self.image_view.fit()
+
+    def set_rating(self, rating: int) -> None:
+        if self._photo is None:
+            return
+        services.set_rating([self._photo.id], rating)
+        # Es el mismo objeto que tiene la galería en memoria: se ve sin recargar
+        self._photo.rating = rating
+        self.tags_were_changed = True
+        self._update_marks()
+        self.info.set_photo(self._photo)
+
+    def toggle_favorite(self) -> None:
+        if self._photo is None:
+            return
+        self._photo.favorite = services.toggle_favorite([self._photo.id])
+        self.tags_were_changed = True
+        self._update_marks()
+
+    def _update_marks(self) -> None:
+        p = self._photo
+        self.marks_lbl.setText(p.stars if p is not None else "")
+        fav = p is not None and p.favorite
+        self.btn_fav.setText("♥" if fav else "♡")
+        self.btn_fav.setStyleSheet(_BAR_BTN + ("QPushButton{color:#FF4A6A;}" if fav else ""))
 
     def done(self, result: int) -> None:
         # Se llama al cerrar por cualquier vía (Esc, ✕, botón de la ventana)

@@ -210,10 +210,38 @@ def _m003_mtime_and_sort_indexes(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_folder ON photos(folder)")
 
 
+def _m004_ratings_notes_tag_tree(conn: sqlite3.Connection) -> None:
+    """Valoración, favoritas y notas; etiquetas jerárquicas y alias; búsquedas guardadas."""
+    _add_column_if_missing(conn, "photos", "rating", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "photos", "favorite", "INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "photos", "note", "TEXT")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_rating ON photos(rating, year, month, filename)")
+    # Parcial: solo las favoritas (pocas) ocupan lugar en el índice
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_photos_favorite ON photos(favorite) WHERE favorite = 1")
+    # Borrar el padre deja a los hijos sin padre (no los borra)
+    _add_column_if_missing(conn, "tags", "parent_id", "INTEGER REFERENCES tags(id) ON DELETE SET NULL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tag_aliases (
+            alias   TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+            tag_id  INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_aliases_tag ON tag_aliases(tag_id)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS saved_searches (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT UNIQUE NOT NULL COLLATE NOCASE,
+            query_json  TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m001_baseline,
     _m002_internal_trash,
     _m003_mtime_and_sort_indexes,
+    _m004_ratings_notes_tag_tree,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -357,7 +385,7 @@ def _seed_initial_data(conn):
 
 _PHOTO_COLUMNS = (
     "p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, "
-    "p.filesize, p.width, p.height, p.added_at, p.mtime"
+    "p.filesize, p.width, p.height, p.added_at, p.mtime, p.rating, p.favorite, p.note"
 )
 
 
@@ -498,6 +526,9 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
         added_at=row["added_at"] if "added_at" in keys else None,
         md5=row["md5"] if "md5" in keys else None,
         mtime=row["mtime"] if "mtime" in keys else None,
+        rating=(row["rating"] or 0) if "rating" in keys else 0,
+        favorite=bool(row["favorite"]) if "favorite" in keys else False,
+        note=row["note"] if "note" in keys else None,
     )
 
 
@@ -507,9 +538,24 @@ class PhotoFilter:
 
     tag_ids: list[int] | None = None  # la foto debe tener TODAS
     hidden_tag_ids: set[int] | None = None  # excluir fotos con alguna
-    search: str | None = None  # LIKE en filename
+    search: str | None = None  # LIKE en filename o en la nota
     folder: str | None = None  # carpeta y subcarpetas
     untagged_only: bool = False
+    # Fase 6 ─ etiquetas con jerarquía ya expandida (etiqueta + descendientes)
+    tag_groups: list[list[int]] | None = None  # AND de grupos; de cada grupo, alguna
+    any_tag_ids: list[int] | None = None  # OR: al menos una
+    exclude_tag_ids: list[int] | None = None  # NOT: ninguna
+    # Fase 6 ─ atributos
+    media_type: str | None = None  # "image" | "video"
+    year_from: int | None = None
+    year_to: int | None = None
+    min_pixels: int | None = None  # ancho × alto
+    orientation: str | None = None  # "landscape" | "portrait" | "square"
+    min_duration: float | None = None  # segundos (solo videos)
+    max_duration: float | None = None
+    min_rating: int | None = None
+    favorites_only: bool = False
+    has_note: bool = False
 
 
 def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
@@ -526,9 +572,58 @@ def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
         clauses.append("p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id = ?)")
         params.append(tid)
 
+    for group in f.tag_groups or []:
+        if group:
+            ph = ",".join("?" * len(group))
+            clauses.append(f"p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({ph}))")
+            params.extend(group)
+
+    if f.any_tag_ids:
+        ph = ",".join("?" * len(f.any_tag_ids))
+        clauses.append(f"p.id IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({ph}))")
+        params.extend(f.any_tag_ids)
+
+    if f.exclude_tag_ids:
+        ph = ",".join("?" * len(f.exclude_tag_ids))
+        clauses.append(f"p.id NOT IN (SELECT photo_id FROM photo_tags WHERE tag_id IN ({ph}))")
+        params.extend(f.exclude_tag_ids)
+
     if f.search:
-        clauses.append("p.filename LIKE ?")
-        params.append(f"%{f.search}%")
+        clauses.append("(p.filename LIKE ? OR p.note LIKE ?)")
+        params.extend([f"%{f.search}%", f"%{f.search}%"])
+
+    if f.media_type:
+        clauses.append("p.media_type = ?")
+        params.append(f.media_type)
+    if f.year_from is not None:
+        clauses.append("p.year >= ?")
+        params.append(f.year_from)
+    if f.year_to is not None:
+        clauses.append("p.year <= ?")
+        params.append(f.year_to)
+    if f.min_pixels:
+        clauses.append("p.width * p.height >= ?")
+        params.append(f.min_pixels)
+    # Con un 2 % de tolerancia, 1000×990 cuenta como cuadrada
+    if f.orientation == "landscape":
+        clauses.append("p.width * 50 > p.height * 51")
+    elif f.orientation == "portrait":
+        clauses.append("p.height * 50 > p.width * 51")
+    elif f.orientation == "square":
+        clauses.append("p.width * 50 BETWEEN p.height * 49 AND p.height * 51")
+    if f.min_duration is not None:
+        clauses.append("p.duration >= ?")
+        params.append(f.min_duration)
+    if f.max_duration is not None:
+        clauses.append("p.duration < ?")
+        params.append(f.max_duration)
+    if f.min_rating:
+        clauses.append("p.rating >= ?")
+        params.append(f.min_rating)
+    if f.favorites_only:
+        clauses.append("p.favorite = 1")
+    if f.has_note:
+        clauses.append("p.note IS NOT NULL AND p.note != ''")
 
     if f.folder:
         clauses.append("p.path LIKE ? ESCAPE '!'")
@@ -596,6 +691,28 @@ def get_photo_count(
     )
     row = get_connection().execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()
     return row[0]
+
+
+def query_photos(
+    f: PhotoFilter,
+    sort_field: SortField = SortField.DATE,
+    sort_order: SortOrder = SortOrder.DESC,
+    limit: int = -1,
+    offset: int = 0,
+) -> list[Photo]:
+    """Como get_photos pero con un PhotoFilter completo (galería, fase 6)."""
+    where_sql, params = _build_where(f)
+    rows = get_connection().execute(
+        f"SELECT {_PHOTO_COLUMNS} FROM photos p {where_sql} "
+        f"ORDER BY {sort_to_sql(sort_field, sort_order)} LIMIT ? OFFSET ?",
+        [*params, limit, offset],
+    )
+    return [_row_to_photo(r) for r in rows]
+
+
+def count_filtered(f: PhotoFilter) -> int:
+    where_sql, params = _build_where(f)
+    return get_connection().execute(f"SELECT COUNT(*) FROM photos p {where_sql}", params).fetchone()[0]
 
 
 def _and(where_sql: str, condition: str) -> str:
@@ -764,7 +881,19 @@ _TRASH_PHOTO_FIELDS = (
     "duration",
     "md5",
     "added_at",
+    "rating",
+    "favorite",
+    "note",
 )
+
+
+def _merge_extras(conn: sqlite3.Connection, target_id: int, rating, favorite, note) -> None:
+    """Al fusionar dos registros de la misma foto: la valoración más alta, favorita si alguna lo era, la nota que haya."""
+    conn.execute(
+        "UPDATE photos SET rating = MAX(rating, ?), favorite = MAX(favorite, ?), "
+        "note = CASE WHEN note IS NULL OR note = '' THEN ? ELSE note END WHERE id = ?",
+        (rating or 0, int(bool(favorite)), note, target_id),
+    )
 
 
 def _chunks(items: list, size: int = 500):
@@ -875,6 +1004,7 @@ def restore_trash_batch(batch_id: str) -> tuple[int, int]:
             existing = conn.execute("SELECT id FROM photos WHERE path = ?", (data["path"],)).fetchone()
             if existing:
                 photo_id = existing[0]
+                _merge_extras(conn, photo_id, data.get("rating"), data.get("favorite"), data.get("note"))
                 merged += 1
             else:
                 cols = [k for k in _TRASH_PHOTO_FIELDS if k in data]
@@ -957,6 +1087,10 @@ def apply_relocation(plan: list[tuple[int, str, int | None]]) -> tuple[int, int]
                     "SELECT ?, tag_id FROM photo_tags WHERE photo_id = ?",
                     (existing_id, pid),
                 )
+                old = conn.execute(
+                    "SELECT rating, favorite, note FROM photos WHERE id = ?", (pid,)
+                ).fetchone()
+                _merge_extras(conn, existing_id, old[0], old[1], old[2])
                 conn.execute("DELETE FROM photos WHERE id = ?", (pid,))
                 merged += 1
     return moved, merged
@@ -1045,6 +1179,121 @@ def get_folder_photo_ids(folder: str) -> list[int]:
     return [r[0] for r in rows]
 
 
+# ── Valoración, favoritas, notas (v4) ────────────────────────────────────────
+
+
+def set_rating(photo_ids: list[int], rating: int) -> None:
+    rating = max(0, min(5, int(rating)))
+    with transaction() as conn:
+        for chunk in _chunks(photo_ids):
+            conn.execute(
+                f"UPDATE photos SET rating = ? WHERE id IN ({','.join('?' * len(chunk))})", [rating, *chunk]
+            )
+
+
+def set_favorite(photo_ids: list[int], favorite: bool) -> None:
+    with transaction() as conn:
+        for chunk in _chunks(photo_ids):
+            conn.execute(
+                f"UPDATE photos SET favorite = ? WHERE id IN ({','.join('?' * len(chunk))})",
+                [int(favorite), *chunk],
+            )
+
+
+def count_favorites(photo_ids: list[int]) -> int:
+    conn = get_connection()
+    return sum(
+        conn.execute(
+            f"SELECT COUNT(*) FROM photos WHERE favorite = 1 AND id IN ({','.join('?' * len(chunk))})", chunk
+        ).fetchone()[0]
+        for chunk in _chunks(photo_ids)
+    )
+
+
+def set_note(photo_id: int, note: str | None) -> None:
+    note = (note or "").strip() or None
+    with transaction() as conn:
+        conn.execute("UPDATE photos SET note = ? WHERE id = ?", (note, photo_id))
+
+
+def get_photo_extras() -> dict[str, tuple[str, int | None, int, bool, str | None]]:
+    """{ruta: (nombre, tamaño, valoración, favorita, nota)} de las fotos que tienen alguna (exportar)."""
+    rows = get_connection().execute(
+        "SELECT path, filename, filesize, rating, favorite, note FROM photos "
+        "WHERE rating > 0 OR favorite = 1 OR (note IS NOT NULL AND note != '')"
+    )
+    return {r[0]: (r[1], r[2], r[3], bool(r[4]), r[5]) for r in rows}
+
+
+def merge_photo_extras(pairs: list[tuple[int, int, bool, str | None]]) -> int:
+    """[(photo_id, valoración, favorita, nota)] — solo agrega (importar). Devuelve las fotos cambiadas."""
+    with transaction() as conn:
+        before = conn.total_changes
+        for pid, rating, favorite, note in pairs:
+            conn.execute(
+                "UPDATE photos SET rating = MAX(rating, ?), favorite = MAX(favorite, ?), "
+                "note = CASE WHEN note IS NULL OR note = '' THEN ? ELSE note END "
+                "WHERE id = ? AND (rating < ? OR favorite < ? OR ((note IS NULL OR note = '') AND ? IS NOT NULL))",
+                (rating, int(favorite), note, pid, rating, int(favorite), note),
+            )
+        return conn.total_changes - before
+
+
+def get_rated_photo_ids() -> list[int]:
+    return [r[0] for r in get_connection().execute("SELECT id FROM photos WHERE rating > 0")]
+
+
+# ── Búsquedas guardadas (v4) ──────────────────────────────────────────────────
+
+
+def list_saved_searches() -> list[tuple[int, str, str]]:
+    """[(id, nombre, query_json)] por nombre."""
+    return [
+        (r[0], r[1], r[2])
+        for r in get_connection().execute(
+            "SELECT id, name, query_json FROM saved_searches ORDER BY name COLLATE NOCASE"
+        )
+    ]
+
+
+def save_search(name: str, query_json: str) -> int:
+    """Crea o reemplaza (mismo nombre) una búsqueda guardada."""
+    name = name.strip()
+    if not name:
+        raise ValueError("El nombre no puede estar vacío.")
+    with transaction() as conn:
+        # COLLATE NOCASE de SQLite solo ignora mayúsculas en ASCII ("Mías" ≠ "MÍAS"):
+        # se compara en Python para que el mismo nombre reemplace
+        for sid, existing in conn.execute("SELECT id, name FROM saved_searches").fetchall():
+            if existing.casefold() == name.casefold():
+                conn.execute("UPDATE saved_searches SET query_json = ? WHERE id = ?", (query_json, sid))
+                return sid
+        return conn.execute(
+            "INSERT INTO saved_searches (name, query_json) VALUES (?, ?) RETURNING id", (name, query_json)
+        ).fetchone()[0]
+
+
+def rename_saved_search(search_id: int, name: str) -> None:
+    name = name.strip()
+    if not name:
+        raise ValueError("El nombre no puede estar vacío.")
+    with transaction() as conn:
+        for sid, existing in conn.execute("SELECT id, name FROM saved_searches").fetchall():
+            if sid != search_id and existing.casefold() == name.casefold():
+                raise ValueError(f"Ya hay una búsqueda llamada '{name}'.")
+        conn.execute("UPDATE saved_searches SET name = ? WHERE id = ?", (name, search_id))
+
+
+def update_saved_search_json(search_id: int, query_json: str) -> None:
+    with transaction() as conn:
+        conn.execute("UPDATE saved_searches SET query_json = ? WHERE id = ?", (query_json, search_id))
+
+
+def delete_saved_search(search_id: int) -> None:
+    with transaction() as conn:
+        conn.execute("DELETE FROM saved_searches WHERE id = ?", (search_id,))
+
+
 # ── Configuración del usuario ─────────────────────────────────────────────────
 
 
@@ -1074,6 +1323,7 @@ def _row_to_tag(row: sqlite3.Row) -> Tag:
         color=row["color"] or "#4A9EFF",
         hidden=bool(row["hidden"]) if "hidden" in keys else False,
         sidebar_hidden=bool(row["sidebar_hidden"]) if "sidebar_hidden" in keys else False,
+        parent_id=row["parent_id"] if "parent_id" in keys else None,
     )
 
 
@@ -1081,7 +1331,7 @@ def get_photo_tags(photo_id: int) -> list[Tag]:
     conn = get_connection()
     rows = conn.execute(
         """
-        SELECT t.id, t.name, t.category, t.color, t.hidden, t.sidebar_hidden
+        SELECT t.id, t.name, t.category, t.color, t.hidden, t.sidebar_hidden, t.parent_id
         FROM tags t JOIN photo_tags pt ON pt.tag_id = t.id
         WHERE pt.photo_id = ?
         ORDER BY t.category, t.name
@@ -1134,11 +1384,11 @@ def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
     conn = get_connection()
     if include_sidebar_hidden:
         rows = conn.execute(
-            "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags ORDER BY category, name"
+            "SELECT id, name, category, color, hidden, sidebar_hidden, parent_id FROM tags ORDER BY category, name"
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, name, category, color, hidden, sidebar_hidden "
+            "SELECT id, name, category, color, hidden, sidebar_hidden, parent_id "
             "FROM tags WHERE sidebar_hidden = 0 ORDER BY category, name"
         ).fetchall()
     return [_row_to_tag(r) for r in rows]
@@ -1166,8 +1416,21 @@ class TagNameConflictError(ValueError):
     """Ya existe otra etiqueta con ese nombre."""
 
 
-def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
-    """Cambia nombre, categoría y color de una etiqueta existente."""
+_KEEP = object()  # update_tag: no cambiar el padre
+
+
+def update_tag(
+    tag_id: int,
+    name: str,
+    category: str,
+    color: str,
+    parent_id: int | None | object = _KEEP,
+    aliases: list[str] | None = None,
+) -> None:
+    """
+    Cambia nombre, categoría y color (y opcionalmente padre y alias) en una
+    sola transacción: si algo no es válido no cambia nada.
+    """
     name = name.strip().lower()
     category = category.strip().lower() or "general"
     if not name:
@@ -1176,11 +1439,128 @@ def update_tag(tag_id: int, name: str, category: str, color: str) -> None:
         clash = conn.execute("SELECT id FROM tags WHERE name = ? AND id != ?", (name, tag_id)).fetchone()
         if clash:
             raise TagNameConflictError(f"Ya existe una etiqueta llamada '{name}'.")
+        alias_clash = conn.execute(
+            "SELECT 1 FROM tag_aliases WHERE alias = ? AND tag_id != ?", (name, tag_id)
+        ).fetchone()
+        if alias_clash:
+            raise TagNameConflictError(f"'{name}' ya es un alias de otra etiqueta.")
         conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (category,))
         conn.execute(
             "UPDATE tags SET name = ?, category = ?, color = ? WHERE id = ?",
             (name, category, color, tag_id),
         )
+        if parent_id is not _KEEP:
+            _set_parent(conn, tag_id, parent_id)  # type: ignore[arg-type]
+        if aliases is not None:
+            _set_aliases(conn, tag_id, aliases)
+
+
+def _set_parent(conn: sqlite3.Connection, tag_id: int, parent_id: int | None) -> None:
+    if parent_id is not None:
+        # Subir desde el padre propuesto: si se llega a tag_id, sería un ciclo
+        node: int | None = parent_id
+        while node is not None:
+            if node == tag_id:
+                raise ValueError("Una etiqueta no puede ser descendiente de sí misma.")
+            row = conn.execute("SELECT parent_id FROM tags WHERE id = ?", (node,)).fetchone()
+            if row is None:
+                raise ValueError("La etiqueta padre no existe.")
+            node = row[0]
+    conn.execute("UPDATE tags SET parent_id = ? WHERE id = ?", (parent_id, tag_id))
+
+
+def set_tag_parent(tag_id: int, parent_id: int | None) -> None:
+    """Lanza ValueError si crearía un ciclo."""
+    with transaction() as conn:
+        _set_parent(conn, tag_id, parent_id)
+
+
+def _set_aliases(conn: sqlite3.Connection, tag_id: int, aliases: list[str]) -> None:
+    clean: list[str] = []
+    for a in aliases:
+        a = a.strip().lower()
+        if a and a not in clean:
+            clean.append(a)
+    for a in clean:
+        if conn.execute("SELECT 1 FROM tags WHERE name = ? AND id != ?", (a, tag_id)).fetchone():
+            raise TagNameConflictError(f"'{a}' ya es el nombre de otra etiqueta.")
+        if conn.execute("SELECT 1 FROM tags WHERE name = ? AND id = ?", (a, tag_id)).fetchone():
+            raise ValueError(f"'{a}' es el nombre de la propia etiqueta.")
+        if conn.execute("SELECT 1 FROM tag_aliases WHERE alias = ? AND tag_id != ?", (a, tag_id)).fetchone():
+            raise TagNameConflictError(f"'{a}' ya es un alias de otra etiqueta.")
+    conn.execute("DELETE FROM tag_aliases WHERE tag_id = ?", (tag_id,))
+    conn.executemany("INSERT INTO tag_aliases (alias, tag_id) VALUES (?, ?)", [(a, tag_id) for a in clean])
+
+
+def set_tag_aliases(tag_id: int, aliases: list[str]) -> None:
+    with transaction() as conn:
+        _set_aliases(conn, tag_id, aliases)
+
+
+def get_tag_aliases() -> dict[int, list[str]]:
+    out: dict[int, list[str]] = {}
+    for alias, tag_id in get_connection().execute("SELECT alias, tag_id FROM tag_aliases ORDER BY alias"):
+        out.setdefault(tag_id, []).append(alias)
+    return out
+
+
+def resolve_tag_name(name: str) -> int | None:
+    """Id de la etiqueta con ese nombre o alias (sin distinguir mayúsculas)."""
+    name = name.strip().lower()
+    conn = get_connection()
+    row = conn.execute("SELECT id FROM tags WHERE name = ?", (name,)).fetchone()
+    if row:
+        return row[0]
+    row = conn.execute("SELECT tag_id FROM tag_aliases WHERE alias = ?", (name,)).fetchone()
+    return row[0] if row else None
+
+
+def get_tag_parents() -> dict[int, int | None]:
+    return {r[0]: r[1] for r in get_connection().execute("SELECT id, parent_id FROM tags")}
+
+
+def get_tag_photo_counts() -> dict[int, int]:
+    """{tag_id: n.º de fotos} en una sola consulta (contadores del sidebar)."""
+    return {
+        r[0]: r[1]
+        for r in get_connection().execute("SELECT tag_id, COUNT(*) FROM photo_tags GROUP BY tag_id")
+    }
+
+
+def merge_tags(source_id: int, target_id: int) -> int:
+    """
+    Fusiona `source` en `target`: sus fotos pasan a tener `target`, sus hijas
+    y alias pasan a `target`, y su nombre queda como alias de `target` (lo que
+    se escriba con el nombre viejo sigue funcionando). Devuelve cuántas fotos
+    tenían `source`.
+    """
+    if source_id == target_id:
+        raise ValueError("No se puede fusionar una etiqueta consigo misma.")
+    with transaction() as conn:
+        src = conn.execute("SELECT name FROM tags WHERE id = ?", (source_id,)).fetchone()
+        if src is None or conn.execute("SELECT 1 FROM tags WHERE id = ?", (target_id,)).fetchone() is None:
+            raise ValueError("La etiqueta no existe.")
+        n = conn.execute("SELECT COUNT(*) FROM photo_tags WHERE tag_id = ?", (source_id,)).fetchone()[0]
+        conn.execute(
+            "INSERT OR IGNORE INTO photo_tags (photo_id, tag_id) SELECT photo_id, ? FROM photo_tags WHERE tag_id = ?",
+            (target_id, source_id),
+        )
+        # Si target desciende de source, sube al lugar de source; si no, las
+        # hijas de source (que pasan a target) formarían un ciclo con él
+        node = conn.execute("SELECT parent_id FROM tags WHERE id = ?", (target_id,)).fetchone()[0]
+        while node is not None and node != source_id:
+            node = conn.execute("SELECT parent_id FROM tags WHERE id = ?", (node,)).fetchone()[0]
+        if node == source_id:
+            conn.execute(
+                "UPDATE tags SET parent_id = (SELECT parent_id FROM tags WHERE id = ?) WHERE id = ?",
+                (source_id, target_id),
+            )
+        conn.execute("UPDATE tags SET parent_id = ? WHERE parent_id = ?", (target_id, source_id))
+        conn.execute("UPDATE tag_aliases SET tag_id = ? WHERE tag_id = ?", (target_id, source_id))
+        conn.execute("DELETE FROM tags WHERE id = ?", (source_id,))
+        conn.execute("INSERT OR REPLACE INTO tag_aliases (alias, tag_id) VALUES (?, ?)", (src[0], target_id))
+    logger.info("Etiqueta %d (%s) fusionada en %d: %d fotos", source_id, src[0], target_id, n)
+    return n
 
 
 def count_photos_with_tag(tag_id: int) -> int:
@@ -1193,7 +1573,7 @@ def get_tag(tag_id: int) -> Tag | None:
     row = (
         get_connection()
         .execute(
-            "SELECT id, name, category, color, hidden, sidebar_hidden FROM tags WHERE id = ?",
+            "SELECT id, name, category, color, hidden, sidebar_hidden, parent_id FROM tags WHERE id = ?",
             (tag_id,),
         )
         .fetchone()
@@ -1219,7 +1599,7 @@ def delete_tag(tag_id: int):
 def get_tags_by_category(category: str) -> list[Tag]:
     conn = get_connection()
     rows = conn.execute(
-        "SELECT id, name, color, category, hidden, sidebar_hidden FROM tags WHERE category = ? ORDER BY name",
+        "SELECT id, name, color, category, hidden, sidebar_hidden, parent_id FROM tags WHERE category = ? ORDER BY name",
         (category,),
     ).fetchall()
     return [_row_to_tag(r) for r in rows]
