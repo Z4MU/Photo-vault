@@ -119,21 +119,37 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 5 — Galería nueva y visor → v2.0
+## Fase 5 — Galería nueva y visor → v2.0 ✅
+*Medido con una copia de la DB real (171.840 fotos).*
 
-- [ ] #18 ⭐ [A] Galería virtualizada (`QListView` + modelo) con scroll infinito
-- [ ] #68 [B] Ir a fecha/posición
-- [ ] #35 [B] Slider de tamaño de miniatura
-- [ ] #47 [M] Selección avanzada (Shift-rango, Ctrl+A, entre páginas)
-- [ ] #70 [B] Atajos de teclado en la galería
-- [ ] #34 [M] Menú contextual
-- [ ] #33 [B] Abrir en Explorador / copiar ruta
-- [ ] #38 [M] Arrastrar fotos hacia otras apps
-- [ ] #30 ⭐ [M] Visor a pantalla completa (←/→, zoom, rotar)
-- [ ] #31 ⭐ [M] Video integrado (QtMultimedia) y GIFs animados
-- [ ] #32 [B] Panel de información (fecha, resolución, tamaño, ruta, cámara)
-- [ ] #36 [M] Árbol de carpetas
-- [ ] #37 [M] Línea de tiempo por año/mes
+| Operación | Antes (páginas de 100) | Después |
+|---|---|---|
+| Arranque hasta ver la galería | ~0,6 s + 130 ms por página | 0,5 s, toda la colección en un scroll |
+| Saltar a la foto 100.000 y pintar | 1.000 clics de "Siguiente" | 11 ms (+0,4 s miniaturas en frío) |
+| Seleccionar todo (Ctrl+A) | solo la página actual | 0,2 s (ids de 171.840 fotos: 85 ms) |
+| Ir a una fecha (línea de tiempo) | — | 30 ms |
+| Árbol de carpetas / filtrar una carpeta | — | 25 ms / 115 ms |
+| Siguiente foto en el visor | diálogo nuevo por foto | 5 ms (precargada) |
+
+- [x] #18 ⭐ [A] Galería virtualizada (`QListView` + modelo por tramos de 500 + cola LIFO de miniaturas): sin páginas
+- [x] #68 [B] Ir a fecha (línea de tiempo) y a una posición (Ctrl+G); indicador "mes año · n / total"
+- [x] #35 [B] Slider de tamaño de miniatura (100–400 px, se guarda; ≥ 240 usa las miniaturas de 480)
+- [x] #47 [M] Selección como en el Explorador (clic, Ctrl, Shift, Ctrl+A) sobre toda la colección
+- [x] #70 [B] Atajos de teclado (F1 los muestra)
+- [x] #34 [M] Menú contextual
+- [x] #33 [B] Mostrar en el Explorador / copiar rutas / copiar archivos / abrir con la app
+- [x] #38 [M] Arrastrar fotos hacia otras apps (hasta 500)
+- [x] #30 ⭐ [M] Visor a pantalla completa (←/→, zoom con rueda, 1:1, rotar la vista, precarga de vecinas)
+- [x] #31 ⭐ [M] Video integrado (QtMultimedia/FFmpeg: MOV HEVC de iPhone y MP4 probados) y GIF animados
+- [x] #32 [B] Panel de información (archivo, cámara/objetivo/ajustes EXIF, etiquetas editables)
+- [x] #36 [M] Árbol de carpetas (filtro con chip ✕ arriba)
+- [x] #37 [M] Línea de tiempo por año/mes (con los filtros actuales)
+- [x] *(bug)* Nombres tipo UUID (`20547205-…`) daban años imposibles (2031–2054, 7 fotos): se rechazan y se releen al re-indexar
+- [x] *(bug)* Los workers terminados se soltaban mientras cerraban su conexión (posible `QThread: Destroyed…`)
+- [x] 39 tests nuevos (222 en total) + prueba de humo con la DB real
+- Se quitó la opción "Fotos por página" (ya no hay páginas) y `PhotoDetailDialog` (lo reemplaza el visor).
+
+**Pendiente para el usuario:** re-indexar `G:\Fotos` corrige las 7 fechas imposibles. 150 JPEG truncados (copias en "Broken pics") muestran ⚠ en vez de miniatura.
 
 ---
 
