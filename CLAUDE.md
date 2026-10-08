@@ -50,6 +50,8 @@ main.py             Solo el arranque: main() + _startup() (backup, migraciones, 
 config.py           Rutas de datos, versión, tamaños de miniatura, paleta (COLORS)
 services.py         Lógica de negocio. La UI SOLO habla con esta capa (y con privacy.py).
 privacy.py          Contenido oculto: PIN, desbloqueo, código de recuperación, cifrado (capa de servicios)
+smart.py            Inteligencia local (capa de servicios): etiquetas sugeridas por carpeta, fotos parecidas
+similarity.py       pHash de 64 bits y búsqueda de parecidas (numpy; sin Qt ni DB)
 database.py         Acceso a SQLite: conexiones, migraciones versionadas, queries
 models.py           Dataclasses tipadas + enums de ordenamiento
 indexer.py          Escaneo de carpetas, extracción de fecha/dimensiones/duración
@@ -115,6 +117,7 @@ main.py → ui/ → services.py → database.py → SQLite
 ```
 
 **Reglas:**
+- `smart.py` también es capa de servicios (importa de `services`; la UI lo usa directo).
 - `privacy.py` es parte de la capa de servicios (no tiene SQL; usa `db.get/set_setting` y `thumbnail_cache`); la UI lo usa igual que `services`.
 - La UI **no** escribe SQL ni llama a `database` directamente. Excepciones existentes y permitidas: `db.init_db()`, `db.close_connection()` (workers), `db.DB_PATH`, `db.SCHEMA_VERSION` y `db.DatabaseTooNewError` (en `main.py`).
 - `database.py` devuelve **modelos** (`Photo`, `Tag`, `Stats`…), nunca `sqlite3.Row` hacia afuera.
@@ -145,14 +148,15 @@ main.py → ui/ → services.py → database.py → SQLite
 - Todo hilo worker (`QThread`) debe llamar `db.close_connection()` al terminar (ya lo hacen `IndexWorker`, `ImageLoadQueue`, `MD5Worker`, `TaskWorker`).
 - Escrituras con `with transaction() as conn:` (commit/rollback automático).
 
-### Esquema (versión 5)
+### Esquema (versión 6)
 
 ```sql
 photos(id PK, path UNIQUE, filename, media_type, year, month, filesize,
        width, height, duration, md5, added_at,
        mtime REAL,                                   -- v3: indexación incremental
        folder GENERATED ALWAYS AS (rtrim(path, replace(path,'\',''))) VIRTUAL,  -- v3
-       rating INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0, note TEXT)  -- v4
+       rating INTEGER NOT NULL DEFAULT 0, favorite INTEGER NOT NULL DEFAULT 0, note TEXT,  -- v4
+       phash INTEGER)                                -- v6: hash perceptual (NULL = sin calcular, 0 = imagen lisa)
 tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden,
      parent_id → tags ON DELETE SET NULL)                                            -- v4
 tag_aliases(alias PK COLLATE NOCASE, tag_id → tags ON DELETE CASCADE)               -- v4
@@ -169,12 +173,12 @@ deleted_photos(id PK, batch_id, reason, deleted_at, path,   -- v2: papelera inte
 
 Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photos(rating, year, month, filename)` (v4), `photos(favorite) WHERE favorite = 1` (parcial, v4), `tag_aliases(tag_id)`, `tag_rejections(photo_id)` (v5), `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
 
-Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real), v4 `_m004_ratings_notes_tag_tree` (0,4 s), v5 `_m005_tag_rejections`.
+Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real), v4 `_m004_ratings_notes_tag_tree` (0,4 s), v5 `_m005_tag_rejections`, v6 `_m006_perceptual_hash`.
 
 - ⚠️ `COLLATE NOCASE` de SQLite solo ignora mayúsculas **ASCII** ("Mías" ≠ "MÍAS"). Donde importa (nombres de búsquedas guardadas) se compara en Python con `casefold()`.
 
 - `photos.folder` es una columna **calculada** (no se escribe nunca): la carpeta de la foto con la `\` final. `PRAGMA table_info` no la muestra; `_columns()` usa `table_xinfo`.
-- El `upsert` pone `md5 = NULL` si cambió el tamaño o el `mtime` (antes un md5 viejo sobrevivía a cambios del archivo).
+- El `upsert` pone `md5 = NULL` y `phash = NULL` si cambió el tamaño o el `mtime` (antes un md5 viejo sobrevivía a cambios del archivo).
 (La DB real tiene además una columna sobrante `photos.sidebar_hidden` de alguna versión vieja; es inofensiva.)
 
 - `tags.hidden = 1` → las fotos con ese tag **no aparecen** en la galería salvo con el contenido oculto desbloqueado (fase 9, `services._hidden_filter()`). Con PIN y bloqueado tampoco aparece el nombre de la etiqueta (`services._visible_tags()`); sin PIN sí, para poder des-ocultarla como antes.
@@ -392,6 +396,12 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 - Exportar etiquetas con lo oculto bloqueado pide el PIN (el archivo lo incluye). Los `.xmp` no: ya se advierte que exponen los nombres.
 - ⚠ La DB **no** está cifrada: protege de miradas, no de alguien con acceso al archivo. La UI lo dice.
 
+### Inteligencia local (fase 10)
+- **Etiquetas sugeridas** (`smart.suggest_tags(ids)`): por la parte de la carpeta que tiene cada etiqueta (≥ `MIN_SHARE` 20 % y ≥ 2 fotos; la carpeta de arriba pesa `PARENT_WEIGHT` 0,5) y por el nombre de la carpeta (palabras completas, sin acentos: «Cancún» → «cancun»; 0,9). No sugiere las que ya tienen todas (`db.get_common_tag_ids`) ni las ocultas bloqueadas. Se muestran en `TagEditor` (visor; un clic la agrega) y en `BulkTagDialog` (un clic la elige). ~3 ms por foto con la DB real.
+- **Parecidas** (`smart.find_similar_photos(sensibilidad)`, en un `TaskWorker` desde `DuplicatesDialog` → *Parecidas*): calcula el pHash que falte desde la miniatura de 200 px (si falta, la genera: la primera vez lee los originales) y agrupa con `similarity.find_similar` (bandas + palomar, 1,5 s para 174k). Sensibilidad = bits distintos: estricta 3, normal 6, amplia 8. No repite grupos de idénticas (mismo md5) ni incluye lo oculto bloqueado. `DuplicateGroup.similar` / `.best` (★ mejor calidad = más píxeles).
+- Lecciones con la colección real: dHash encadenaba capturas de pantalla y fondos lisos → pHash (DCT) + las imágenes casi lisas no se comparan (`FLAT`) + grupos alrededor de un centro (sin cadenas A~B~C).
+- `clear_layout` ahora vacía también los layouts anidados (filas de botones).
+
 ### Diálogos
 | Clase | Qué hace |
 |---|---|
@@ -403,7 +413,7 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 | `QuickTagWindow` | Varias etiquetas: cada etiqueta con su tecla (cualquiera, `services.get_tag_keys`), Ctrl+R repite las de la anterior, Ctrl+Z (por acción) vuelve a la foto, buscador por nombre o alias; recuerda la última foto por consulta y ofrece continuar. |
 | `KeymapDialog` | Remapear teclas (2 por acción) y la tecla de cada etiqueta; no deja guardar choques (`services.keymap_conflicts`). |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
-| `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
+| `DuplicatesDialog` | *Idénticas*: calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real). *Parecidas* (fase 10): hash perceptual con sensibilidad. Agrupa, marca la de mejor calidad y manda copias a la **Papelera** (con confirmación, nunca la última copia). Muestra los 200 grupos más grandes y 10 fotos por grupo. |
 | `SettingsDialog` | Pestañas: **General** (recordar sesión, carpetas vigiladas), **Miniaturas y .xmp** (tamaño, limpiar —también el privado—, purgar huérfanos, generar todas, .xmp) y **🔒 Privacidad** (`PrivacySettingsPanel`: crear/cambiar/quitar PIN y código nuevo —al momento—, minutos para bloquear, bloquear al minimizar, tecla y acción del modo pánico, validada con `privacy.panic_key_problem`). |
 | `PinDialog` / `NewPinDialog` / `RecoveryCodeDialog` | Pedir el PIN (cuenta regresiva si hay que esperar; "¿Olvidaste el PIN?" → código de recuperación → PIN nuevo), crear uno, mostrar el código (no se cierra con "Listo" hasta marcar que se guardó). |
 | `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/**fusionar** (⇢)/eliminar tags (confirma con el n.º de fotos), buscador, árbol con contadores y alias, flags hidden, exportar/importar JSON. |

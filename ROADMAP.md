@@ -256,8 +256,8 @@ Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 ## Fase 10 — Inteligencia local → v3.0
 *Usar ONNX Runtime en vez de PyTorch; modelos como descarga aparte para no inflar el `.exe`.*
 
-- [ ] #60 [B] Sugerir tags por carpeta (se puede adelantar)
-- [ ] #59 [M] Casi-duplicados con hash perceptual
+- [x] #60 [B] Sugerir tags por carpeta: por lo que tiene el resto de la carpeta (y la de arriba) y por su nombre; en el visor y en *Etiquetar selección* (~3 ms por foto)
+- [x] #59 [M] Casi-duplicados con hash perceptual (pHash + bandas): *Duplicados → Parecidas*, 3 sensibilidades, ★ mejor calidad. Agrupar 174k hashes: 1,5 s. La primera vez hay que leer cada original (≈ 54 ms/foto desde el USB: ~2,5 h para 172k; cancelable y se retoma)
 - [ ] #55 ⭐ [A] Búsqueda semántica con CLIP
 - [ ] #56 [A] Sugerencia automática de tags + detector NSFW
 - [ ] #58 [M] OCR en capturas de pantalla
