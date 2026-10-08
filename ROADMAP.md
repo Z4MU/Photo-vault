@@ -234,11 +234,22 @@ Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 
 ---
 
-## Fase 9 — Privacidad → v2.4
+## Fase 9 — Privacidad → v2.4 ✅
+*Medido con una copia de la DB real (171.843 fotos) ocultando una etiqueta de 21 fotos.*
 
-- [ ] #61 [M] PIN para contenido oculto
-- [ ] #62 [M] Caché de miniaturas cifrado/separado para lo oculto
-- [ ] #63 [B] Modo pánico
+| Operación | Tiempo |
+|---|---|
+| Desbloquear (scrypt) + recargar la galería | 0,12 s + 0,18 s |
+| Ocultar una etiqueta (borra sus miniaturas sin cifrar) | 31 ms |
+| Miniatura cifrada ya en caché | 0,15 ms (igual que una normal) |
+| Modo pánico (bloquear, cerrar ventanas, minimizar) | 0,2 s |
+
+- [x] #61 [M] PIN para el contenido oculto: sin desbloquear no se ven las fotos ni (con PIN) los nombres de las etiquetas ocultas; código de recuperación; espera tras 5 errores; bloqueo automático por inactividad y al minimizar
+- [x] #62 [M] Miniaturas de lo oculto cifradas (AES-GCM) en una carpeta aparte con nombres HMAC; las sin cifrar se borran
+- [x] #63 [B] Modo pánico: tecla configurable que funciona desde cualquier ventana (también diálogos modales)
+- [x] Configuración en pestañas
+- [x] 26 tests nuevos (313 en total) + prueba con la DB real
+- ⚠ Límite conocido: la base de datos no está cifrada (rutas y nombres de etiquetas se pueden leer con otro programa). Cifrarla (SQLCipher) sería otra fase.
 
 ---
 

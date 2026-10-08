@@ -30,12 +30,14 @@ PhotoVault es una app de escritorio (Windows) para **indexar, navegar, etiquetar
 | **opencv-python** | Duración/dimensiones de video y frame para miniatura |
 | **pillow-heif** | Soporte `.heic` / `.heif` (la colección tiene muchos). Se registra con `try/import`; si faltara, los HEIC se indexan sin miniatura |
 | **Send2Trash** | Mandar archivos a la Papelera de reciclaje (duplicados). Nunca usar `unlink` sobre fotos del usuario |
+| **cryptography** | AES-GCM para la clave del PIN y las miniaturas del contenido oculto (fase 9). PyInstaller lo incluye solo (hook de `pyinstaller-hooks-contrib`) |
 | **PyInstaller** | Empaquetado a `PhotoVault.exe` |
 | **pytest / ruff / mypy** | Desarrollo (`requirements-dev.txt`, config en `pyproject.toml`) |
 
 Datos del usuario (fuera del repo, nunca commitear):
 - `~/.photovault/photovault.db` — base de datos (~33 MB)
 - `~/.photovault/thumbs/<2 chars>/<sha1>.jpg` — caché de miniaturas
+- `~/.photovault/thumbs_private/<2 chars>/<hmac>.pvt` — miniaturas cifradas de las fotos ocultas (fase 9)
 - `~/.photovault/backups/` — copias de seguridad automáticas (§6)
 - `~/.photovault/logs/photovault.log` — log rotativo (§7)
 
@@ -46,7 +48,8 @@ Datos del usuario (fuera del repo, nunca commitear):
 ```
 main.py             Solo el arranque: main() + _startup() (backup, migraciones, papelera)
 config.py           Rutas de datos, versión, tamaños de miniatura, paleta (COLORS)
-services.py         Lógica de negocio. La UI SOLO habla con esta capa.
+services.py         Lógica de negocio. La UI SOLO habla con esta capa (y con privacy.py).
+privacy.py          Contenido oculto: PIN, desbloqueo, código de recuperación, cifrado (capa de servicios)
 database.py         Acceso a SQLite: conexiones, migraciones versionadas, queries
 models.py           Dataclasses tipadas + enums de ordenamiento
 indexer.py          Escaneo de carpetas, extracción de fecha/dimensiones/duración
@@ -71,6 +74,8 @@ ui/
   photo_stage.py        PhotoStage: foto/video ajustado, a resolución de pantalla, con precarga (etiquetado)
   system.py             Explorador, abrir con la app, portapapeles
   main_window.py        MainWindow (sesión, avisos, carpetas vigiladas)
+  privacy_actions.py    PrivacyMixin: mostrar/bloquear lo oculto, bloqueo automático, modo pánico
+  privacy_guard.py      PrivacyGuard: filtro de eventos de la app (tecla de pánico, inactividad)
   background.py         BackgroundTasksMixin: indexar (con cola) y generar miniaturas en segundo plano
   toast.py              ToastManager: avisos breves abajo a la derecha
   welcome.py            EmptyState: bienvenida (colección vacía) y "sin resultados"
@@ -83,7 +88,8 @@ ui/
     quick_tag.py        QuickTagWindow (varias etiquetas)
     review.py           ReviewWindow (sí / no), GridReviewWindow (cuadrícula)
     keymap.py           KeymapDialog + bind_keys / display_keys / normalize_key
-    settings.py         SettingsDialog
+    settings.py         SettingsDialog (pestañas General / Miniaturas y .xmp / Privacidad)
+    privacy.py          PinDialog, NewPinDialog, RecoveryCodeDialog, ensure_unlocked, PrivacySettingsPanel
     tags.py             CategoryManagerDialog, EditTagDialog, TagManagerDialog
     folders.py          IndexDialog, DeindexDialog, RelocateDialog, TrashDialog
 tests/              Suite de pytest (conftest.py aísla DB, backups y caché en tmp)
@@ -109,6 +115,7 @@ main.py → ui/ → services.py → database.py → SQLite
 ```
 
 **Reglas:**
+- `privacy.py` es parte de la capa de servicios (no tiene SQL; usa `db.get/set_setting` y `thumbnail_cache`); la UI lo usa igual que `services`.
 - La UI **no** escribe SQL ni llama a `database` directamente. Excepciones existentes y permitidas: `db.init_db()`, `db.close_connection()` (workers), `db.DB_PATH`, `db.SCHEMA_VERSION` y `db.DatabaseTooNewError` (en `main.py`).
 - `database.py` devuelve **modelos** (`Photo`, `Tag`, `Stats`…), nunca `sqlite3.Row` hacia afuera.
 - La lógica que combina varias queries (p. ej. obtener tags ocultos + contar + paginar) vive en `services.py`. `services.py` no tiene SQL.
@@ -118,7 +125,7 @@ main.py → ui/ → services.py → database.py → SQLite
 
 ## 4. Modelos (`models.py`)
 
-- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5, mtime, rating (0–5), favorite, note`. `stars` = "★★★☆☆". `mtime` es el del archivo al indexarlo (None = registro de antes de v3 aún no re-indexado). Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
+- `Photo` — `id, path, filename, year, month, media_type ("image"|"video"), duration, filesize, width, height, added_at, md5, mtime, rating (0–5), favorite, note, hidden`. `stars` = "★★★☆☆". `hidden` (fase 9) = tiene alguna etiqueta oculta; se calcula al leer (`_HIDDEN_EXPR` en `_PHOTO_COLUMNS`, subconsulta no correlacionada) y decide a qué caché va su miniatura. `mtime` es el del archivo al indexarlo (None = registro de antes de v3 aún no re-indexado). Propiedades: `is_video`, `duration_str` (`M:SS`), `short_name` (truncado a 22 chars). `md5` solo se carga en `get_photo_by_id` y `get_all_photos_for_duplicates`. Las queries usan `_PHOTO_COLUMNS`.
 - `Tag` — `id, name, category, color, hidden, sidebar_hidden, parent_id`.
 - `SavedSearch` — `id, name, query` (dict de `services.GalleryQuery.to_dict()`).
 - `GalleryPage` — `photos, total, offset, limit, sort_field, sort_order` + `page_number`, `total_pages`, `has_prev`, `has_next`.
@@ -170,7 +177,7 @@ Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and
 - El `upsert` pone `md5 = NULL` si cambió el tamaño o el `mtime` (antes un md5 viejo sobrevivía a cambios del archivo).
 (La DB real tiene además una columna sobrante `photos.sidebar_hidden` de alguna versión vieja; es inofensiva.)
 
-- `tags.hidden = 1` → las fotos con ese tag **no aparecen** en la galería.
+- `tags.hidden = 1` → las fotos con ese tag **no aparecen** en la galería salvo con el contenido oculto desbloqueado (fase 9, `services._hidden_filter()`). Con PIN y bloqueado tampoco aparece el nombre de la etiqueta (`services._visible_tags()`); sin PIN sí, para poder des-ocultarla como antes.
 - `tags.sidebar_hidden = 1` → el tag no aparece en el panel de filtros.
 - ⚠️ `ON DELETE CASCADE`: borrar una fila de `photos` borra sus etiquetas. Por eso **todo borrado de fotos pasa por `db.delete_photos(ids, reason)`**, que antes copia registro + etiquetas a `deleted_photos` en la misma transacción. Nunca hacer `DELETE FROM photos` directo (excepción: `apply_relocation` al fusionar, donde las etiquetas ya se pasaron al otro registro).
 
@@ -208,7 +215,7 @@ Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo i
 - Los «no» se borran solos (CASCADE) al borrar la etiqueta o la foto; **no** pasan por la papelera interna ni se trasladan al fusionar etiquetas (un «no es playa» no dice nada de la otra).
 
 ### Configuración del usuario
-`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume`, `session_state`, `restore_session`, `watched_folders`, `watch_on_start`, `watch_live` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume`, `session_state`, `restore_session`, `watched_folders`, `watch_on_start`, `watch_live`, `privacy_vault` (clave maestra cifrada), `privacy_attempts`, `privacy_options` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -286,6 +293,7 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 - **Pasar siempre el `mtime` de la DB** (o usar `get_photo_thumbnail`): sin él se consulta el archivo en el disco de la colección por cada miniatura. Con él, una miniatura en caché tarda 0,17 ms (antes 5,6 ms). Con el mismo mtime la clave es idéntica a la de antes, así que el caché existente sigue valiendo.
 - `services.pregenerate_thumbnails(ids | None)`: genera las que falten con `THUMB_WORKERS` hilos (Pillow suelta el GIL: ×2,3 medido), por tandas cancelables; la comprobación de caché también va dentro de los hilos.
 - `purge_orphans` borra también las miniaturas del formato anterior (sin `_<size>`).
+- **Fotos ocultas (fase 9):** `get_photo_thumbnail(photo)` con `photo.hidden` nunca escribe en `CACHE_DIR`: con el contenido desbloqueado (`privacy` llama `set_private_codec`) la guarda cifrada en `PRIVATE_DIR` (`<hmac>.pvt`, nonce + AES-GCM); bloqueado devuelve None sin generar nada. `remove_plain(fotos)` borra las sin cifrar de los 3 tamaños; `purge_private_orphans` necesita estar desbloqueado. `services.secure_hidden_thumbnails()` corre al ocultar una etiqueta, tras cada cambio de etiquetas (`_tags_changed`, que también sincroniza los .xmp) y al abrir la ventana (en un hilo).
 
 ---
 
@@ -376,6 +384,14 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 - **Galería vacía:** `gallery_stack` alterna `view` / `EmptyState` en `_after_model_reset` (bienvenida si `get_totals()[0] == 0`).
 - **Carpetas vigiladas:** `services.get/set_watched_folders`, `available_watched_folders()` (solo las que existen) y `watch_dirs(raíces)` (raíz + subcarpetas indexadas, desde la DB, máx. `MAX_WATCHED_DIRS`). `apply_watch_settings()` comprueba qué existe **en un `TaskWorker`** (un USB dormido tarda ~9 s en responder), monta `FolderWatcher` y, al abrir, revisa con `scan_watched_folders` 3 s después. `FolderWatcher.changed(raíz)` se emite 30 s (`SETTLE_MS`) después del último cambio → `start_indexing(raíz, auto=True)`; tras cada revisión automática se actualizan las carpetas vigiladas (subcarpetas nuevas).
 
+### Privacidad (fase 9)
+- **Modelo:** `privacy.set_pin` crea una clave maestra aleatoria y la guarda cifrada (AES-GCM) con el PIN (scrypt, `KDF_N`) y con un **código de recuperación** (20 caracteres, se muestra una vez). Desbloquear = descifrarla; queda solo en memoria hasta `lock()`. Cambiar el PIN solo la vuelve a cifrar. Tras `MAX_ATTEMPTS` (5) errores hay que esperar `LOCKOUT_SECONDS` × tandas (`LockedOutError`); se guarda en `privacy_attempts` (reiniciar no lo salta).
+- `privacy.show_hidden_content()` (= desbloqueado) decide si la galería incluye lo oculto; `hidden_locked()` (= hay PIN y está bloqueado) decide si se esconden también los nombres. Sin PIN no hay forma de desbloquear.
+- **UI:** `PrivacyMixin` (`ui/privacy_actions.py`): `toggle_hidden_content()` (Ctrl+Shift+H y el botón 🔒 de la barra de estado), `lock_hidden_content()` (cierra el visor y todo diálogo abierto: pueden estar mostrando lo oculto), `privacy_changed()` (vacía `QPixmapCache` y recarga), `panic()`. `PrivacyGuard` es un filtro de eventos **de la app** (así la tecla funciona en diálogos modales): acepta el `ShortcutOverride` de la tecla de pánico para que ningún atajo se la quede y actúa en el `KeyPress`, siempre fuera del filtro (`QTimer.singleShot`).
+- `ensure_unlocked(parent)` pide el PIN (o lo crea). En tests hay que reemplazarlo (`monkeypatch`): el diálogo real espera para siempre.
+- Exportar etiquetas con lo oculto bloqueado pide el PIN (el archivo lo incluye). Los `.xmp` no: ya se advierte que exponen los nombres.
+- ⚠ La DB **no** está cifrada: protege de miradas, no de alguien con acceso al archivo. La UI lo dice.
+
 ### Diálogos
 | Clase | Qué hace |
 |---|---|
@@ -388,7 +404,8 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 | `KeymapDialog` | Remapear teclas (2 por acción) y la tecla de cada etiqueta; no deja guardar choques (`services.keymap_conflicts`). |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
 | `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
-| `SettingsDialog` | Al abrir (recordar sesión), carpetas vigiladas (agregar/quitar, revisar al abrir, vigilar), tamaño de caché, limpiar caché (confirma, en un hilo), purgar huérfanos. |
+| `SettingsDialog` | Pestañas: **General** (recordar sesión, carpetas vigiladas), **Miniaturas y .xmp** (tamaño, limpiar —también el privado—, purgar huérfanos, generar todas, .xmp) y **🔒 Privacidad** (`PrivacySettingsPanel`: crear/cambiar/quitar PIN y código nuevo —al momento—, minutos para bloquear, bloquear al minimizar, tecla y acción del modo pánico, validada con `privacy.panic_key_problem`). |
+| `PinDialog` / `NewPinDialog` / `RecoveryCodeDialog` | Pedir el PIN (cuenta regresiva si hay que esperar; "¿Olvidaste el PIN?" → código de recuperación → PIN nuevo), crear uno, mostrar el código (no se cierra con "Listo" hasta marcar que se guardó). |
 | `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/**fusionar** (⇢)/eliminar tags (confirma con el n.º de fotos), buscador, árbol con contadores y alias, flags hidden, exportar/importar JSON. |
 | `EditTagDialog` | Cambiar nombre, categoría, color, **etiqueta padre** (sin ciclos: no ofrece descendientes) y **alias**; avisa si el nombre o un alias ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
@@ -480,7 +497,7 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 
 ### Tests
 - `tests/conftest.py` también tiene fixtures `autouse` que hacen fallar el test (con el mensaje) si aparece un `QMessageBox` crítico/advertencia/pregunta que el test no reemplazó (`information` se acepta solo) o si hay una excepción en un slot de Qt. Antes: el test se colgaba esperando el diálogo, o PyQt abortaba el proceso sin decir dónde. `PV_NO_SLOT_HOOK=1` desactiva lo segundo.
-- `tests/conftest.py` tiene una fixture `autouse` que redirige `database.DB_PATH`, `backup.BACKUP_DIR` y `thumbnail_cache.CACHE_DIR` a `tmp_path` y, al terminar cada test, espera los hilos retirados (`wait_all_threads`; si el proceso termina con uno vivo, Qt aborta). También define `qapp` (sesión) para los tests de UI. **Ningún test debe tocar `~/.photovault`.**
+- `tests/conftest.py` tiene una fixture `autouse` que redirige `database.DB_PATH`, `backup.BACKUP_DIR`, `thumbnail_cache.CACHE_DIR` y `thumbnail_cache.PRIVATE_DIR` a `tmp_path` (además bloquea `privacy` antes y después de cada test y baja `privacy.KDF_N` para que scrypt sea rápido) y, al terminar cada test, espera los hilos retirados (`wait_all_threads`; si el proceso termina con uno vivo, Qt aborta). También define `qapp` (sesión) para los tests de UI. **Ningún test debe tocar `~/.photovault`.**
 - `make_legacy_db(path)` simula una DB de V1 para probar migraciones.
 - Para probar contra datos reales: copiar la DB real con la API de backup (abriéndola `?mode=ro`) a un directorio temporal y apuntar `DB_PATH` ahí. Nunca contra la DB real.
 - Si tocas `DATE_PATTERNS`: agregar casos válidos y falsos positivos en `tests/test_dates.py`.
@@ -516,7 +533,7 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-10. `services.py` (~1.300 líneas), `database.py` (~1.700) y `ui/main_window.py` (~780) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
+10. `services.py` (~1.700 líneas), `database.py` (~1.800) y `ui/main_window.py` (~810) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
 11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
 9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
