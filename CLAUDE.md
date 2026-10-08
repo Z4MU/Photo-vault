@@ -68,13 +68,17 @@ ui/
   viewer.py             ViewerWindow, ImageView (visor a pantalla completa)
   video_player.py       VideoPlayer (QtMultimedia)
   photo_info.py         InfoPanel (panel de información del visor)
+  photo_stage.py        PhotoStage: foto/video ajustado, a resolución de pantalla, con precarga (etiquetado)
   system.py             Explorador, abrir con la app, portapapeles
   main_window.py        MainWindow
   dialogs/
     photo.py            TagEditor (etiquetas de una foto), BulkTagDialog
     stats.py            StatsDialog
     duplicates.py       DuplicatesDialog
-    quick_tag.py        QuickTagSetupDialog, QuickTagWindow
+    quick_tag_setup.py  QuickTagSetupDialog (modo, etiqueta, conjunto; recuerda la última)
+    quick_tag.py        QuickTagWindow (varias etiquetas)
+    review.py           ReviewWindow (sí / no), GridReviewWindow (cuadrícula)
+    keymap.py           KeymapDialog + bind_keys / display_keys / normalize_key
     settings.py         SettingsDialog
     tags.py             CategoryManagerDialog, EditTagDialog, TagManagerDialog
     folders.py          IndexDialog, DeindexDialog, RelocateDialog, TrashDialog
@@ -130,7 +134,7 @@ main.py → ui/ → services.py → database.py → SQLite
 - Todo hilo worker (`QThread`) debe llamar `db.close_connection()` al terminar (ya lo hacen `IndexWorker`, `ImageLoadQueue`, `MD5Worker`, `TaskWorker`).
 - Escrituras con `with transaction() as conn:` (commit/rollback automático).
 
-### Esquema (versión 4)
+### Esquema (versión 5)
 
 ```sql
 photos(id PK, path UNIQUE, filename, media_type, year, month, filesize,
@@ -142,6 +146,8 @@ tags(id PK, name UNIQUE COLLATE NOCASE, category, color, hidden, sidebar_hidden,
      parent_id → tags ON DELETE SET NULL)                                            -- v4
 tag_aliases(alias PK COLLATE NOCASE, tag_id → tags ON DELETE CASCADE)               -- v4
 saved_searches(id PK, name UNIQUE COLLATE NOCASE, query_json, created_at)          -- v4
+tag_rejections(tag_id → tags ON DELETE CASCADE, photo_id → photos ON DELETE CASCADE,
+               rejected_at, PK(tag_id, photo_id))                                  -- v5: los «no»
 photo_tags(photo_id → photos ON DELETE CASCADE, tag_id → tags ON DELETE CASCADE,
            PK(photo_id, tag_id))
 categories(name PK COLLATE NOCASE)
@@ -150,9 +156,9 @@ deleted_photos(id PK, batch_id, reason, deleted_at, path,   -- v2: papelera inte
                photo_json, tags_json)
 ```
 
-Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photos(rating, year, month, filename)` (v4), `photos(favorite) WHERE favorite = 1` (parcial, v4), `tag_aliases(tag_id)`, `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
+Índices: `photos(year, month, filename)` (`idx_photos_date`), `photos(filename)`, `photos(filesize)`, `photos(added_at)`, `photos(folder)`, `photos(md5)`, `photos(rating, year, month, filename)` (v4), `photos(favorite) WHERE favorite = 1` (parcial, v4), `tag_aliases(tag_id)`, `tag_rejections(photo_id)` (v5), `photo_tags(photo_id)`, `photo_tags(tag_id)`, `deleted_photos(batch_id)`, `deleted_photos(deleted_at)`. (v3 quitó `idx_photos_year`/`idx_photos_month`, cubiertos por el compuesto.)
 
-Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real), v4 `_m004_ratings_notes_tag_tree` (0,4 s).
+Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and_sort_indexes` (≈1 s sobre la DB real), v4 `_m004_ratings_notes_tag_tree` (0,4 s), v5 `_m005_tag_rejections`.
 
 - ⚠️ `COLLATE NOCASE` de SQLite solo ignora mayúsculas **ASCII** ("Mías" ≠ "MÍAS"). Donde importa (nombres de búsquedas guardadas) se compara en Python con `casefold()`.
 
@@ -177,7 +183,7 @@ Migraciones: v1 `_m001_baseline`, v2 `_m002_internal_trash`, v3 `_m003_mtime_and
 - Si la ruta nueva ya estaba indexada (se re-indexó), se fusionan: etiquetas, valoración más alta, favorita y nota al registro existente, y el viejo se quita.
 
 ### Filtros de consulta
-`PhotoFilter` (fase 6) agrega: `tag_groups` (Y de grupos; cada grupo = etiqueta + descendientes), `any_tag_ids` (O), `exclude_tag_ids` (NO), `media_type`, `year_from/to`, `min_pixels`, `orientation` (con 2 % de tolerancia para "cuadrada"), `min/max_duration`, `min_rating`, `favorites_only`, `has_note`; `search` busca en el nombre **o en la nota**. La galería usa `query_photos(filtro, orden, limit, offset)` y `count_filtered(filtro)`.
+`PhotoFilter` (fase 6) agrega: `tag_groups` (Y de grupos; cada grupo = etiqueta + descendientes), `any_tag_ids` (O), `exclude_tag_ids` (NO), `media_type`, `year_from/to`, `min_pixels`, `orientation` (con 2 % de tolerancia para "cuadrada"), `min/max_duration`, `min_rating`, `favorites_only`, `has_note`, `not_rejected_for`/`rejected_for` (v5, revisión); `search` busca en el nombre **o en la nota**. La galería usa `query_photos(filtro, orden, limit, offset)` y `count_filtered(filtro)`.
 
 Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo ids, mismo orden que `get_photos`), `count_before_date(filtro, año, mes, orden)` (fila a la que saltar; `mes=None` = el año, `NO_MONTH` = las de ese año sin mes; respeta dónde pone SQLite los NULL en ASC/DESC) y `get_date_histogram(filtro)`.
 
@@ -192,8 +198,13 @@ Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo i
 - La expansión padre → descendientes se hace en `services.GalleryQuery.photo_filter()` (`tag_descendants()`). `tag_path_names()` = `{id: [raíz, …, nombre]}`.
 - Valoración/favoritas/notas: `set_rating(ids, n)`, `set_favorite(ids, bool)`, `set_note(id, texto)`; para exportar/importar `get_photo_extras()` / `merge_photo_extras()` (solo agrega: la valoración más alta, la nota si no había).
 
+### Revisión por etiqueta (v5)
+- Solo se guardan los **«no»** (`tag_rejections`); un «sí» es la etiqueta misma. «Revisada para X» = tiene X (o una hija) **o** tiene un «no» para X.
+- `add_rejections`, `remove_rejections`, `get_rejected_ids`, `get_ids_with_tag`, `get_all_rejections` (exportar).
+- Los «no» se borran solos (CASCADE) al borrar la etiqueta o la foto; **no** pasan por la papelera interna ni se trasladan al fusionar etiquetas (un «no es playa» no dice nada de la otra).
+
 ### Configuración del usuario
-`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado). (`page_size` quedó sin uso desde la fase 5.)
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -302,6 +313,9 @@ Todos heredan de `StoppableThread` (`stop()`, `is_stopping()`):
 - No llamar una señal propia `done` en una subclase de `QDialog` (choca con `QDialog.done`). Por eso `QuickTagWindow` usa `done_signal`.
 - Conectar señales de workers a **métodos** (`_on_progress`, `_on_error`…), no a lambdas que devuelven tuplas `(a(), b())`.
 - Cuando un worker avisa que terminó (`completed`), el hilo **todavía** está cerrando su conexión: soltarlo con `retire_thread(w)`, no con `self._w = None` (`MainWindow._release_background`, `InfoPanel._on_details`).
+- Toda ventana con una cola propia llama además `retire_on_destroy(self, cola)` (`weakref.finalize`): si se descarta sin pasar por `done()` (p. ej. nunca se mostró), el hilo se retira en vez de destruirse vivo (eso aborta la app). No usar la señal `destroyed` para esto: corre en medio de la destrucción en C++.
+- `retire_thread` tolera un hilo que Qt ya destruyó (`RuntimeError`).
+- No conectar señales de controles antes de terminar de construir la ventana: un `setChecked` inicial dispara el slot con atributos que aún no existen, y una excepción en un slot **aborta** la app (código 0xC0000409) si no hay excepthook (tests).
 
 ### Imágenes grandes
 `load_preview_pixmap(path, max_side)`: `QImageReader` con `setAutoTransform(True)` (orientación EXIF) y `setScaledSize` (no carga el original completo). Si Qt no puede leer el formato (HEIC), usa la miniatura de Pillow. Usarla en vez de `QPixmap(path)`.
@@ -355,8 +369,11 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 |---|---|
 | `ViewerWindow` | Visor (ver arriba). Reemplaza al antiguo `PhotoDetailDialog`. |
 | `BulkTagDialog` | Agregar/quitar un tag a todas las fotos seleccionadas. |
-| `QuickTagSetupDialog` | Elegir conjunto a etiquetar: carpeta indexada + tags requeridos + "solo sin etiquetar", con conteo en vivo. |
-| `QuickTagWindow` | Etiquetado por teclado: `←/→` navegar, `Space` saltar, `1–9` atajos de tag, `Ctrl+Z` deshacer (historial completo), búsqueda de tags, `Esc` salir. Al terminar la última foto regresa a la galería y esta se recarga. |
+| `QuickTagSetupDialog` | Modo (sí / no, cuadrícula, varias etiquetas), etiqueta a revisar, conjunto (colección, galería actual, álbum, búsqueda guardada) + carpeta + "solo sin etiquetar" + "volver a revisar las respondidas"; cuenta lo pendiente en vivo; botón ⌨ Teclas…; recuerda la última configuración. |
+| `ReviewWindow` | Sí / no: una foto a la vez (`PhotoStage`), destello verde/rojo al responder, Ctrl+Z vuelve a la foto. |
+| `GridReviewWindow` | Cuadrícula de 9/12/16/20 (`thumbnail_queue`, 480 px, precarga la página siguiente): 1–9 / clic marcan, Enter confirma (resto = «no»), Ctrl+Z vuelve a la página con sus marcas. 1–9 y flechas son fijas. |
+| `QuickTagWindow` | Varias etiquetas: cada etiqueta con su tecla (cualquiera, `services.get_tag_keys`), Ctrl+R repite las de la anterior, Ctrl+Z (por acción) vuelve a la foto, buscador por nombre o alias; recuerda la última foto por consulta y ofrece continuar. |
+| `KeymapDialog` | Remapear teclas (2 por acción) y la tecla de cada etiqueta; no deja guardar choques (`services.keymap_conflicts`). |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
 | `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
 | `SettingsDialog` | Tamaño de caché, limpiar caché, purgar huérfanos. |
@@ -381,6 +398,12 @@ Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existe
 - Paleta en `config.COLORS`: fondo `#0D0D1A`, paneles `#13131F` / `#1E1E2E`, bordes `#2D2D3F` / `#3A3A5A`, acento `#4A9EFF`, peligro `#FF4A4A`, advertencia `#FFD700`, éxito `#4AFF9E`.
 - Mantener esta paleta en cualquier UI nueva. (Los estilos en línea existentes todavía usan los hex literales.)
 
+### Etiquetado rápido (fase 7)
+- Tres modos que comparten piezas: `services.PhotoList(ids)` (lista fija leída por tramos de 300; cumple `PhotoSequence`), `PhotoStage` (precarga las 3 siguientes a resolución de pantalla en su `ImageLoadQueue`; videos en silencio) y las teclas de `services.get_keymap()` (`KEY_ACTIONS`: acción → descripción y teclas de fábrica, prefijo `review.` / `grid.` / `multi.` / `common.`).
+- **Sí / no y cuadrícula** recorren `services.review_query(base, tag)` = `base` + excluir la etiqueta (con hijas) + `not_rejected_for`; por eso retomar es automático. `review_answer(tag, sí_ids, no_ids)` devuelve el `ReviewState` previo de cada foto y `review_restore` lo deshace. Un «no» sobre una foto que tenía la etiqueta (re-revisión) se la quita.
+- Las teclas se enlazan con `bind_keys` (un `QShortcut` por tecla, contexto de ventana). Un atajo de ventana solo funciona en la ventana **activa**: en tests, `show()` + `activateWindow()` y esperar a que lo sea.
+- Los conteos de `QuickTagSetupDialog` usan `review_stats(base, tag)` → `total / tagged / rejected / pending`.
+
 ### Formato de exportación de tags (JSON, versión 3)
 ```json
 { "version": 2, "app": "PhotoVault", "exported_at": "2026-10-04T12:00:00",
@@ -388,11 +411,12 @@ Esas van en `report.skipped` y se muestran al usuario. Si de verdad ya no existe
             "parent": "nombre del padre", "aliases": ["..."]}],
   "categories": ["..."],
   "assignments": [{"path": "G:\\...\\a.jpg", "filename": "a.jpg", "filesize": 123, "tags": ["x", "y"],
-                   "rating": 4, "favorite": true, "note": "..."}] }
+                   "rating": 4, "favorite": true, "note": "...", "rejected": ["etiquetas con «no»"]}] }
 ```
 - Se siguen aceptando las versiones 1 (sin `assignments`) y 2 (sin padre/alias/valoración). `parent`, `aliases`, `rating`, `favorite` y `note` son opcionales; `assignments` incluye también fotos sin etiquetas pero con valoración, favorita o nota.
 - Importar padre/alias solo si la etiqueta no tenía; valoración/favorita/nota solo se agregan.
 - Las búsquedas guardadas **no** se exportan (usan ids de etiquetas de esta DB).
+- `rejected` (fase 7): al importar, un «no» se agrega solo si la foto no tiene esa etiqueta.
 - La importación solo crea tags que no existan (nunca sobrescribe) y **solo agrega** asignaciones, nunca quita.
 - Emparejamiento de fotos: ruta exacta → si no, `(nombre, tamaño)` cuando hay **una sola** coincidencia (cambio de unidad/carpeta). Si hay varias, no adivina (`photos_missing`).
 - La UI pregunta si importar las asignaciones (Sí / No / Cancelar).
@@ -443,7 +467,7 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - `build/`, `dist/`, `.venv/` no se commitean.
 
 ### Tests
-- `tests/conftest.py` tiene una fixture `autouse` que redirige `database.DB_PATH`, `backup.BACKUP_DIR` y `thumbnail_cache.CACHE_DIR` a `tmp_path`. **Ningún test debe tocar `~/.photovault`.**
+- `tests/conftest.py` tiene una fixture `autouse` que redirige `database.DB_PATH`, `backup.BACKUP_DIR` y `thumbnail_cache.CACHE_DIR` a `tmp_path` y, al terminar cada test, espera los hilos retirados (`wait_all_threads`; si el proceso termina con uno vivo, Qt aborta). También define `qapp` (sesión) para los tests de UI. **Ningún test debe tocar `~/.photovault`.**
 - `make_legacy_db(path)` simula una DB de V1 para probar migraciones.
 - Para probar contra datos reales: copiar la DB real con la API de backup (abriéndola `?mode=ro`) a un directorio temporal y apuntar `DB_PATH` ahí. Nunca contra la DB real.
 - Si tocas `DATE_PATTERNS`: agregar casos válidos y falsos positivos en `tests/test_dates.py`.
@@ -479,12 +503,10 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-3. `get_photos_for_tagging` carga todas las fotos coincidentes (843 ms para 171k); `QuickTagWindow` podría usar `GalleryModel` como el visor (fase 7).
 10. `services.py` (~1.300 líneas), `database.py` (~1.700) y `ui/main_window.py` (~740) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
 11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
 9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
-4. `QuickTagWindow` carga imágenes en el hilo de UI (con `load_preview_pixmap` ya es rápido, pero un HEIC grande sin caché tarda) → fase 7 (usar `ImageLoadQueue` como el visor).
 12. 150 JPEG truncados de la colección real (copias en "Broken pics") no generan miniatura (⚠). Pillow podría leerlos con `ImageFile.LOAD_TRUNCATED_IMAGES`.
 13. FFmpeg (QtMultimedia) escribe la información de cada video en la consola en desarrollo; en el `.exe` no hay consola.
 5. `SettingsDialog._clear_cache` borra el caché con `shutil.rmtree` en el hilo de UI y sin confirmar (es regenerable, pero con 170k miniaturas tarda).
@@ -534,3 +556,6 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - Workers soltados (`= None`) en su `completed` mientras aún cerraban la conexión → `retire_thread`.
 - Ancho/alto sin la rotación EXIF (fotos verticales de celular como horizontales) → se intercambian al indexar (`test_dimensiones_con_la_orientacion_aplicada`).
 - "Mías" y "MÍAS" eran búsquedas distintas (`NOCASE` solo ASCII) → `casefold()`.
+- Etiquetado rápido cargaba todas las fotos (843 ms) y decodificaba en el hilo de UI → `services.PhotoList` (por tramos) + `PhotoStage` (hilo, precarga).
+- Una ventana descartada sin mostrarse dejaba su hilo vivo y Qt abortaba → `retire_on_destroy`.
+- `QuickTagSetupDialog` llamaba `_refresh` a medio construir (señales conectadas antes de tiempo) → se conectan al final (`test_configuracion_se_construye_sin_errores_en_slots`).

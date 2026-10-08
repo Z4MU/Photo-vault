@@ -183,15 +183,33 @@ Leyenda: ⭐ alto impacto · esfuerzo **[B]** bajo · **[M]** medio · **[A]** a
 
 ---
 
-## Fase 7 — Etiquetado rápido 2.0 → v2.2
+## Fase 7 — Etiquetado rápido 2.0 → v2.2 ✅
+*Idea del usuario: elegir UNA etiqueta y una carpeta, y decidir foto por foto con el teclado si entra o no.
+Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 
-- [ ] #48 ⭐ [B] Atajos configurables
-- [ ] #49 [M] Más de 9 atajos
-- [ ] #50 [B] Precargar la siguiente imagen
-- [ ] #54 [B] Imagen a resolución de pantalla
-- [ ] #51 [B] Repetir los tags de la foto anterior
-- [ ] #52 [B] Retomar sesión
-- [ ] #53 [B] Deshacer navega a la foto afectada
+| Operación | Tiempo |
+|---|---|
+| Contar lo pendiente de una etiqueta en toda la colección | 5 ms |
+| Armar la lista de pendientes (171.843) / retomar tras 3.000 respuestas | 75 ms / 105 ms |
+| Siguiente foto en sí / no (ya precargada) | 2 ms |
+| Primera foto a resolución de pantalla (disco despierto) | 28 ms |
+| Cuadrícula de 16: primera página / página siguiente | 52 ms / 160 ms |
+| Abrir "varias etiquetas" con toda la colección | 0,3 s (antes 0,8 s solo cargando) |
+
+- [x] ⭐ Modo **sí / no** (idea del usuario): una etiqueta + un conjunto (colección, galería actual, álbum o búsqueda guardada, carpeta, solo sin etiquetar); → sí, ← no, Espacio saltar
+- [x] ⭐ Modo **cuadrícula** (9/12/16/20): se marcan las que sí; al confirmar, el resto queda «no»
+- [x] Los «no» se guardan (tabla `tag_rejections`, migración v5): una sesión nueva empieza por lo que falta; se exportan en el JSON
+- [x] Se mantiene el modo **varias etiquetas**
+- [x] #48 ⭐ Teclas configurables (⌨ Teclas…): cada acción con hasta 2 teclas, detección de choques
+- [x] #49 Más de 9 atajos: cualquier tecla para cualquier etiqueta
+- [x] #50 Precarga de las 3 siguientes (`PhotoStage`)
+- [x] #54 Imagen a resolución de pantalla (máx. 2560 px), decodificada en un hilo
+- [x] #51 Repetir las etiquetas de la foto anterior (Ctrl+R; un Ctrl+Z la deshace entera)
+- [x] #52 Retomar sesión (sí / no y cuadrícula: automático; varias etiquetas: ofrece continuar en la última foto)
+- [x] #53 Deshacer vuelve a la foto (o página) afectada
+- [x] La configuración recuerda la última sesión (modo, etiqueta, conjunto, tamaño)
+- [x] *(bug)* Un hilo de precarga quedaba vivo si una ventana se descartaba sin mostrarse → `retire_on_destroy`
+- [x] 21 tests nuevos (276 en total) + prueba con la DB real y fotos de `G:`
 
 ---
 
