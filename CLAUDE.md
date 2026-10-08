@@ -27,12 +27,12 @@ PhotoVault es una app de escritorio (Windows) para **indexar, navegar, etiquetar
 | **PyQt6** (+ `PyQt6-Qt6`) | Toda la UI. `PyQt6-Qt6` es necesario para `QSvgWidget` (gráficas de estadísticas). |
 | **SQLite** (`sqlite3` stdlib) | Base de datos en `~/.photovault/photovault.db` |
 | **Pillow** | Lectura de imágenes, EXIF, generación de miniaturas |
-| **opencv-python** | Duración/dimensiones de video y frame para miniatura |
+| **opencv-python-headless** | Duración/dimensiones de video y frame para miniatura (sin la parte de ventanas: desde la fase 11) |
 | **pillow-heif** | Soporte `.heic` / `.heif` (la colección tiene muchos). Se registra con `try/import`; si faltara, los HEIC se indexan sin miniatura |
 | **Send2Trash** | Mandar archivos a la Papelera de reciclaje (duplicados). Nunca usar `unlink` sobre fotos del usuario |
 | **onnxruntime** + **tokenizers** + **numpy** | Búsqueda por contenido (CLIP, fase 10) y hash perceptual. Los modelos **no** van en el `.exe`: se descargan desde Configuración → IA |
 | **cryptography** | AES-GCM para la clave del PIN y las miniaturas del contenido oculto (fase 9). PyInstaller lo incluye solo (hook de `pyinstaller-hooks-contrib`) |
-| **PyInstaller** | Empaquetado a `PhotoVault.exe` |
+| **PyInstaller** + **Inno Setup 6** | Programa en modo carpeta (`dist\PhotoVault\`) e instalador (`dist\PhotoVault-X.Y.Z-instalador.exe`). Inno Setup está en `%LOCALAPPDATA%\Programs\Inno Setup 6\` |
 | **pytest / ruff / mypy** | Desarrollo (`requirements-dev.txt`, config en `pyproject.toml`) |
 
 Datos del usuario (fuera del repo, nunca commitear):
@@ -55,6 +55,7 @@ services.py         Lógica de negocio. La UI SOLO habla con esta capa (y con pr
 privacy.py          Contenido oculto: PIN, desbloqueo, código de recuperación, cifrado (capa de servicios)
 smart.py            Inteligencia local (capa de servicios): etiquetas sugeridas por carpeta, fotos parecidas
 similarity.py       pHash de 64 bits y búsqueda de parecidas (numpy; sin Qt ni DB)
+updates.py          Aviso de versión nueva: lee la última release de GitHub (sin Qt; nunca descarga nada)
 clip_model.py       Modelo CLIP local: descarga verificada (SHA-256, revisión fija), imagen/texto → vector
 embedding_store.py  Vectores CLIP en ~/.photovault/embeddings.db (SQLite aparte)
 database.py         Acceso a SQLite: conexiones, migraciones versionadas, queries
@@ -84,6 +85,7 @@ ui/
   privacy_actions.py    PrivacyMixin: mostrar/bloquear lo oculto, bloqueo automático, modo pánico
   privacy_guard.py      PrivacyGuard: filtro de eventos de la app (tecla de pánico, inactividad)
   content_search.py     ContentSearchMixin: botón 🧠 del buscador y "Parecidas por contenido"
+  update_notice.py      UpdateNoticeMixin: al abrir, avisa (aviso que abre la página) si hay versión nueva
   background.py         BackgroundTasksMixin: indexar (con cola) y generar miniaturas en segundo plano
   toast.py              ToastManager: avisos breves abajo a la derecha
   welcome.py            EmptyState: bienvenida (colección vacía) y "sin resultados"
@@ -99,14 +101,19 @@ ui/
     settings.py         SettingsDialog (pestañas General / Miniaturas y .xmp / Privacidad)
     privacy.py          PinDialog, NewPinDialog, RecoveryCodeDialog, ensure_unlocked, PrivacySettingsPanel
     ai_settings.py      AiSettingsPanel (pestaña IA: descargar modelo, analizar, borrar análisis)
+    about.py            AboutDialog (versión, carpeta de datos, log, créditos, buscar actualizaciones)
+    starter_tags.py     StarterTagsDialog (grupos de etiquetas de ejemplo, services.STARTER_TAGS)
     tags.py             CategoryManagerDialog, EditTagDialog, TagManagerDialog
     folders.py          IndexDialog, DeindexDialog, RelocateDialog, TrashDialog
 tests/              Suite de pytest (conftest.py aísla DB, backups y caché en tmp)
 pyproject.toml      Config de pytest, ruff (lint + format) y mypy
 requirements.txt    Dependencias de la app
 requirements-dev.txt Dependencias de desarrollo (pytest, pytest-cov, ruff, mypy)
-PhotoVault.spec     Configuración de PyInstaller
-build.bat           Script de build para Windows (autodetecta Python)
+PhotoVault.spec     Configuración de PyInstaller (modo carpeta, ícono, versión del .exe)
+build.bat           Script de build para Windows (autodetecta Python; instalador si hay Inno Setup)
+installer/PhotoVault.iss  Instalador (Inno Setup)
+assets/             icon.ico / icon.png (generados con tools/make_icon.py)
+.github/workflows/  ci.yml (tests en cada push) y release.yml (tag vX.Y.Z → instalador en una release)
 ROADMAP.md          Plan por fases con casillas
 ```
 
@@ -226,7 +233,7 @@ Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo i
 - Los «no» se borran solos (CASCADE) al borrar la etiqueta o la foto; **no** pasan por la papelera interna ni se trasladan al fusionar etiquetas (un «no es playa» no dice nada de la otra).
 
 ### Configuración del usuario
-`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume`, `session_state`, `restore_session`, `watched_folders`, `watch_on_start`, `watch_live`, `privacy_vault` (clave maestra cifrada), `privacy_attempts`, `privacy_options` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume`, `session_state`, `restore_session`, `watched_folders`, `watch_on_start`, `watch_live`, `privacy_vault` (clave maestra cifrada), `privacy_attempts`, `privacy_options`, `ai_auto_analyze`, `update_check`, `update_last_check`, `update_skipped_version` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -244,7 +251,7 @@ La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en 
 
 **Reglas aprendidas a la mala (siguen vigentes):**
 1. Un índice sobre una columna nueva se crea DESPUÉS de agregar la columna (causó `no such column: md5`).
-2. **Datos semilla se insertan UNA sola vez** (flag `seeded`). Nunca poner `INSERT OR IGNORE` de seeds en cada arranque: hacía que lo que el usuario borraba reapareciera.
+2. **Datos semilla se insertan UNA sola vez** (flag `seeded`). Nunca poner `INSERT OR IGNORE` de seeds en cada arranque: hacía que lo que el usuario borraba reapareciera. Desde la fase 11 el seed de una DB nueva solo crea la categoría `general`: las ~50 etiquetas de antes eran personales; ahora hay grupos genéricos opcionales (`services.STARTER_TAGS`, *🏷 Gestionar etiquetas → Etiquetas de ejemplo…*). Las DB existentes no cambian.
 3. DBs anteriores a `app_settings` que ya tienen tags se marcan como `seeded` (lo hace `_m001_baseline`).
 4. `_m001_baseline` es idempotente y equivale a todo lo que hacía `init_db()` hasta V11: lleva cualquier DB vieja (V1…V11, `user_version = 0`) a la versión 1. Verificado contra una copia de la DB real (171.840 fotos): solo cambia `user_version`.
 
@@ -509,12 +516,17 @@ py -m venv --system-site-packages .venv
 py -m PyInstaller PhotoVault.spec --noconfirm
 ```
 
-- Salida: `dist\PhotoVault.exe` (un solo archivo, `console=False`, UPX activado, ~150 MB).
+- Salida (fase 11): **carpeta** `dist\PhotoVault\` (`PhotoVault.exe` + `_internal\`, ~310 MB sin comprimir, sin UPX) y, si está Inno Setup, `dist\PhotoVault-X.Y.Z-instalador.exe` (~84 MB). La carpeta arranca en ~1 s; el `.exe` de un solo archivo tardaba ~7 s (se descomprimía en cada arranque). `main.py` registra "Ventana lista en X s".
+- El `.spec` toma la versión de `config.APP_VERSION` (una sola fuente) y la pone en las propiedades del `.exe`, con `assets/icon.ico`. No usa `collect_data_files('PyQt6')`: los hooks traen los plugins necesarios; excluye módulos de Qt que no se usan (WebEngine, QML…), las traducciones de Qt, `opengl32sw.dll` y el plugin de PDF.
+- Instalador (`installer/PhotoVault.iss`): por usuario, sin administrador (`PrivilegesRequired=lowest`, `%LOCALAPPDATA%\Programs\PhotoVault`); actualizar = instalar encima (mismo `AppId`; borra `_internal` viejo); desinstalar **no** toca `~/.photovault`. Compresión `lzma2/max` (`ultra64` se queda sin memoria en ISCC de 32 bits).
+- **Publicar una versión:** subir `APP_VERSION`, commit, `git tag vX.Y.Z` y `git push origin vX.Y.Z` → `release.yml` corre los tests, compila, arma el instalador y crea la release (falla si la etiqueta no coincide con `APP_VERSION`). El aviso de versión nueva lee esa release.
+- CI (`ci.yml`): ruff, formato, mypy y pytest en `windows-latest` con Python 3.14 en cada push/PR. ruff y mypy están fijos en `requirements-dev.txt`.
 - Archivos que no son `.py` (hoy: `ui/dark.qss`) van en `datas` del `.spec`; si no, el `.exe` no los encuentra.
-- ⚠️ Al probar el `.exe` desde un script: en modo un-solo-archivo el `.exe` lanza un **proceso hijo**. Matar solo el padre deja el hijo vivo (y bloquea `dist\PhotoVault.exe` para la próxima compilación). Cerrar con `taskkill /PID <pid> /T /F`.
+- ⚠️ Al probar el `.exe` desde un script cerrar con `taskkill /PID <pid> /T /F`. Con una terminal parada dentro de `dist\PhotoVault\` PyInstaller no puede borrar la carpeta (`WinError 32`).
 - `build.bat` busca Python en: PATH → `py` → `%LOCALAPPDATA%\Python\pythoncore-*` → instalaciones típicas.
 - Si el `.exe` abre y se cierra: revisar `~/.photovault/logs/photovault.log`. Si no hay nada, poner `console=True` en el `.spec`, recompilar y ver el traceback.
-- `hiddenimports` incluye `PyQt6.QtSvg`, `PyQt6.QtSvgWidgets`, `cv2`, `pillow_heif`, `send2trash.win(.legacy)`. Si agregas un import dinámico nuevo, añádelo ahí.
+- `hiddenimports` incluye `PyQt6.QtSvg`, `PyQt6.QtSvgWidgets`, `PyQt6.QtMultimedia(Widgets)`, `cv2`, `pillow_heif`, `send2trash.win(.legacy)`. Si agregas un import dinámico nuevo, añádelo ahí. `onnxruntime`, `tokenizers` y `cryptography` los detecta solo (verificado en el bundle).
+- Ícono: `py tools/make_icon.py` regenera `assets/`. La app lo pone en las ventanas (`config.ICON_PATH`) y fija un `AppUserModelID` para que la barra de tareas use el ícono de PhotoVault.
 - `build/`, `dist/`, `.venv/` no se commitean.
 
 ### Tests
@@ -555,10 +567,10 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-10. `services.py` (~1.700 líneas), `database.py` (~1.800) y `ui/main_window.py` (~810) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
+10. `services.py` (~1.800 líneas), `database.py` (~1.800) y `ui/main_window.py` (~810) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
 11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
-9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
+9. `cv2` ocupa ~100 MB del programa (71 MB `cv2.pyd` + FFmpeg) solo para la duración y un cuadro de los videos; QtMultimedia ya trae FFmpeg: se podría usar eso. El instalador no está firmado (Windows SmartScreen avisa la primera vez).
 12. 150 JPEG truncados de la colección real (copias en "Broken pics") no generan miniatura (⚠). Pillow podría leerlos con `ImageFile.LOAD_TRUNCATED_IMAGES`.
 13. FFmpeg (QtMultimedia) escribe la información de cada video en la consola en desarrollo; en el `.exe` no hay consola.
 6. El caché de miniaturas de antes de la fase 1 (formato sin tamaño) queda como huérfano hasta pulsar **Purgar huérfanos** en Configuración.

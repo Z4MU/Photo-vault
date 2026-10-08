@@ -265,15 +265,22 @@ Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 
 ---
 
-## Fase 11 — Distribución *(continua)*
+## Fase 11 — Distribución → v3.1 ✅
 
-- [ ] #82 ⭐ [B] Modo `onedir` (arranque rápido) — *se puede adelantar*
-- [ ] #83 [B] `.exe` más liviano (`opencv-python-headless`, sin `collect_data_files('PyQt6')` completo)
-- [ ] #84 [B] Ícono, versión en el `.exe`, "Acerca de"
-- [ ] #85 [M] Instalador (Inno Setup)
-- [ ] #81 [M] CI en GitHub Actions: tests + build en cada release
-- [ ] #86 [M] Aviso de versión nueva
-- [ ] #87 [B] Tags predefinidos genéricos/opcionales
+| | Antes (3.0, un solo archivo) | Después (3.1) |
+|---|---|---|
+| Hasta ver la ventana | ~7 s | ~1 s |
+| Lo que se descarga | `PhotoVault.exe` 178 MB | instalador 84 MB |
+
+- [x] #82 ⭐ [B] Modo carpeta (`onedir`): arranque en ~1 s
+- [x] #83 [B] Más liviano: `opencv-python-headless`, sin `collect_data_files('PyQt6')`, sin módulos de Qt sin usar, traducciones, OpenGL por software ni PDF
+- [x] #84 [B] Ícono (cámara con cerradura), versión en las propiedades del `.exe`, "Acerca de" (botón ℹ)
+- [x] #85 [M] Instalador (Inno Setup): por usuario, sin administrador, actualiza encima, no borra los datos al desinstalar
+- [x] #81 [M] CI en GitHub Actions: tests en cada push; tag `vX.Y.Z` → instalador publicado en una release
+- [x] #86 [M] Aviso de versión nueva (una vez al día, desactivable; nunca descarga solo)
+- [x] #87 [B] Etiquetas de fábrica: una DB nueva empieza sin etiquetas personales; grupos de ejemplo genéricos opcionales
+- [ ] Firmar el instalador (SmartScreen) — requiere un certificado
+- [ ] Videos con el FFmpeg de QtMultimedia en vez de OpenCV (~100 MB menos)
 
 ---
 
