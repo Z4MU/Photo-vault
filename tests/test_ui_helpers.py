@@ -112,7 +112,9 @@ def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
 
     db.init_db()
     pid = db.upsert_photo(r"C:\no\existe.jpg", "existe.jpg", 2020, 1, 1)
-    win = QuickTagWindow([p for p in db.get_photos() if p.id == pid])
+    import services
+
+    win = QuickTagWindow(services.PhotoList([pid]))
 
     def headers() -> dict[str, bool]:
         return {

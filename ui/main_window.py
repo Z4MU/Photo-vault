@@ -34,7 +34,9 @@ import services
 from models import SortField, SortOrder
 from ui.dialogs.duplicates import DuplicatesDialog
 from ui.dialogs.folders import DeindexDialog, IndexDialog
-from ui.dialogs.quick_tag import QuickTagSetupDialog, QuickTagWindow
+from ui.dialogs.quick_tag import QuickTagWindow
+from ui.dialogs.quick_tag_setup import QuickTagSetupDialog
+from ui.dialogs.review import GridReviewWindow, ReviewWindow
 from ui.dialogs.settings import SettingsDialog
 from ui.dialogs.stats import StatsDialog
 from ui.dialogs.tags import TagManagerDialog
@@ -613,20 +615,26 @@ class MainWindow(QMainWindow, GalleryActionsMixin):
         self.stats_lbl.setText(f"{photos:,} fotos  •  {tags} etiquetas")
 
     def _open_quick_tag(self):
-        setup = QuickTagSetupDialog(self)
+        setup = QuickTagSetupDialog(self._query(), self)
         if setup.exec() != QDialog.DialogCode.Accepted:
             return
-        photos = services.get_photos_for_tagging(
-            folder=setup.selected_folder,
-            tag_ids=setup.selected_tag_ids or None,
-            untagged_only=setup.untagged_only,
-        )
-        if not photos:
-            QMessageBox.information(self, "Sin fotos", "No se encontraron fotos con ese filtro.")
+        photos = services.photo_list(setup.query)
+        if not photos.count():
+            QMessageBox.information(self, "Sin fotos", "No hay fotos para etiquetar con esa configuración.")
             return
-        win = QuickTagWindow(photos, self)
-        win.done_signal.connect(self._refresh_after_tag_change)
+        tag = services.get_tag(setup.tag_id) if setup.tag_id is not None else None
+        win: QDialog
+        if setup.mode == "multi" or tag is None:
+            win = QuickTagWindow(photos, setup.query, self)
+        elif setup.mode == "grid":
+            win = GridReviewWindow(tag, photos, setup.grid_size, self)
+        else:
+            win = ReviewWindow(tag, photos, self)
+        win.setWindowState(Qt.WindowState.WindowMaximized)
         win.exec()
+        if isinstance(win, (ReviewWindow, GridReviewWindow)) and (win.yes_count or win.no_count):
+            self.task_status.finish(win.summary(), hide_after_ms=8000)
+        self._refresh_after_tag_change()
 
     # ── Tareas en segundo plano (barra de estado) ─────────────────────────────
 

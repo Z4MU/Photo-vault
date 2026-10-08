@@ -10,7 +10,7 @@ los tests puedan redirigirlas con monkeypatch. Cambia el valor aquí, no allá.
 from pathlib import Path
 
 APP_NAME = "PhotoVault"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.2.0"
 
 # ── Datos del usuario (fuera del repo) ────────────────────────────────────────
 DATA_DIR = Path.home() / ".photovault"

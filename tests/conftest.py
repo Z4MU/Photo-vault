@@ -7,6 +7,7 @@ DB_PATH y BACKUP_DIR a un directorio temporal.
 """
 
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -24,6 +25,11 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(backup, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(thumbnail_cache, "CACHE_DIR", tmp_path / "thumbs")
     yield tmp_path
+    # Hilos que una ventana retiró al cerrarse: esperarlos como hace la app al
+    # salir (si el proceso termina con uno vivo, Qt lo cierra de golpe)
+    workers = sys.modules.get("ui.workers")
+    if workers is not None:
+        workers.wait_all_threads(5000)
     db.close_connection()
 
 

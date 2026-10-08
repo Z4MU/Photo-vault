@@ -130,6 +130,9 @@ class GalleryQuery:
     favorites_only: bool = False
     untagged_only: bool = False
     has_note: bool = False
+    # Revisión por etiqueta (fase 7): sin / con un "no" para esa etiqueta
+    not_rejected_for: int | None = None
+    rejected_for: int | None = None
 
     def photo_filter(self) -> db.PhotoFilter:
         desc = tag_descendants()
@@ -159,6 +162,8 @@ class GalleryQuery:
             min_rating=self.min_rating or None,
             favorites_only=self.favorites_only,
             has_note=self.has_note,
+            not_rejected_for=self.not_rejected_for,
+            rejected_for=self.rejected_for,
         )
 
     def attribute_filter_count(self) -> int:
@@ -287,6 +292,46 @@ def get_photo_details(photo: Photo) -> dict[str, str]:
     if photo.is_video:
         return {}
     return indexer.read_exif_details(photo.path)
+
+
+class PhotoList:
+    """
+    Una lista fija de fotos (por id) que se lee de la DB por tramos: sirve
+    para recorrer 170.000 fotos sin tenerlas todas en memoria. Cumple lo que
+    el visor espera de una secuencia (count + photo_at).
+    """
+
+    CHUNK = 300
+
+    def __init__(self, ids: list[int]):
+        self.ids = list(ids)
+        self._cache: dict[int, Photo] = {}
+
+    def count(self) -> int:
+        return len(self.ids)
+
+    def photo_at(self, row: int) -> Photo | None:
+        if not 0 <= row < len(self.ids):
+            return None
+        pid = self.ids[row]
+        if pid not in self._cache:
+            start = (row // self.CHUNK) * self.CHUNK
+            if len(self._cache) > self.CHUNK * 8:
+                self._cache.clear()
+            for p in db.get_photos_by_ids(self.ids[start : start + self.CHUNK]):
+                self._cache[p.id] = p
+        return self._cache.get(pid)
+
+    def index_of(self, photo_id: int) -> int | None:
+        try:
+            return self.ids.index(photo_id)
+        except ValueError:
+            return None
+
+
+def photo_list(q: GalleryQuery) -> PhotoList:
+    """Las fotos de una consulta, en su orden, para recorrerlas una a una."""
+    return PhotoList(get_gallery_ids(q))
 
 
 def get_photos_for_tagging(
@@ -558,6 +603,207 @@ def delete_category(name: str):
     _sync_sidecars(affected)
 
 
+# ── Revisión por etiqueta (sí / no) ───────────────────────────────────────────
+
+
+def review_query(base: GalleryQuery, tag_id: int, include_reviewed: bool = False) -> GalleryQuery:
+    """
+    Lo que falta revisar de `base` para una etiqueta: sin la etiqueta (ni una
+    hija) y sin un "no" previo. Así retomar una sesión es automático.
+    """
+    if include_reviewed:
+        return base
+    excluded = tuple(dict.fromkeys((*base.exclude_tag_ids, tag_id)))
+    return replace(base, exclude_tag_ids=excluded, not_rejected_for=tag_id)
+
+
+@dataclass
+class ReviewStats:
+    total: int  # fotos del conjunto
+    tagged: int  # ya tienen la etiqueta (o una hija)
+    rejected: int  # marcadas "no"
+
+    @property
+    def pending(self) -> int:
+        return max(0, self.total - self.tagged - self.rejected)
+
+
+def review_stats(base: GalleryQuery, tag_id: int) -> ReviewStats:
+    total = count_gallery(base)
+    tagged = count_gallery(replace(base, tag_ids=(*base.tag_ids, tag_id), match_any=False))
+    # Rechazadas que no tengan la etiqueta (por si se agregó a mano después)
+    rejected = count_gallery(
+        replace(base, rejected_for=tag_id, exclude_tag_ids=(*base.exclude_tag_ids, tag_id))
+    )
+    return ReviewStats(total, tagged, rejected)
+
+
+@dataclass(frozen=True)
+class ReviewState:
+    """Cómo estaba una foto respecto de una etiqueta antes de responder (para deshacer)."""
+
+    had_tag: bool
+    was_rejected: bool
+
+
+def review_answer(tag_id: int, yes_ids: list[int], no_ids: list[int]) -> dict[int, ReviewState]:
+    """
+    Sí → la foto recibe la etiqueta (y se quita un "no" previo).
+    No → se guarda el "no" (y se quita la etiqueta si la tenía: re-revisión).
+    Devuelve el estado anterior de cada foto, para deshacer.
+    """
+    ids = [*yes_ids, *no_ids]
+    had = db.get_ids_with_tag(tag_id, ids)
+    rejected = db.get_rejected_ids(tag_id, ids)
+    before = {pid: ReviewState(pid in had, pid in rejected) for pid in ids}
+    if yes_ids:
+        db.remove_rejections(tag_id, yes_ids)
+        db.add_tag_to_photos(yes_ids, tag_id)
+    if no_ids:
+        db.add_rejections(tag_id, no_ids)
+        removed = [pid for pid in no_ids if pid in had]
+        if removed:
+            db.remove_tag_from_photos(removed, tag_id)
+    _sync_sidecars([pid for pid in yes_ids if pid not in had] + [pid for pid in no_ids if pid in had])
+    return before
+
+
+def review_restore(tag_id: int, states: dict[int, ReviewState]) -> None:
+    """Deshace review_answer: deja cada foto como estaba."""
+    add = [pid for pid, st in states.items() if st.had_tag]
+    remove = [pid for pid, st in states.items() if not st.had_tag]
+    db.add_tag_to_photos(add, tag_id)
+    db.remove_tag_from_photos(remove, tag_id)
+    db.add_rejections(tag_id, [pid for pid, st in states.items() if st.was_rejected])
+    db.remove_rejections(tag_id, [pid for pid, st in states.items() if not st.was_rejected])
+    _sync_sidecars(list(states))
+
+
+# ── Teclas del etiquetado rápido (remapeables) ────────────────────────────────
+
+# acción → (descripción, teclas por defecto). Las teclas son textos de
+# QKeySequence ("Right", "Ctrl+Z"…); la UI las normaliza al guardarlas.
+KEY_ACTIONS: dict[str, tuple[str, list[str]]] = {
+    "review.yes": ("Sí, tiene la etiqueta", ["Right", "D"]),
+    "review.no": ("No la tiene", ["Left", "A"]),
+    "review.skip": ("Saltar (dudosa)", ["Space", "Down"]),
+    "review.undo": ("Deshacer (vuelve a esa foto)", ["Ctrl+Z"]),
+    "grid.confirm": ("Confirmar la página (las marcadas: sí; el resto: no)", ["Return", "Enter"]),
+    "grid.skip": ("Saltar la página sin responder", ["PgDown"]),
+    "grid.toggle": ("Marcar la celda con foco", ["Space"]),
+    "grid.all": ("Marcar / desmarcar todas", ["Ctrl+A"]),
+    "grid.undo": ("Deshacer la última página", ["Ctrl+Z"]),
+    "multi.next": ("Siguiente foto", ["Right", "Space"]),
+    "multi.prev": ("Foto anterior", ["Left"]),
+    "multi.repeat": ("Repetir las etiquetas de la foto anterior", ["Ctrl+R"]),
+    "multi.undo": ("Deshacer (vuelve a esa foto)", ["Ctrl+Z"]),
+    "common.exit": ("Salir (lo hecho queda guardado)", ["Esc"]),
+    "common.viewer": ("Ver la foto en grande (visor)", ["Ctrl+Return"]),
+}
+KEYMAP_SETTING = "quick_tag_keymap"
+TAG_KEYS_SETTING = "quick_tag_tag_keys"
+DEFAULT_TAG_KEYS = 9  # sin configurar: 1–9 = las primeras 9 etiquetas
+
+
+def _load_json_setting(key: str) -> object:
+    raw = db.get_setting(key)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except ValueError:
+        logger.warning("Configuración %s con JSON inválido; se usa la de fábrica", key)
+        return None
+
+
+def get_keymap() -> dict[str, list[str]]:
+    """{acción: [teclas]} con lo que el usuario cambió sobre lo de fábrica."""
+    saved = _load_json_setting(KEYMAP_SETTING)
+    out = {action: list(keys) for action, (_desc, keys) in KEY_ACTIONS.items()}
+    if isinstance(saved, dict):
+        for action, keys in saved.items():
+            if action in out and isinstance(keys, list):
+                out[action] = [str(k) for k in keys if str(k).strip()]
+    return out
+
+
+def set_keymap(keymap: dict[str, list[str]]) -> None:
+    db.set_setting(KEYMAP_SETTING, json.dumps({a: k for a, k in keymap.items() if a in KEY_ACTIONS}))
+
+
+def get_tag_keys() -> dict[str, int]:
+    """{tecla: tag_id} del modo "varias etiquetas" (solo etiquetas que existen)."""
+    existing = {t.id for t in db.get_all_tags()}
+    saved = _load_json_setting(TAG_KEYS_SETTING)
+    if isinstance(saved, dict):
+        return {str(k): int(v) for k, v in saved.items() if isinstance(v, int) and v in existing}
+    tags = db.get_all_tags()[:DEFAULT_TAG_KEYS]
+    return {str(i + 1): t.id for i, t in enumerate(tags)}
+
+
+def set_tag_keys(keys: dict[str, int]) -> None:
+    db.set_setting(TAG_KEYS_SETTING, json.dumps({k: v for k, v in keys.items() if k.strip()}))
+
+
+def reset_keys() -> None:
+    db.set_setting(KEYMAP_SETTING, "{}")
+    db.set_setting(TAG_KEYS_SETTING, "null")
+
+
+def keymap_conflicts(keymap: dict[str, list[str]], tag_keys: dict[str, int]) -> list[str]:
+    """
+    Teclas repetidas dentro de un mismo modo (las de "common" valen en todos).
+    En el modo cuadrícula 1–9 marcan celdas y las flechas mueven el foco: tampoco se pueden usar.
+    """
+    problems: list[str] = []
+    for mode in ("review", "grid", "multi"):
+        used: dict[str, str] = {}
+        if mode == "grid":
+            used.update({str(n): "marcar la celda n" for n in range(1, 10)})
+            used.update({k: "mover el foco" for k in ("Left", "Right", "Up", "Down")})
+        entries = [
+            (a, k) for a, keys in keymap.items() for k in keys if a.startswith((mode + ".", "common."))
+        ]
+        if mode == "multi":
+            names = {t.id: t.name for t in db.get_all_tags()}
+            entries += [(f"etiqueta «{names.get(tid, tid)}»", k) for k, tid in tag_keys.items()]
+        for action, key in entries:
+            label = KEY_ACTIONS[action][0] if action in KEY_ACTIONS else action
+            if key in used and used[key] != label:
+                problems.append(f"«{key}» está en «{used[key]}» y en «{label}»")
+            used[key] = label
+    return problems
+
+
+# ── Recordar la última sesión ─────────────────────────────────────────────────
+
+QUICK_TAG_SETUP_SETTING = "quick_tag_setup"
+QUICK_TAG_RESUME_SETTING = "quick_tag_resume"
+
+
+def get_quick_tag_setup() -> dict:
+    saved = _load_json_setting(QUICK_TAG_SETUP_SETTING)
+    return saved if isinstance(saved, dict) else {}
+
+
+def set_quick_tag_setup(setup: dict) -> None:
+    db.set_setting(QUICK_TAG_SETUP_SETTING, json.dumps(setup, ensure_ascii=False))
+
+
+def remember_position(q: GalleryQuery, photo_id: int) -> None:
+    """Modo varias etiquetas: dónde quedó, para ofrecer continuar ahí (#52)."""
+    db.set_setting(QUICK_TAG_RESUME_SETTING, json.dumps({"query": q.to_dict(), "photo_id": photo_id}))
+
+
+def resume_position(q: GalleryQuery) -> int | None:
+    """La foto donde quedó la última sesión con esta misma consulta, o None."""
+    saved = _load_json_setting(QUICK_TAG_RESUME_SETTING)
+    if isinstance(saved, dict) and saved.get("query") == q.to_dict():
+        pid = saved.get("photo_id")
+        return pid if isinstance(pid, int) else None
+    return None
+
+
 # ── Valoración, favoritas y notas ─────────────────────────────────────────────
 
 
@@ -691,6 +937,9 @@ def export_tags(path: str) -> ExportSummary:
         p: {"path": p, "filename": fn, "filesize": size, "tags": tag_names}
         for p, fn, size, tag_names in db.get_all_assignments()
     }
+    for p, fn, size, rejected in db.get_all_rejections():
+        entry = by_path.setdefault(p, {"path": p, "filename": fn, "filesize": size, "tags": []})
+        entry["rejected"] = rejected
     for p, (fn, size, rating, favorite, note) in db.get_photo_extras().items():
         entry = by_path.setdefault(p, {"path": p, "filename": fn, "filesize": size, "tags": []})
         if rating:
@@ -776,6 +1025,7 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
         tag_ids = db.get_tag_ids_by_name()
         pairs: list[tuple[int, int]] = []
         extras: list[tuple[int, int, bool, str | None]] = []
+        rejections: dict[int, list[int]] = {}
         touched: list[int] = []
         for a in data["assignments"]:
             pid = by_path.get(a.get("path", ""))
@@ -798,12 +1048,20 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
                     result.created += alias_of is None
                 pairs.append((pid, tag_ids[name]))
             rating = a.get("rating") or 0
+            for name in a.get("rejected", []):
+                tid = db.resolve_tag_name(str(name))
+                if tid is not None:
+                    rejections.setdefault(tid, []).append(pid)
             if rating or a.get("favorite") or a.get("note"):
                 extras.append(
                     (pid, max(0, min(5, int(rating))), bool(a.get("favorite")), a.get("note") or None)
                 )
         result.pairs_added = db.add_assignments(pairs)
         result.extras_added = db.merge_photo_extras(extras)
+        for tid, pids in rejections.items():
+            # Un "no" no se importa si la foto ya tiene la etiqueta (solo agregar, nunca quitar)
+            has = db.get_ids_with_tag(tid, pids)
+            db.add_rejections(tid, [pid for pid in pids if pid not in has])
         _sync_sidecars(touched)
 
     logger.info("Importación desde %s: %s", path, result)

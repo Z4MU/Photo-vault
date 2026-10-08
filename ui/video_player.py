@@ -144,6 +144,11 @@ class VideoPlayer(QWidget):
             self.audio.setMuted(not self.audio.isMuted())
             self.btn_mute.setText("🔇" if self.audio.isMuted() else "🔊")
 
+    def set_muted(self, muted: bool) -> None:
+        if self.audio is not None:
+            self.audio.setMuted(muted)
+            self.btn_mute.setText("🔇" if muted else "🔊")
+
     def seek_relative(self, ms: int) -> None:
         if self.player is not None:
             self.player.setPosition(max(0, min(self.player.duration(), self.player.position() + ms)))

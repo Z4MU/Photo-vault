@@ -33,7 +33,7 @@ from ui.images import is_animated, load_full_image
 from ui.photo_info import InfoPanel
 from ui.style import DARK_STYLE
 from ui.video_player import VideoPlayer
-from ui.workers import ImageLoadQueue, disconnect_all, retire_thread
+from ui.workers import ImageLoadQueue, disconnect_all, retire_on_destroy, retire_thread
 
 logger = logging.getLogger(__name__)
 
@@ -220,6 +220,7 @@ class ViewerWindow(QDialog):
         self._queue = ImageLoadQueue(lambda path: load_full_image(path, config.VIEWER_MAX_SIDE), workers=2)
         self._queue.loaded.connect(self._on_image_loaded)
         self._queue.start()
+        retire_on_destroy(self, self._queue)
 
         self._build_ui()
         self._build_shortcuts()

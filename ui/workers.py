@@ -5,12 +5,13 @@ Hilos (QThread) y utilidades para correr tareas largas sin congelar la UI.
 
 import logging
 import threading
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from PyQt6.QtCore import QEventLoop, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEventLoop, QObject, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import (
     QMessageBox,
@@ -61,9 +62,25 @@ def retire_thread(thread: StoppableThread | None) -> None:
     if thread is None:
         return
     thread.stop()
-    if thread.isRunning():
+    try:
+        running = thread.isRunning()
+    except RuntimeError:  # Qt ya lo destruyó (terminó hace rato): nada que retirar
+        return
+    if running:
         _retired_threads.add(thread)
         thread.finished.connect(lambda t=thread: _retired_threads.discard(t))
+
+
+def retire_on_destroy(owner: QObject, thread: StoppableThread) -> None:
+    """
+    Si `owner` (una ventana) se destruye sin haber retirado su hilo (p. ej. se
+    creó y se descartó sin mostrarse, así que nunca pasó por done()), el hilo
+    se retira en vez de destruirse vivo, que cierra la app de golpe.
+    """
+    # weakref.finalize guarda su propia referencia al hilo hasta que corre: el
+    # hilo no puede destruirse antes. (Usar la señal `destroyed` corría código en
+    # medio de la destrucción de la ventana en C++ y cerraba la app.)
+    weakref.finalize(owner, retire_thread, thread)
 
 
 def wait_all_threads(timeout_ms: int = 5000) -> None:

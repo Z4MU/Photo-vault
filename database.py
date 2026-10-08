@@ -237,11 +237,26 @@ def _m004_ratings_notes_tag_tree(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _m005_tag_rejections(conn: sqlite3.Connection) -> None:
+    """Revisión por etiqueta: las fotos marcadas "no" (para no volver a mostrarlas)."""
+    # Solo se guardan los "no": un "sí" es la etiqueta misma (photo_tags)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS tag_rejections (
+            tag_id      INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+            photo_id    INTEGER NOT NULL REFERENCES photos(id) ON DELETE CASCADE,
+            rejected_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (tag_id, photo_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_rejections_photo ON tag_rejections(photo_id)")
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m001_baseline,
     _m002_internal_trash,
     _m003_mtime_and_sort_indexes,
     _m004_ratings_notes_tag_tree,
+    _m005_tag_rejections,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -556,6 +571,9 @@ class PhotoFilter:
     min_rating: int | None = None
     favorites_only: bool = False
     has_note: bool = False
+    # Fase 7 ─ revisión por etiqueta
+    not_rejected_for: int | None = None  # sin un "no" para esta etiqueta
+    rejected_for: int | None = None  # con un "no" para esta etiqueta
 
 
 def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
@@ -622,6 +640,12 @@ def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
         params.append(f.min_rating)
     if f.favorites_only:
         clauses.append("p.favorite = 1")
+    if f.not_rejected_for is not None:
+        clauses.append("p.id NOT IN (SELECT photo_id FROM tag_rejections WHERE tag_id = ?)")
+        params.append(f.not_rejected_for)
+    if f.rejected_for is not None:
+        clauses.append("p.id IN (SELECT photo_id FROM tag_rejections WHERE tag_id = ?)")
+        params.append(f.rejected_for)
     if f.has_note:
         clauses.append("p.note IS NOT NULL AND p.note != ''")
 
@@ -1237,6 +1261,69 @@ def merge_photo_extras(pairs: list[tuple[int, int, bool, str | None]]) -> int:
                 (rating, int(favorite), note, pid, rating, int(favorite), note),
             )
         return conn.total_changes - before
+
+
+def add_rejections(tag_id: int, photo_ids: list[int]) -> None:
+    """Marca estas fotos como "no tienen esta etiqueta" (revisión)."""
+    with transaction() as conn:
+        conn.executemany(
+            "INSERT OR IGNORE INTO tag_rejections (tag_id, photo_id) VALUES (?, ?)",
+            [(tag_id, pid) for pid in photo_ids],
+        )
+
+
+def remove_rejections(tag_id: int, photo_ids: list[int]) -> None:
+    with transaction() as conn:
+        conn.executemany(
+            "DELETE FROM tag_rejections WHERE tag_id = ? AND photo_id = ?",
+            [(tag_id, pid) for pid in photo_ids],
+        )
+
+
+def get_rejected_ids(tag_id: int, photo_ids: list[int]) -> set[int]:
+    conn = get_connection()
+    out: set[int] = set()
+    for chunk in _chunks(photo_ids):
+        ph = ",".join("?" * len(chunk))
+        out.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT photo_id FROM tag_rejections WHERE tag_id = ? AND photo_id IN ({ph})",
+                [tag_id, *chunk],
+            )
+        )
+    return out
+
+
+def get_ids_with_tag(tag_id: int, photo_ids: list[int]) -> set[int]:
+    """Cuáles de estas fotos tienen la etiqueta (directamente)."""
+    conn = get_connection()
+    out: set[int] = set()
+    for chunk in _chunks(photo_ids):
+        ph = ",".join("?" * len(chunk))
+        out.update(
+            r[0]
+            for r in conn.execute(
+                f"SELECT photo_id FROM photo_tags WHERE tag_id = ? AND photo_id IN ({ph})", [tag_id, *chunk]
+            )
+        )
+    return out
+
+
+def get_all_rejections() -> list[tuple[str, str, int | None, list[str]]]:
+    """[(ruta, nombre, tamaño, [etiquetas rechazadas])] para exportar."""
+    rows = get_connection().execute("""
+        SELECT p.path, p.filename, p.filesize, t.name
+        FROM tag_rejections r JOIN photos p ON p.id = r.photo_id JOIN tags t ON t.id = r.tag_id
+        ORDER BY p.path, t.name
+    """)
+    out: list[tuple[str, str, int | None, list[str]]] = []
+    for path, filename, filesize, tag in rows:
+        if out and out[-1][0] == path:
+            out[-1][3].append(tag)
+        else:
+            out.append((path, filename, filesize, [tag]))
+    return out
 
 
 def get_rated_photo_ids() -> list[int]:
