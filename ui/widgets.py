@@ -28,7 +28,8 @@ def clear_layout(layout: QLayout) -> None:
     """
     Quita todos los elementos de un layout (widgets y espaciadores) y destruye
     los widgets. A diferencia de borrar solo los widgets, no deja acumulados
-    los `addStretch()` de refrescos anteriores.
+    los `addStretch()` de refrescos anteriores. Vacía también los layouts
+    anidados (filas) y oculta los widgets ya (deleteLater los borra después).
     """
     while layout.count():
         item = layout.takeAt(0)
@@ -36,7 +37,13 @@ def clear_layout(layout: QLayout) -> None:
             break
         widget = item.widget()
         if widget is not None:
+            widget.hide()
             widget.deleteLater()
+            continue
+        child = item.layout()
+        if child is not None:
+            clear_layout(child)
+            child.deleteLater()
 
 
 def layout_widgets(layout: QLayout) -> list[QWidget]:

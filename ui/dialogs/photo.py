@@ -1,6 +1,7 @@
 """
 PhotoVault - ui/dialogs/photo.py
-Editor de etiquetas de una foto (panel del visor) y etiquetado en lote.
+Editor de etiquetas de una foto (panel del visor) y etiquetado en lote, con
+etiquetas sugeridas por carpeta (smart.suggest_tags, fase 10).
 """
 
 import logging
@@ -18,11 +19,35 @@ from PyQt6.QtWidgets import (
 )
 
 import services
+import smart
 from models import Tag
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 
 logger = logging.getLogger(__name__)
+
+SUGGESTIONS_PER_ROW = 3
+
+
+def suggestion_rows(suggestions: list[smart.TagSuggestion], on_click) -> list[QHBoxLayout]:
+    """Botones "＋ etiqueta" de las sugerencias, en filas (el panel del visor es angosto)."""
+    rows: list[QHBoxLayout] = []
+    for i, s in enumerate(suggestions):
+        if i % SUGGESTIONS_PER_ROW == 0:
+            rows.append(QHBoxLayout())
+            rows[-1].setSpacing(4)
+        btn = QPushButton(f"＋ {s.tag.name}")
+        btn.setToolTip(f"{s.reason}\nClic para agregarla")
+        btn.setStyleSheet(
+            f"QPushButton{{color:{s.tag.color};border:1px dashed {s.tag.color};border-radius:10px;"
+            "padding:1px 8px;font-size:11px;background:transparent;}"
+            f"QPushButton:hover{{background:{s.tag.color}33;}}"
+        )
+        btn.clicked.connect(lambda _, t=s.tag: on_click(t))
+        rows[-1].addWidget(btn)
+    for row in rows:
+        row.addStretch()
+    return rows
 
 
 # ─── Editor de etiquetas de una foto ──────────────────────────────────────────
@@ -46,6 +71,13 @@ class TagEditor(QWidget):
         self.tags_layout.setSpacing(4)
         self.tags_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         lay.addWidget(self.tags_container)
+
+        # Sugeridas por carpeta (fase 10)
+        self.sugg_container = QWidget()
+        self.sugg_layout = QVBoxLayout(self.sugg_container)
+        self.sugg_layout.setContentsMargins(0, 0, 0, 0)
+        self.sugg_layout.setSpacing(4)
+        lay.addWidget(self.sugg_container)
 
         row = QHBoxLayout()
         self.tag_combo = QComboBox()
@@ -76,6 +108,7 @@ class TagEditor(QWidget):
                 empty = QLabel("Sin etiquetas")
                 empty.setStyleSheet("color:#666;font-size:11px;")
                 self.tags_layout.addWidget(empty)
+        self._reload_suggestions()
         text = self.tag_combo.currentText()
         self.tag_combo.blockSignals(True)
         self.tag_combo.clear()
@@ -84,6 +117,32 @@ class TagEditor(QWidget):
         self.tag_combo.setCurrentIndex(-1)
         self.tag_combo.setEditText(text if self.photo_id is None else "")
         self.tag_combo.blockSignals(False)
+
+    def _reload_suggestions(self) -> None:
+        clear_layout(self.sugg_layout)
+        suggestions = smart.suggest_tags([self.photo_id], limit=6) if self.photo_id is not None else []
+        self.sugg_container.setVisible(bool(suggestions))
+        if not suggestions:
+            return
+        title = QLabel("Sugeridas:")
+        title.setStyleSheet("color:#666;font-size:10px;")
+        self.sugg_layout.addWidget(title)
+        for row in suggestion_rows(suggestions, self._add_suggested):
+            self.sugg_layout.addLayout(row)
+
+    def suggestions(self) -> list[str]:
+        """Nombres de las etiquetas sugeridas que se muestran (para tests)."""
+        return [
+            b.text().removeprefix("＋ ")
+            for b in self.sugg_container.findChildren(QPushButton)
+            if not b.isHidden() and not self.sugg_container.isHidden()
+        ]
+
+    def _add_suggested(self, tag: Tag) -> None:
+        if self.photo_id is not None:
+            services.add_tag_by_id(self.photo_id, tag.id)
+            self.reload()
+            self.tags_changed.emit()
 
     def _chip(self, tag: Tag) -> QPushButton:
         btn = QPushButton(f"{tag.name}  ✕")
@@ -121,7 +180,7 @@ class BulkTagDialog(QDialog):
         self.photo_ids = photo_ids
         self.summary = ""  # lo que se hizo, para el aviso de la ventana principal
         self.setWindowTitle(f"Etiquetar {len(photo_ids)} fotos")
-        self.setFixedSize(420, 200)
+        self.setMinimumWidth(420)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
 
@@ -143,7 +202,18 @@ class BulkTagDialog(QDialog):
         self.combo.setPlaceholderText("Etiqueta a aplicar…")
         for t in services.get_all_tags():
             self.combo.addItem(t.name, userData=t.id)
+        self.combo.setCurrentIndex(-1)
         layout.addWidget(self.combo)
+
+        # Sugeridas por carpeta: un clic la elige (después "Agregar a todas")
+        suggestions = smart.suggest_tags(self.photo_ids, limit=6)
+        self.suggested = [s.tag.name for s in suggestions]
+        if suggestions:
+            hint = QLabel("Sugeridas:")
+            hint.setStyleSheet("color:#666;font-size:10px;")
+            layout.addWidget(hint)
+            for row in suggestion_rows(suggestions, lambda t: self.combo.setEditText(t.name)):
+                layout.addLayout(row)
 
         row = QHBoxLayout()
         btn_add = QPushButton("＋ Agregar a todas")

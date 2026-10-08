@@ -251,12 +251,18 @@ def _m005_tag_rejections(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tag_rejections_photo ON tag_rejections(photo_id)")
 
 
+def _m006_perceptual_hash(conn: sqlite3.Connection) -> None:
+    """Hash perceptual de cada foto (casi-duplicados); se calcula bajo demanda."""
+    _add_column_if_missing(conn, "photos", "phash", "INTEGER")
+
+
 _MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [
     _m001_baseline,
     _m002_internal_trash,
     _m003_mtime_and_sort_indexes,
     _m004_ratings_notes_tag_tree,
     _m005_tag_rejections,
+    _m006_perceptual_hash,
 ]
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -447,6 +453,12 @@ _UPSERT_SQL = """
                 THEN photos.md5
                 ELSE NULL
               END,
+        phash = CASE
+                WHEN photos.filesize IS excluded.filesize
+                 AND (photos.mtime IS NULL OR photos.mtime = excluded.mtime)
+                THEN photos.phash
+                ELSE NULL
+              END,
         filesize   = excluded.filesize,
         mtime      = excluded.mtime
 """
@@ -524,6 +536,70 @@ def get_index_state(folder: str) -> dict[str, tuple[int | None, float | None, in
         (folder_like_pattern(folder),),
     )
     return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+
+def get_photos_without_phash() -> list[Photo]:
+    """Fotos sin hash perceptual (nuevas, cambiadas o de antes de v6)."""
+    rows = get_connection().execute(f"SELECT {_PHOTO_COLUMNS} FROM photos p WHERE p.phash IS NULL")
+    return [_row_to_photo(r) for r in rows]
+
+
+def set_phashes(pairs: list[tuple[int, int]]) -> None:
+    """[(photo_id, hash con signo)]"""
+    with transaction() as conn:
+        conn.executemany("UPDATE photos SET phash = ? WHERE id = ?", [(h, pid) for pid, h in pairs])
+
+
+def get_phashes() -> list[tuple[int, int]]:
+    """[(photo_id, hash)] de las fotos que ya lo tienen."""
+    return [
+        (r[0], r[1]) for r in get_connection().execute("SELECT id, phash FROM photos WHERE phash IS NOT NULL")
+    ]
+
+
+def get_common_tag_ids(photo_ids: list[int]) -> set[int]:
+    """Etiquetas que tienen TODAS estas fotos."""
+    ids = sorted(set(photo_ids))
+    counts: dict[int, int] = {}
+    conn = get_connection()
+    for chunk in _chunks(ids):
+        ph = ",".join("?" * len(chunk))
+        for tag_id, n in conn.execute(
+            f"SELECT tag_id, COUNT(*) FROM photo_tags WHERE photo_id IN ({ph}) GROUP BY tag_id", chunk
+        ):
+            counts[tag_id] = counts.get(tag_id, 0) + n
+    return {tid for tid, n in counts.items() if n == len(ids)}
+
+
+def get_md5s(photo_ids: list[int]) -> dict[int, str | None]:
+    out: dict[int, str | None] = {}
+    conn = get_connection()
+    for chunk in _chunks(photo_ids):
+        ph = ",".join("?" * len(chunk))
+        out.update(conn.execute(f"SELECT id, md5 FROM photos WHERE id IN ({ph})", chunk).fetchall())
+    return out
+
+
+def get_folder_tag_stats(folders: list[str]) -> dict[str, tuple[int, dict[int, int]]]:
+    """
+    Para cada carpeta (valor de `photos.folder`, con la barra final): cuántas
+    fotos tiene directamente y cuántas tienen cada etiqueta.
+    """
+    conn = get_connection()
+    out: dict[str, tuple[int, dict[int, int]]] = {}
+    for chunk in _chunks(sorted(set(folders))):
+        ph = ",".join("?" * len(chunk))
+        for folder, n in conn.execute(
+            f"SELECT folder, COUNT(*) FROM photos WHERE folder IN ({ph}) GROUP BY folder", chunk
+        ):
+            out[folder] = (n, {})
+        for folder, tag_id, n in conn.execute(
+            f"SELECT p.folder, pt.tag_id, COUNT(*) FROM photos p JOIN photo_tags pt ON pt.photo_id = p.id "
+            f"WHERE p.folder IN ({ph}) GROUP BY p.folder, pt.tag_id",
+            chunk,
+        ):
+            out[folder][1][tag_id] = n
+    return out
 
 
 def update_photo_md5(photo_id: int, md5: str):

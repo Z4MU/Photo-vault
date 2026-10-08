@@ -152,10 +152,21 @@ class Stats:
 
 @dataclass
 class DuplicateGroup:
-    """Un grupo de fotos que comparten el mismo hash MD5."""
+    """
+    Un grupo de fotos que comparten el mismo hash MD5 (idénticas) o, con
+    `similar`, que se parecen (hash perceptual; fase 10). Con `similar`, `md5` va vacío.
+    """
 
     md5: str
     photos: list[Photo]
+    similar: bool = False
+
+    @property
+    def best(self) -> Photo | None:
+        """La de mejor calidad: más píxeles y, a igualdad, el archivo más grande."""
+        if not self.photos:
+            return None
+        return max(self.photos, key=lambda p: ((p.width or 0) * (p.height or 0), p.filesize or 0))
 
     @property
     def size(self) -> int:

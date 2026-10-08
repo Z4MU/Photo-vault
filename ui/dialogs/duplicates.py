@@ -1,6 +1,7 @@
 """
 PhotoVault - ui/dialogs/duplicates.py
-Búsqueda y limpieza de duplicados por MD5.
+Búsqueda y limpieza de duplicados: idénticos (MD5) o parecidos (hash
+perceptual, smart.find_similar_photos; fase 10).
 """
 
 import logging
@@ -8,6 +9,7 @@ import logging
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
+    QComboBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -22,17 +24,29 @@ from PyQt6.QtWidgets import (
 import config
 import logging_setup
 import services
+import smart
 import thumbnail_cache
 from models import DuplicateGroup
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 from ui.workers import (
     MD5Worker,
+    TaskWorker,
     disconnect_all,
     retire_thread,
 )
 
 logger = logging.getLogger(__name__)
+
+# Con miles de grupos (ráfagas de fotos) crear todas las tarjetas congelaría la ventana
+MAX_GROUPS_SHOWN = 200
+MAX_PHOTOS_PER_GROUP = 10
+
+SENSITIVITIES = [
+    ("normal", "Normal"),
+    ("strict", "Estricta (casi iguales)"),
+    ("loose", "Amplia (incluye ráfagas)"),
+]
 
 
 # ─── Dialog: Duplicados ───────────────────────────────────────────────────────
@@ -45,13 +59,14 @@ class DuplicatesDialog(QDialog):
         self.setMinimumSize(700, 540)
         self.setStyleSheet(DARK_STYLE)
         self._groups: list[DuplicateGroup] = []
-        self._worker: MD5Worker | None = None
+        self._worker: TaskWorker | MD5Worker | None = None
         self._build_ui()
 
     def done(self, result: int):
         # Se llama al cerrar por cualquier vía (botón, Esc, X)
         if self._worker is not None:
-            disconnect_all(self._worker.progress, self._worker.completed, self._worker.error)
+            w = self._worker
+            disconnect_all(w.progress, w.completed, w.error)
             retire_thread(self._worker)
             self._worker = None
         super().done(result)
@@ -63,12 +78,29 @@ class DuplicatesDialog(QDialog):
 
         layout.addWidget(
             QLabel(
-                "<b>Duplicados por hash MD5</b><br>"
+                "<b>Duplicados</b><br>"
                 "<span style='color:#888;font-size:11px;'>"
-                "Los archivos con el mismo contenido aparecen agrupados. "
-                "Puedes mandar las copias extra a la Papelera de reciclaje.</span>"
+                "<b>Idénticas</b>: el mismo archivo (MD5). <b>Parecidas</b>: la misma foto "
+                "redimensionada, recomprimida o ráfagas casi iguales. "
+                "Puedes mandar las que sobren a la Papelera de reciclaje.</span>"
             )
         )
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Buscar:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Idénticas", userData="exact")
+        self.mode_combo.addItem("Parecidas", userData="similar")
+        mode_row.addWidget(self.mode_combo)
+        self.sens_lbl = QLabel("Sensibilidad:")
+        mode_row.addWidget(self.sens_lbl)
+        self.sens_combo = QComboBox()
+        for value, text in SENSITIVITIES:
+            self.sens_combo.addItem(text, userData=value)
+        mode_row.addWidget(self.sens_combo)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        self._on_mode_changed()
 
         # Barra de cálculo de MD5
         md5_bar = QHBoxLayout()
@@ -99,27 +131,59 @@ class DuplicatesDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         layout.addWidget(btn_close)
 
+    def mode(self) -> str:
+        return self.mode_combo.currentData()
+
+    def _on_mode_changed(self, *_args) -> None:
+        similar = self.mode() == "similar"
+        self.sens_lbl.setVisible(similar)
+        self.sens_combo.setVisible(similar)
+
     def _start_scan(self):
         self.btn_scan.setEnabled(False)
+        self.mode_combo.setEnabled(False)
+        self.sens_combo.setEnabled(False)
         self.md5_progress.setVisible(True)
         self.md5_progress.setValue(0)
-        self.status_lbl.setText("Calculando hashes…")
-        self._worker = MD5Worker()
-        self._worker.progress.connect(lambda c, t: self.md5_progress.setValue(int(c / t * 100) if t else 0))
-        self._worker.completed.connect(self._on_scan_done)
-        self._worker.error.connect(self._on_scan_error)
-        self._worker.start()
+        if self.mode() == "similar":
+            sensitivity = self.sens_combo.currentData()
+            self.status_lbl.setText(
+                "Calculando la huella de cada foto (la primera vez tarda: usa las miniaturas)…"
+            )
+            worker: TaskWorker | MD5Worker = TaskWorker(
+                lambda progress_callback=None, should_stop=None: smart.find_similar_photos(
+                    sensitivity, progress_callback, should_stop
+                )
+            )
+            worker.completed.connect(self._on_similar_done)
+        else:
+            self.status_lbl.setText("Calculando hashes…")
+            worker = MD5Worker()
+            worker.completed.connect(self._on_scan_done)
+        worker.progress.connect(lambda c, t: self.md5_progress.setValue(int(c / t * 100) if t else 0))
+        worker.error.connect(self._on_scan_error)
+        self._worker = worker
+        worker.start()
 
-    def _on_scan_error(self, message: str):
+    def _scan_finished(self) -> None:
+        retire_thread(self._worker)
         self._worker = None
         self.md5_progress.setVisible(False)
         self.btn_scan.setEnabled(True)
+        self.mode_combo.setEnabled(True)
+        self.sens_combo.setEnabled(True)
+
+    def _on_similar_done(self, groups: list[DuplicateGroup]) -> None:
+        self._scan_finished()
+        self._groups = groups
+        self._render_groups()
+
+    def _on_scan_error(self, message: str):
+        self._scan_finished()
         QMessageBox.critical(self, "Error", message)
 
     def _on_scan_done(self, n: int):
-        self._worker = None
-        self.md5_progress.setVisible(False)
-        self.btn_scan.setEnabled(True)
+        self._scan_finished()
         self._groups = services.get_duplicate_groups()
         self._render_groups()
 
@@ -132,28 +196,31 @@ class DuplicatesDialog(QDialog):
             return
 
         total_wasted = sum(g.wasted_bytes for g in self._groups)
-        self.status_lbl.setText(
-            f"{len(self._groups)} grupos de duplicados  •  {total_wasted / 1_048_576:.1f} MB recuperables"
-        )
+        status = f"{len(self._groups):,} grupos  •  {total_wasted / 1_048_576:.1f} MB recuperables"
+        if len(self._groups) > MAX_GROUPS_SHOWN:
+            status += f"  •  se muestran los {MAX_GROUPS_SHOWN} más grandes"
+        self.status_lbl.setText(status)
 
-        for group in self._groups:
+        for group in self._groups[:MAX_GROUPS_SHOWN]:
             card = QWidget()
             card.setStyleSheet("background:#1A1A2E;border-radius:8px;")
             cl = QVBoxLayout(card)
             cl.setContentsMargins(10, 8, 10, 8)
             cl.setSpacing(6)
 
+            detail = "parecidas" if group.similar else f"MD5: {group.md5[:16]}…"
             header_lbl = QLabel(
-                f"<b>{group.size} copias</b>  "
+                f"<b>{group.size} {'fotos' if group.similar else 'copias'}</b>  "
                 f"<span style='color:#888;font-size:11px;'>"
-                f"MD5: {group.md5[:16]}…  •  "
+                f"{detail}  •  "
                 f"+{group.wasted_bytes // 1024} KB duplicados</span>"
             )
             header_lbl.setTextFormat(Qt.TextFormat.RichText)
             cl.addWidget(header_lbl)
 
             photos_row = QHBoxLayout()
-            for photo in group.photos:
+            best = group.best if group.similar else None
+            for photo in group.photos[:MAX_PHOTOS_PER_GROUP]:
                 col = QVBoxLayout()
                 # Miniatura pequeña
                 img_lbl = QLabel()
@@ -181,10 +248,18 @@ class DuplicatesDialog(QDialog):
                 name.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.addWidget(name)
 
-                size_lbl = QLabel(f"{(photo.filesize or 0) // 1024} KB")
+                size_txt = f"{(photo.filesize or 0) // 1024} KB"
+                if group.similar and photo.width and photo.height:
+                    size_txt = f"{photo.width}×{photo.height}  ·  {size_txt}"
+                size_lbl = QLabel(size_txt)
                 size_lbl.setStyleSheet("font-size:10px;color:#666;")
                 size_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 col.addWidget(size_lbl)
+                if best is not None and photo.id == best.id:
+                    best_lbl = QLabel("★ mejor calidad")
+                    best_lbl.setStyleSheet("font-size:10px;color:#4AFF9E;")
+                    best_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                    col.addWidget(best_lbl)
 
                 btn_del = QPushButton("🗑 A la Papelera")
                 btn_del.setFixedWidth(110)
@@ -193,6 +268,10 @@ class DuplicatesDialog(QDialog):
                 col.addWidget(btn_del)
                 photos_row.addLayout(col)
 
+            if group.size > MAX_PHOTOS_PER_GROUP:
+                more = QLabel(f"+{group.size - MAX_PHOTOS_PER_GROUP} más")
+                more.setStyleSheet("color:#8888AA;font-size:11px;")
+                photos_row.addWidget(more)
             photos_row.addStretch()
             cl.addLayout(photos_row)
             self.vbox.addWidget(card)
