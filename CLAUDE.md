@@ -70,7 +70,11 @@ ui/
   photo_info.py         InfoPanel (panel de información del visor)
   photo_stage.py        PhotoStage: foto/video ajustado, a resolución de pantalla, con precarga (etiquetado)
   system.py             Explorador, abrir con la app, portapapeles
-  main_window.py        MainWindow
+  main_window.py        MainWindow (sesión, avisos, carpetas vigiladas)
+  background.py         BackgroundTasksMixin: indexar (con cola) y generar miniaturas en segundo plano
+  toast.py              ToastManager: avisos breves abajo a la derecha
+  welcome.py            EmptyState: bienvenida (colección vacía) y "sin resultados"
+  folder_watch.py       FolderWatcher (QFileSystemWatcher + espera de 30 s)
   dialogs/
     photo.py            TagEditor (etiquetas de una foto), BulkTagDialog
     stats.py            StatsDialog
@@ -204,7 +208,7 @@ Para la galería continua: `get_photo_ids(filtro, orden, limit, offset)` (solo i
 - Los «no» se borran solos (CASCADE) al borrar la etiqueta o la foto; **no** pasan por la papelera interna ni se trasladan al fusionar etiquetas (un «no es playa» no dice nada de la otra).
 
 ### Configuración del usuario
-`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
+`get_setting(key, default)` / `set_setting(key, value)` sobre `app_settings`. Claves en uso: `seeded`, `thumb_size` (slider de la galería, 100–400), `xmp_sidecars` (`"1"` = activado), `quick_tag_keymap`, `quick_tag_tag_keys`, `quick_tag_setup`, `quick_tag_resume`, `session_state`, `restore_session`, `watched_folders`, `watch_on_start`, `watch_live` (JSON; si están rotos se usa lo de fábrica). (`page_size` quedó sin uso desde la fase 5.)
 
 ### Migraciones versionadas
 La versión del esquema vive en **`PRAGMA user_version`**. `init_db()` corre en **cada arranque**:
@@ -353,9 +357,11 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 - Atajos en `SHORTCUTS_HELP` (F1 los muestra junto con los de la galería). Son `QShortcut` del diálogo: un `QLineEdit` con foco (agregar etiqueta) se queda con las letras y flechas.
 - Los botones de la barra y el `ImageView` son `NoFocus`: si no, las flechas moverían el scroll en vez de cambiar de foto.
 
-### Tareas en segundo plano (`MainWindow`)
+### Tareas en segundo plano (`ui/background.py`, `BackgroundTasksMixin`)
 - Una a la vez (`_bg_worker`, `_bg_kind` = `"index"` | `"thumbs"`), con progreso y **Cancelar** en la barra de estado (`TaskStatusWidget`). Se puede seguir usando la app.
-- `start_indexing(folder)`: `IndexDialog` solo elige la carpeta y emite `start_requested`. Al terminar recarga y, si hubo fotos nuevas, lanza `start_thumbnail_generation(new_ids)`. La indexación tiene prioridad: cancela una generación de miniaturas en curso.
+- `start_indexing(folder, force=False, auto=False)`: si ya hay una indexación, la pedida **espera en `_index_queue`** (sin repetir carpetas). `auto` = carpeta vigilada: sin aviso si no hubo cambios y sin recargar la galería. Las miniaturas de lo nuevo se generan cuando la cola se vacía. La indexación tiene prioridad: cancela una generación de miniaturas en curso; Cancelar también vacía la cola.
+- `IndexWorker` emite progreso como mucho cada `PROGRESS_INTERVAL` (0,1 s): una señal por archivo saturaba la UI (23 s vs 0,8 s).
+- **`_closing`**: `closeEvent` lo pone en True y desde ahí la ventana ignora avisos tardíos (`completed`/`error` que ya estaban en camino) y no empieza tareas nuevas.
 - `start_thumbnail_generation(None)` = toda la colección (botón *Generar todas* en Configuración); devuelve False si hay otra tarea.
 - Al cerrar con una indexación en curso, pregunta; lo ya indexado se conserva.
 
@@ -363,6 +369,12 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 - Sidebar: botones de acciones, botón destacado **⚡ Etiquetado rápido**, filtros por tag agrupados por categoría (colapsables), botón 👁 para esconder tags del sidebar, botón **"👁 Mostrar escondidas (N)"** (solo visible si hay escondidas) que las muestra en cursiva con 🚫 para restaurarlas, estadísticas.
 - Barra superior: búsqueda por nombre, ordenamiento (campo + dirección), contador, botón **Seleccionar** (modo selección múltiple) y **Etiquetar selección**.
 - Filtro por tags es **AND** (la foto debe tener todos los seleccionados).
+
+### Sesión, avisos, bienvenida, carpetas vigiladas (fase 8)
+- **Sesión:** `closeEvent` guarda `session_state()` (geometría en base64, `GalleryQuery.to_dict()`, pestaña, barra de filtros, primera fila visible); al abrir, `_restore_geometry()` y `_initial_load()` usan `services.restorable_query()` (None si es la de por defecto o ya no muestra nada → se abre con todo y un aviso). Opción "Recordar…" en Configuración (`restore_session`).
+- **Avisos:** `self.toast(texto, kind, ms)` (`info`/`success`/`warning`/`error`). Para confirmaciones que no requieren acción; los errores que sí la requieren siguen siendo `QMessageBox`. Texto plano (nombres de archivo). `BulkTagDialog.summary` → aviso.
+- **Galería vacía:** `gallery_stack` alterna `view` / `EmptyState` en `_after_model_reset` (bienvenida si `get_totals()[0] == 0`).
+- **Carpetas vigiladas:** `services.get/set_watched_folders`, `available_watched_folders()` (solo las que existen) y `watch_dirs(raíces)` (raíz + subcarpetas indexadas, desde la DB, máx. `MAX_WATCHED_DIRS`). `apply_watch_settings()` comprueba qué existe **en un `TaskWorker`** (un USB dormido tarda ~9 s en responder), monta `FolderWatcher` y, al abrir, revisa con `scan_watched_folders` 3 s después. `FolderWatcher.changed(raíz)` se emite 30 s (`SETTLE_MS`) después del último cambio → `start_indexing(raíz, auto=True)`; tras cada revisión automática se actualizan las carpetas vigiladas (subcarpetas nuevas).
 
 ### Diálogos
 | Clase | Qué hace |
@@ -376,7 +388,7 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 | `KeymapDialog` | Remapear teclas (2 por acción) y la tecla de cada etiqueta; no deja guardar choques (`services.keymap_conflicts`). |
 | `StatsDialog` | Tarjetas de totales + barras SVG por año y top 10 tags. |
 | `DuplicatesDialog` | Calcula MD5 en hilo (cancelable) **solo de archivos cuyo tamaño se repite** (38 % de la colección real), agrupa duplicados, manda copias a la **Papelera** (con confirmación, nunca la última copia). |
-| `SettingsDialog` | Tamaño de caché, limpiar caché, purgar huérfanos. |
+| `SettingsDialog` | Al abrir (recordar sesión), carpetas vigiladas (agregar/quitar, revisar al abrir, vigilar), tamaño de caché, limpiar caché (confirma, en un hilo), purgar huérfanos. |
 | `TagManagerDialog` | Crear/editar (✎ → `EditTagDialog`)/**fusionar** (⇢)/eliminar tags (confirma con el n.º de fotos), buscador, árbol con contadores y alias, flags hidden, exportar/importar JSON. |
 | `EditTagDialog` | Cambiar nombre, categoría, color, **etiqueta padre** (sin ciclos: no ofrece descendientes) y **alias**; avisa si el nombre o un alias ya existe (`TagNameConflictError`). |
 | `CategoryManagerDialog` | Crear/renombrar/eliminar categorías (al eliminar, sus tags pasan a `general`). |
@@ -467,6 +479,7 @@ py -m PyInstaller PhotoVault.spec --noconfirm
 - `build/`, `dist/`, `.venv/` no se commitean.
 
 ### Tests
+- `tests/conftest.py` también tiene fixtures `autouse` que hacen fallar el test (con el mensaje) si aparece un `QMessageBox` crítico/advertencia/pregunta que el test no reemplazó (`information` se acepta solo) o si hay una excepción en un slot de Qt. Antes: el test se colgaba esperando el diálogo, o PyQt abortaba el proceso sin decir dónde. `PV_NO_SLOT_HOOK=1` desactiva lo segundo.
 - `tests/conftest.py` tiene una fixture `autouse` que redirige `database.DB_PATH`, `backup.BACKUP_DIR` y `thumbnail_cache.CACHE_DIR` a `tmp_path` y, al terminar cada test, espera los hilos retirados (`wait_all_threads`; si el proceso termina con uno vivo, Qt aborta). También define `qapp` (sesión) para los tests de UI. **Ningún test debe tocar `~/.photovault`.**
 - `make_legacy_db(path)` simula una DB de V1 para probar migraciones.
 - Para probar contra datos reales: copiar la DB real con la API de backup (abriéndola `?mode=ro`) a un directorio temporal y apuntar `DB_PATH` ahí. Nunca contra la DB real.
@@ -503,13 +516,12 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 
 1. "Eliminar etiqueta" no pasa por la papelera interna (solo se confirma).
 2. `get_relocation_plan` hace una consulta por registro para detectar conflictos (1 s para 172k; aceptable, mejorable con un JOIN).
-10. `services.py` (~1.300 líneas), `database.py` (~1.700) y `ui/main_window.py` (~740) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
+10. `services.py` (~1.300 líneas), `database.py` (~1.700) y `ui/main_window.py` (~780) son demasiado grandes: dividirlos por área (galería, etiquetas, mantenimiento) en commits propios (solo mover código).
 11. Aviso de Qt en el log real: `QFont::setPointSize: Point size <= 0 (-1)` (inofensivo; probablemente un estilo con `font-size` en px). Revisar al tocar estilos.
 8. Los estilos en línea (`setStyleSheet("color:#4A9EFF;…")`) repiten los hex de la paleta en vez de usar `config.COLORS`; migrarlos al tocar cada diálogo.
 9. El `.exe` incluye todo PyQt6 (QML, WebEngine…) por `collect_data_files('PyQt6')` → fase 11 (#83).
 12. 150 JPEG truncados de la colección real (copias en "Broken pics") no generan miniatura (⚠). Pillow podría leerlos con `ImageFile.LOAD_TRUNCATED_IMAGES`.
 13. FFmpeg (QtMultimedia) escribe la información de cada video en la consola en desarrollo; en el `.exe` no hay consola.
-5. `SettingsDialog._clear_cache` borra el caché con `shutil.rmtree` en el hilo de UI y sin confirmar (es regenerable, pero con 170k miniaturas tarda).
 6. El caché de miniaturas de antes de la fase 1 (formato sin tamaño) queda como huérfano hasta pulsar **Purgar huérfanos** en Configuración.
 7. Las fechas guardadas con la regla EXIF vieja se corrigen solo al re-indexar.
 
@@ -559,3 +571,6 @@ El detalle y el orden están en `ROADMAP.md`. Pendientes relevantes:
 - Etiquetado rápido cargaba todas las fotos (843 ms) y decodificaba en el hilo de UI → `services.PhotoList` (por tramos) + `PhotoStage` (hilo, precarga).
 - Una ventana descartada sin mostrarse dejaba su hilo vivo y Qt abortaba → `retire_on_destroy`.
 - `QuickTagSetupDialog` llamaba `_refresh` a medio construir (señales conectadas antes de tiempo) → se conectan al final (`test_configuracion_se_construye_sin_errores_en_slots`).
+- Un "indexación terminada" que llegaba con la ventana ya cerrada arrancaba miniaturas y mostraba un error → `_closing` (`test_ventana_cerrada_ignora_avisos_tardios`).
+- Una señal de progreso por archivo al indexar saturaba la UI → `PROGRESS_INTERVAL`.
+- Abrir con una carpeta vigilada en un USB dormido congelaba la ventana 9 s → comprobación en un hilo.

@@ -213,12 +213,24 @@ Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 
 ---
 
-## Fase 8 — Experiencia de uso → v2.3
+## Fase 8 — Experiencia de uso → v2.3 ✅
+*Medido con una copia de la DB real (171.843 fotos) y `G:\Fotos` como carpeta vigilada.*
 
-- [ ] #64 [B] Guardar ventana, orden y filtros entre sesiones
-- [ ] #66 [B] Notificaciones tipo toast
-- [ ] #67 [B] Pantalla de bienvenida
-- [ ] #69 [M] Vigilar carpetas y auto-indexar
+| Operación | Antes | Después |
+|---|---|---|
+| Abrir con una carpeta vigilada (disco USB dormido) | 9,3 s con la ventana congelada | 0,25 s (se comprueba en un hilo) |
+| Revisar `G:\Fotos` sin cambios al abrir | 23 s (una señal de progreso por archivo) | 0,8 s |
+| Reabrir con filtros, orden y posición de la última vez | — | 0,14 s |
+
+- [x] #64 [B] Recordar ventana, filtros, orden, carpeta, pestaña y posición (si ya no muestran nada, se abre con todo y avisa); opción en Configuración
+- [x] #66 [B] Avisos tipo notificación (abajo a la derecha, se van solos; clic para cerrar)
+- [x] #67 [B] Pantalla de bienvenida (colección vacía) y "sin resultados" con botón para limpiar filtros
+- [x] #69 [M] Carpetas vigiladas: revisión al abrir y vigilancia mientras está abierta (30 s después del último cambio); las indexaciones esperan en cola
+- [x] *(deuda #5)* "Limpiar caché" pide confirmación y corre en un hilo
+- [x] *(bug)* Un aviso de "indexación terminada" que llegaba con la ventana ya cerrada arrancaba miniaturas y podía mostrar un error / cerrar la app (`_closing`)
+- [x] *(bug)* La indexación mandaba una señal de progreso por archivo (saturaba la UI)
+- [x] Tests: un `QMessageBox` inesperado o una excepción en un slot hacen fallar el test con su mensaje (antes: cuelgue o cierre sin saber dónde)
+- [x] 11 tests nuevos (287 en total) + prueba con la DB real
 
 ---
 
