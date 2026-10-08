@@ -3,6 +3,7 @@ PhotoVault - ui/main_window.py
 Ventana principal: sidebar (etiquetas, carpetas, fechas, búsquedas), filtros,
 galería continua y visor. Las acciones sobre la selección están en ui/gallery_actions.py
 y las tareas en segundo plano en ui/background.py. Recuerda la sesión y vigila carpetas.
+Contenido oculto, bloqueo y modo pánico: ui/privacy_actions.py.
 """
 
 import logging
@@ -31,6 +32,7 @@ from PyQt6.QtWidgets import (
 )
 
 import database as db
+import privacy
 import services
 from models import SortField, SortOrder
 from ui.background import BackgroundTasksMixin
@@ -46,6 +48,7 @@ from ui.filter_bar import FilterBar
 from ui.folder_watch import FolderWatcher
 from ui.gallery import GalleryDelegate, GalleryModel, GalleryView, format_date, thumb_source_size
 from ui.gallery_actions import GalleryActionsMixin
+from ui.privacy_actions import TOGGLE_HIDDEN_KEY, PrivacyMixin
 from ui.sidebar import FolderTreePanel, SavedSearchPanel, TimelinePanel
 from ui.style import DARK_STYLE
 from ui.tag_panel import TagFilterPanel
@@ -90,7 +93,7 @@ GALLERY_SHORTCUTS_HELP = [
 ]
 
 
-class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
+class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, PrivacyMixin):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoVault")
@@ -134,6 +137,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         self._watch_worker: TaskWorker | None = None
         self._pending_watch_startup: bool | None = None
         self.watcher.changed.connect(lambda root: self.start_indexing(root, auto=True))
+        self._init_privacy(self.status_bar)
         self.tag_panel.refresh()
         self.folder_panel.refresh()
         self._update_stats()
@@ -185,10 +189,10 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         # Barra de estado: progreso de indexación / miniaturas en segundo plano
         self.task_status = TaskStatusWidget()
         self.task_status.cancel_clicked.connect(self._cancel_background)
-        status_bar = QStatusBar()
-        status_bar.setStyleSheet("QStatusBar{background:#13131F;border-top:1px solid #2D2D3F;}")
-        status_bar.addPermanentWidget(self.task_status, 1)
-        self.setStatusBar(status_bar)
+        self.status_bar = QStatusBar()
+        self.status_bar.setStyleSheet("QStatusBar{background:#13131F;border-top:1px solid #2D2D3F;}")
+        self.status_bar.addPermanentWidget(self.task_status, 1)
+        self.setStatusBar(self.status_bar)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QWidget()
@@ -364,6 +368,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
             "Ctrl+0": lambda: self.size_slider.setValue(services.THUMB_DISPLAY_DEFAULT),
             "Ctrl+Shift+F": self.btn_filters.toggle,
             "Ctrl+S": self.save_current_search,
+            TOGGLE_HIDDEN_KEY: self.toggle_hidden_content,
         }
         for key, slot in window_keys.items():
             QShortcut(QKeySequence(key), self, slot)
@@ -604,8 +609,17 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         box = QMessageBox(self)
         box.setWindowTitle("Atajos de teclado")
         box.setTextFormat(Qt.TextFormat.RichText)
+        panic_key = privacy.get_options().panic_key
+        privacy_rows = [(TOGGLE_HIDDEN_KEY, "Mostrar / bloquear el contenido oculto")]
+        if panic_key:
+            privacy_rows.append((panic_key, "Modo pánico (desde cualquier ventana)"))
         box.setText(
-            "<b>Galería</b>" + table(GALLERY_SHORTCUTS_HELP) + "<br><b>Visor</b>" + table(SHORTCUTS_HELP)
+            "<b>Galería</b>"
+            + table(GALLERY_SHORTCUTS_HELP)
+            + "<br><b>Visor</b>"
+            + table(SHORTCUTS_HELP)
+            + "<br><b>Privacidad</b>"
+            + table(privacy_rows)
         )
         box.setStyleSheet(DARK_STYLE)
         box.exec()
@@ -625,11 +639,22 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         self.reload_keep_position()
 
     def _open_tag_manager(self):
+        before = self._privacy_state()
         TagManagerDialog(self).exec()
-        self._refresh_after_tag_change()
+        if self._privacy_state() != before:
+            self.privacy_changed()
+        else:
+            self._refresh_after_tag_change()
 
     def _open_settings_dialog(self):
+        before = self._privacy_state()
         SettingsDialog(self).exec()
+        if self._privacy_state() != before:
+            self.privacy_changed()
+
+    @staticmethod
+    def _privacy_state() -> tuple[bool, bool]:
+        return privacy.has_pin(), privacy.is_unlocked()
 
     def _open_deindex_dialog(self):
         DeindexDialog(self).exec()
@@ -749,8 +774,13 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         if services.is_watch_live():
             self.watcher.set_roots(services.available_watched_folders())  # subcarpetas nuevas
 
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event is not None:
+            self._privacy_change_event(event)
+
     def closeEvent(self, event):
-        if self._bg_kind == "index":
+        if self._bg_kind == "index" and not self._panic_close:
             if (
                 QMessageBox.question(
                     self,
@@ -763,6 +793,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
                 event.ignore()
                 return
         self._closing = True
+        self._shutdown_privacy()
         if self._thumb_save_timer.isActive():
             self._thumb_save_timer.stop()
             self._save_thumb_size()

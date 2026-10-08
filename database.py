@@ -398,9 +398,15 @@ def _seed_initial_data(conn):
 
 # ── Fotos ─────────────────────────────────────────────────────────────────────
 
+# ¿Tiene alguna etiqueta oculta? (alias de photos: `p`)
+# (subconsulta no correlacionada: SQLite la calcula una vez por consulta)
+_HIDDEN_EXPR = (
+    "p.id IN (SELECT hpt.photo_id FROM photo_tags hpt JOIN tags ht ON ht.id = hpt.tag_id WHERE ht.hidden = 1)"
+)
 _PHOTO_COLUMNS = (
     "p.id, p.path, p.filename, p.year, p.month, p.media_type, p.duration, "
-    "p.filesize, p.width, p.height, p.added_at, p.mtime, p.rating, p.favorite, p.note"
+    "p.filesize, p.width, p.height, p.added_at, p.mtime, p.rating, p.favorite, p.note, "
+    f"{_HIDDEN_EXPR} AS hidden"
 )
 
 
@@ -544,6 +550,7 @@ def _row_to_photo(row: sqlite3.Row) -> Photo:
         rating=(row["rating"] or 0) if "rating" in keys else 0,
         favorite=bool(row["favorite"]) if "favorite" in keys else False,
         note=row["note"] if "note" in keys else None,
+        hidden=bool(row["hidden"]) if "hidden" in keys else False,
     )
 
 
@@ -847,8 +854,16 @@ def get_totals() -> tuple[int, int]:
     )
 
 
-def get_paths_with_mtime() -> list[tuple[str, float | None]]:
-    return [(r[0], r[1]) for r in get_connection().execute("SELECT path, mtime FROM photos")]
+def get_paths_with_mtime(hidden: bool | None = None) -> list[tuple[str, float | None]]:
+    """[(ruta, mtime)]; `hidden`: solo las fotos ocultas (True) o solo las visibles (False)."""
+    where = "" if hidden is None else f"WHERE {'' if hidden else 'NOT '}{_HIDDEN_EXPR}"
+    return [(r[0], r[1]) for r in get_connection().execute(f"SELECT p.path, p.mtime FROM photos p {where}")]
+
+
+def get_hidden_photos() -> list[Photo]:
+    """Las fotos con alguna etiqueta oculta."""
+    rows = get_connection().execute(f"SELECT {_PHOTO_COLUMNS} FROM photos p WHERE {_HIDDEN_EXPR}")
+    return [_row_to_photo(r) for r in rows]
 
 
 def get_photos_by_ids(photo_ids: list[int]) -> list[Photo]:

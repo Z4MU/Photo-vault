@@ -1,6 +1,7 @@
 """
 PhotoVault - ui/dialogs/settings.py
-Configuración: al abrir, carpetas vigiladas, caché de miniaturas, sidecars XMP.
+Configuración en pestañas: General (al abrir, carpetas vigiladas), Miniaturas
+(caché, sidecars XMP) y Privacidad (PIN, bloqueo, modo pánico; ui/dialogs/privacy.py).
 """
 
 import logging
@@ -17,11 +18,14 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 import services
 import thumbnail_cache
+from ui.dialogs.privacy import PrivacySettingsPanel
 from ui.style import DARK_STYLE
 from ui.workers import (
     run_with_progress,
@@ -37,16 +41,22 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuración")
-        self.setFixedSize(520, 720)
+        self.setFixedSize(540, 600)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+        self.tabs = QTabWidget()
+        outer.addWidget(self.tabs, stretch=1)
 
-        # ── Al abrir / carpetas vigiladas (fase 8) ────────────────────────
+        # ── General: al abrir / carpetas vigiladas (fase 8) ───────────────
+        general = QWidget()
+        layout = QVBoxLayout(general)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(10)
         layout.addWidget(QLabel("<b>Al abrir</b>"))
         self.chk_session = QCheckBox("Recordar la ventana, los filtros, el orden y por dónde iba")
         self.chk_session.setChecked(services.is_restore_session_enabled())
@@ -80,12 +90,14 @@ class SettingsDialog(QDialog):
         self.chk_watch_live.setChecked(services.is_watch_live())
         layout.addWidget(self.chk_watch_start)
         layout.addWidget(self.chk_watch_live)
+        layout.addStretch()
+        self.tabs.addTab(general, "General")
 
-        sep0 = QFrame()
-        sep0.setFrameShape(QFrame.Shape.HLine)
-        sep0.setStyleSheet("color:#2D2D3F;")
-        layout.addWidget(sep0)
-
+        # ── Miniaturas y .xmp ─────────────────────────────────────────────
+        thumbs = QWidget()
+        layout = QVBoxLayout(thumbs)
+        layout.setContentsMargins(4, 8, 4, 4)
+        layout.setSpacing(10)
         layout.addWidget(QLabel("<b>Caché de miniaturas</b>"))
         self.cache_lbl = QLabel()
         self._refresh_cache_label()
@@ -148,17 +160,23 @@ class SettingsDialog(QDialog):
         xmp_row.addWidget(btn_sync)
         xmp_row.addWidget(btn_read)
         layout.addLayout(xmp_row)
-
         layout.addStretch()
+        self.tabs.addTab(thumbs, "Miniaturas y .xmp")
+
+        # ── Privacidad (fase 9) ───────────────────────────────────────────
+        self.privacy_panel = PrivacySettingsPanel()
+        self.tabs.addTab(self.privacy_panel, "🔒 Privacidad")
+
         btn_row = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar")
         btn_cancel.clicked.connect(self.reject)
         btn_ok = QPushButton("Aplicar")
         btn_ok.setStyleSheet("background:#4A9EFF22;color:#4A9EFF;border:1px solid #4A9EFF;")
         btn_ok.clicked.connect(self._apply)
+        btn_row.addStretch()
         btn_row.addWidget(btn_cancel)
         btn_row.addWidget(btn_ok)
-        layout.addLayout(btn_row)
+        outer.addLayout(btn_row)
 
     def _refresh_cache_label(self):
         self.cache_lbl.setText(f"Tamaño del caché: {thumbnail_cache.cache_size_mb()} MB")
@@ -268,6 +286,13 @@ class SettingsDialog(QDialog):
         return [item.text() for i in range(self.watch_list.count()) if (item := self.watch_list.item(i))]
 
     def _apply(self):
+        if self.privacy_panel.validate():
+            self.tabs.setCurrentWidget(self.privacy_panel)
+            return
+        self.privacy_panel.apply()
+        apply_privacy = getattr(self.parent(), "apply_privacy_options", None)
+        if apply_privacy is not None:
+            apply_privacy()
         services.set_restore_session_enabled(self.chk_session.isChecked())
         before = services.get_watched_folders()
         services.set_watched_folders(self.watched_folders())

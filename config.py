@@ -16,6 +16,8 @@ APP_VERSION = "2.3.0"
 DATA_DIR = Path.home() / ".photovault"
 DB_PATH = DATA_DIR / "photovault.db"
 THUMBS_DIR = DATA_DIR / "thumbs"
+# Miniaturas de las fotos ocultas, cifradas (fase 9)
+PRIVATE_THUMBS_DIR = DATA_DIR / "thumbs_private"
 BACKUP_DIR = DATA_DIR / "backups"
 LOG_DIR = DATA_DIR / "logs"
 

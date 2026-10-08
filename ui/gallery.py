@@ -335,11 +335,14 @@ class GalleryDelegate(QStyledItemDelegate):
         painter.restore()
 
     def _paint_marks(self, painter: QPainter, img_rect: QRect, photo: Photo) -> None:
-        """♥ favorita (arriba a la derecha), 📝 nota (arriba a la izquierda), ★ valoración (abajo a la izquierda)."""
+        """
+        🔒 oculta y ♥ favorita (arriba a la derecha), 📝 nota (arriba a la izquierda),
+        ★ valoración (abajo a la izquierda).
+        """
         painter.setFont(self._badge_font)
         fm = painter.fontMetrics()
 
-        def pill(x: int, y: int, text: str, color: str, align_right: bool = False) -> None:
+        def pill(x: int, y: int, text: str, color: str, align_right: bool = False) -> int:
             w = fm.horizontalAdvance(text) + 10
             rect = QRect(x - w if align_right else x, y, w, 16)
             painter.setPen(Qt.PenStyle.NoPen)
@@ -347,9 +350,13 @@ class GalleryDelegate(QStyledItemDelegate):
             painter.drawRoundedRect(rect, 3, 3)
             painter.setPen(QColor(color))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
+            return w
 
+        right = img_rect.right() - 4
+        if photo.hidden:  # solo se ve con el contenido oculto desbloqueado
+            right -= pill(right, img_rect.top() + 4, "🔒", config.COLORS["warning"], align_right=True) + 4
         if photo.favorite:
-            pill(img_rect.right() - 4, img_rect.top() + 4, "♥", "#FF4A6A", align_right=True)
+            pill(right, img_rect.top() + 4, "♥", "#FF4A6A", align_right=True)
         if photo.note:
             pill(img_rect.left() + 4, img_rect.top() + 4, "📝", "#D0D0E8")
         if photo.rating:

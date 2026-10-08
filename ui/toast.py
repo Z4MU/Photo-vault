@@ -121,5 +121,12 @@ class ToastManager(QObject):
             self._layout()
         return False
 
+    def clear(self) -> None:
+        """Quita todos los avisos al instante (modo pánico)."""
+        for toast in self.toasts:
+            toast.hide()
+            toast.deleteLater()
+        self.toasts.clear()
+
     def texts(self) -> list[str]:
         return [t.text() for t in self.toasts]

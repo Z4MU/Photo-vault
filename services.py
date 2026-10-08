@@ -17,6 +17,7 @@ from send2trash import send2trash
 
 import database as db
 import indexer
+import privacy
 import thumbnail_cache
 import xmp_sidecar
 from models import (
@@ -36,6 +37,17 @@ logger = logging.getLogger(__name__)
 ProgressCallback = Callable[[int, int], None]
 StopCheck = Callable[[], bool]
 
+
+def _hidden_filter() -> set[int]:
+    """Etiquetas cuyas fotos no se muestran: las ocultas, salvo con el contenido desbloqueado (fase 9)."""
+    return set() if privacy.show_hidden_content() else db.get_hidden_tag_ids()
+
+
+def _visible_tags(tags: list[Tag]) -> list[Tag]:
+    """Con PIN y bloqueado, ni los nombres de las etiquetas ocultas se muestran."""
+    return [t for t in tags if not t.hidden] if privacy.hidden_locked() else tags
+
+
 # ── Galería ───────────────────────────────────────────────────────────────────
 
 
@@ -53,7 +65,7 @@ def get_gallery_photos(
     """Solo las fotos de una página, sin contar el total (p. ej. para precargar la siguiente)."""
     return db.get_photos(
         tag_ids=tag_ids or None,
-        hidden_tag_ids=hidden_tag_ids if hidden_tag_ids is not None else db.get_hidden_tag_ids(),
+        hidden_tag_ids=hidden_tag_ids if hidden_tag_ids is not None else _hidden_filter(),
         search=search,
         limit=limit,
         offset=offset,
@@ -76,7 +88,7 @@ def get_gallery_page(
 ) -> GalleryPage:
     if limit <= 0:
         raise ValueError("limit debe ser positivo")
-    hidden = db.get_hidden_tag_ids()
+    hidden = _hidden_filter()
     total = db.get_photo_count(
         tag_ids=tag_ids or None,
         hidden_tag_ids=hidden,
@@ -103,8 +115,8 @@ ORIENTATIONS = ("landscape", "portrait", "square")
 @dataclass(frozen=True)
 class GalleryQuery:
     """
-    Lo que muestra la galería: filtros + orden. Las etiquetas ocultas se
-    excluyen siempre. Se puede guardar (to_dict/from_dict) como búsqueda.
+    Lo que muestra la galería: filtros + orden. Las fotos con etiquetas
+    ocultas se excluyen salvo con el contenido desbloqueado (privacy). Se puede guardar (to_dict/from_dict) como búsqueda.
 
     Etiquetas: `tag_ids` = incluir; con `match_any` basta con una (OR), si no,
     todas (AND); `exclude_tag_ids` = ninguna (NOT). Una etiqueta incluye a sus
@@ -145,7 +157,7 @@ class GalleryQuery:
         groups = None if self.match_any else [expand(t) for t in included] or None
         any_ids = sorted({x for t in included for x in expand(t)}) if self.match_any and included else None
         return db.PhotoFilter(
-            hidden_tag_ids=db.get_hidden_tag_ids(),
+            hidden_tag_ids=_hidden_filter(),
             search=self.search or None,
             folder=self.folder or None,
             untagged_only=self.untagged_only,
@@ -344,7 +356,7 @@ def get_photos_for_tagging(
     (sin paginación, para navegar libremente). Antes tenía limit=99_999 y con
     la colección real (171k sin etiquetar) se perdían 71k fotos.
     """
-    hidden = db.get_hidden_tag_ids()
+    hidden = _hidden_filter()
     return db.get_photos(
         tag_ids=tag_ids or None,
         hidden_tag_ids=hidden,
@@ -365,7 +377,7 @@ def count_photos_for_tagging(
     """Cuántas fotos devolvería get_photos_for_tagging (sin cargarlas)."""
     return db.get_photo_count(
         tag_ids=tag_ids or None,
-        hidden_tag_ids=db.get_hidden_tag_ids(),
+        hidden_tag_ids=_hidden_filter(),
         folder=folder,
         untagged_only=untagged_only,
     )
@@ -394,7 +406,7 @@ def add_tag(photo_id: int, tag_name: str) -> Tag:
         raise ValueError("El nombre de etiqueta no puede estar vacío.")
     tag_id = _tag_id_for_name(tag_name)
     db.add_tag_to_photo(photo_id, tag_id)
-    _sync_sidecars([photo_id])
+    _tags_changed([photo_id])
     tag = db.get_tag(tag_id)
     assert tag is not None
     return tag
@@ -403,12 +415,12 @@ def add_tag(photo_id: int, tag_name: str) -> Tag:
 def add_tag_by_id(photo_id: int, tag_id: int) -> None:
     """Asigna una etiqueta existente (sin buscarla por nombre)."""
     db.add_tag_to_photo(photo_id, tag_id)
-    _sync_sidecars([photo_id])
+    _tags_changed([photo_id])
 
 
 def remove_tag(photo_id: int, tag_id: int):
     db.remove_tag_from_photo(photo_id, tag_id)
-    _sync_sidecars([photo_id])
+    _tags_changed([photo_id])
 
 
 # ── Etiquetado en lote ────────────────────────────────────────────────────────
@@ -423,7 +435,7 @@ def bulk_add_tag(photo_ids: list[int], tag_name: str) -> int:
         return 0
     tag_id = _tag_id_for_name(tag_name.strip().lower())
     db.add_tag_to_photos(photo_ids, tag_id)
-    _sync_sidecars(photo_ids)
+    _tags_changed(photo_ids)
     return len(photo_ids)
 
 
@@ -432,7 +444,7 @@ def bulk_remove_tag(photo_ids: list[int], tag_id: int) -> int:
     if not photo_ids:
         return 0
     db.remove_tag_from_photos(photo_ids, tag_id)
-    _sync_sidecars(photo_ids)
+    _tags_changed(photo_ids)
     return len(photo_ids)
 
 
@@ -440,11 +452,17 @@ def bulk_remove_tag(photo_ids: list[int], tag_id: int) -> int:
 
 
 def get_all_tags(include_sidebar_hidden: bool = True) -> list[Tag]:
-    return db.get_all_tags(include_sidebar_hidden=include_sidebar_hidden)
+    """Las etiquetas para mostrar (sin las ocultas si están bloqueadas)."""
+    return _visible_tags(db.get_all_tags(include_sidebar_hidden=include_sidebar_hidden))
+
+
+def count_locked_hidden_tags() -> int:
+    """Cuántas etiquetas no se muestran por estar el contenido oculto bloqueado."""
+    return sum(1 for t in db.get_all_tags() if t.hidden) if privacy.hidden_locked() else 0
 
 
 def get_sidebar_tags(include_hidden: bool = False) -> dict[str, list[Tag]]:
-    tags = db.get_all_tags(include_sidebar_hidden=include_hidden)
+    tags = _visible_tags(db.get_all_tags(include_sidebar_hidden=include_hidden))
     groups: dict[str, list[Tag]] = {}
     for tag in tags:
         groups.setdefault(tag.category or "general", []).append(tag)
@@ -452,7 +470,7 @@ def get_sidebar_tags(include_hidden: bool = False) -> dict[str, list[Tag]]:
 
 
 def count_sidebar_hidden_tags() -> int:
-    return sum(1 for t in db.get_all_tags() if t.sidebar_hidden)
+    return sum(1 for t in _visible_tags(db.get_all_tags()) if t.sidebar_hidden)
 
 
 def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> int:
@@ -479,7 +497,7 @@ def update_tag(
     affected = set(db.get_photo_ids_with_tag(tag_id))
     for child in tag_descendants().get(tag_id, set()):  # su ruta en el .xmp cambia
         affected.update(db.get_photo_ids_with_tag(child))
-    _sync_sidecars(sorted(affected))
+    _tags_changed(sorted(affected))
 
 
 def tag_descendants() -> dict[int, set[int]]:
@@ -543,7 +561,7 @@ def merge_tags(source_id: int, target_id: int) -> int:
         new = replace(q, tag_ids=swap(q.tag_ids), exclude_tag_ids=swap(q.exclude_tag_ids))
         if new != q:
             db.update_saved_search_json(saved.id, json.dumps(new.to_dict(), ensure_ascii=False))
-    _sync_sidecars(affected)
+    _tags_changed(affected)
     return n
 
 
@@ -558,11 +576,29 @@ def count_photos_with_tag(tag_id: int) -> int:
 def delete_tag(tag_id: int):
     affected = db.get_photo_ids_with_tag(tag_id)
     db.delete_tag(tag_id)
-    _sync_sidecars(affected)
+    _tags_changed(affected)
 
 
 def set_tag_hidden(tag_id: int, hidden: bool):
     db.set_tag_hidden(tag_id, hidden)
+    if hidden:
+        secure_hidden_thumbnails()
+
+
+def secure_hidden_thumbnails(photo_ids: list[int] | None = None) -> int:
+    """
+    Borra las miniaturas sin cifrar de las fotos ocultas (de esas fotos, o de
+    todas si photo_ids es None). Se llama al ocultar una etiqueta, después de
+    cada cambio de etiquetas y al abrir la app. Devuelve cuántos archivos borró.
+    """
+    if photo_ids is None:
+        photos = db.get_hidden_photos()
+    else:
+        photos = [p for p in db.get_photos_by_ids(photo_ids) if p.hidden]
+    removed = thumbnail_cache.remove_plain(photos)
+    if removed:
+        logger.info("Miniaturas sin cifrar de fotos ocultas borradas: %d", removed)
+    return removed
 
 
 def set_tag_sidebar_hidden(tag_id: int, hidden: bool):
@@ -594,13 +630,13 @@ def _photo_ids_in_category(category: str) -> list[int]:
 def rename_category(old_name: str, new_name: str):
     affected = _photo_ids_in_category(old_name) if is_xmp_enabled() else []
     db.rename_category(old_name, new_name)
-    _sync_sidecars(affected)
+    _tags_changed(affected)
 
 
 def delete_category(name: str):
     affected = _photo_ids_in_category(name) if is_xmp_enabled() else []
     db.delete_category(name)
-    _sync_sidecars(affected)
+    _tags_changed(affected)
 
 
 # ── Revisión por etiqueta (sí / no) ───────────────────────────────────────────
@@ -664,7 +700,7 @@ def review_answer(tag_id: int, yes_ids: list[int], no_ids: list[int]) -> dict[in
         removed = [pid for pid in no_ids if pid in had]
         if removed:
             db.remove_tag_from_photos(removed, tag_id)
-    _sync_sidecars([pid for pid in yes_ids if pid not in had] + [pid for pid in no_ids if pid in had])
+    _tags_changed([pid for pid in yes_ids if pid not in had] + [pid for pid in no_ids if pid in had])
     return before
 
 
@@ -676,7 +712,7 @@ def review_restore(tag_id: int, states: dict[int, ReviewState]) -> None:
     db.remove_tag_from_photos(remove, tag_id)
     db.add_rejections(tag_id, [pid for pid, st in states.items() if st.was_rejected])
     db.remove_rejections(tag_id, [pid for pid, st in states.items() if not st.was_rejected])
-    _sync_sidecars(list(states))
+    _tags_changed(list(states))
 
 
 # ── Teclas del etiquetado rápido (remapeables) ────────────────────────────────
@@ -970,7 +1006,11 @@ def delete_saved_search(search_id: int) -> None:
 
 
 def get_stats() -> Stats:
-    return db.get_stats()
+    stats = db.get_stats()
+    if privacy.hidden_locked():
+        hidden = {t.name for t in db.get_all_tags() if t.hidden}
+        stats.top_tags = [(name, n) for name, n in stats.top_tags if name not in hidden]
+    return stats
 
 
 def get_totals() -> tuple[int, int]:
@@ -1159,7 +1199,7 @@ def import_tags(path: str, include_assignments: bool = True) -> ImportResult:
             # Un "no" no se importa si la foto ya tiene la etiqueta (solo agregar, nunca quitar)
             has = db.get_ids_with_tag(tid, pids)
             db.add_rejections(tid, [pid for pid in pids if pid not in has])
-        _sync_sidecars(touched)
+        _tags_changed(touched)
 
     logger.info("Importación desde %s: %s", path, result)
     return result
@@ -1212,6 +1252,13 @@ def _write_photo_sidecar(photo_id: int) -> xmp_sidecar.WriteResult | None:
         parents = paths.get(t.id, [t.name])[:-1]
         tags.append((t.name, "|".join([t.category, *parents]) if t.category else None))
     return xmp_sidecar.write_sidecar(photo.path, tags, photo.rating)
+
+
+def _tags_changed(photo_ids: list[int]) -> None:
+    """Después de cambiar etiquetas: miniaturas de lo que quedó oculto y sidecars."""
+    if photo_ids and db.get_hidden_tag_ids():
+        secure_hidden_thumbnails(photo_ids)
+    _sync_sidecars(photo_ids)
 
 
 def _sync_sidecars(photo_ids: list[int]) -> None:
@@ -1453,7 +1500,12 @@ def get_duplicate_groups() -> list[DuplicateGroup]:
         if photo.md5:
             buckets[photo.md5].append(photo)
 
-    groups = [DuplicateGroup(md5=md5, photos=photos) for md5, photos in buckets.items() if len(photos) >= 2]
+    show_hidden = privacy.show_hidden_content()
+    groups = [
+        DuplicateGroup(md5=md5, photos=photos)
+        for md5, photos in buckets.items()
+        if len(photos) >= 2 and (show_hidden or not any(p.hidden for p in photos))
+    ]
     # Ordenar: grupos con más copias primero
     groups.sort(key=lambda g: g.size, reverse=True)
     return groups
@@ -1606,7 +1658,11 @@ def purge_cache_orphans() -> int:
     Elimina del caché de miniaturas los archivos que ya no tienen registro en la DB.
     Devuelve la cantidad de archivos eliminados.
     """
-    return thumbnail_cache.purge_orphans(db.get_paths_with_mtime())
+    removed = thumbnail_cache.purge_orphans(db.get_paths_with_mtime(hidden=False))
+    if thumbnail_cache.has_private_codec():
+        hidden = db.get_hidden_photos()
+        removed += thumbnail_cache.purge_private_orphans([(p.path, p.mtime, p.is_video) for p in hidden])
+    return removed
 
 
 @dataclass
@@ -1641,7 +1697,9 @@ def pregenerate_thumbnails(
         # Comprobar el caché dentro del hilo: con registros sin mtime en la DB
         # eso consulta el disco de la colección, y hacerlo antes para 170k fotos
         # tardaba minutos sin poder cancelarse.
-        if thumbnail_cache.is_cached(p.path, video=p.is_video, mtime=p.mtime):
+        if p.hidden and not thumbnail_cache.has_private_codec():
+            return "cached"  # oculta y bloqueado: no se genera (sin la clave no se puede cifrar)
+        if thumbnail_cache.is_photo_cached(p):
             return "cached"
         return "ok" if thumbnail_cache.get_photo_thumbnail(p) is not None else "failed"
 

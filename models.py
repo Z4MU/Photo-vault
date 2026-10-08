@@ -70,6 +70,7 @@ class Photo:
     rating: int = 0  # 0 = sin valorar, 1–5 estrellas (v4)
     favorite: bool = False
     note: str | None = None
+    hidden: bool = False  # tiene alguna etiqueta oculta (calculado al leer; fase 9)
 
     @property
     def stars(self) -> str:

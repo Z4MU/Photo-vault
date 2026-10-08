@@ -27,8 +27,10 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+import privacy
 import services
 from models import Tag
+from ui.dialogs.privacy import ensure_unlocked
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 
@@ -359,6 +361,21 @@ class TagManagerDialog(QDialog):
             row.setStyleSheet("background:#1E1E2E;border-radius:6px;")
             self.grid.addWidget(row)
             self._rows.append((row, " ".join([*path, *aliases.get(tag.id, [])]).lower()))
+        locked = services.count_locked_hidden_tags()
+        if locked:
+            note = QWidget()
+            nl = QHBoxLayout(note)
+            nl.setContentsMargins(4, 6, 4, 2)
+            lbl = QLabel(
+                f"🔒 {locked} etiqueta(s) oculta(s) no se muestran: el contenido oculto está bloqueado."
+            )
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color:#8888AA;font-size:11px;")
+            nl.addWidget(lbl, stretch=1)
+            btn_unlock = QPushButton("Desbloquear…")
+            btn_unlock.clicked.connect(self._unlock_hidden)
+            nl.addWidget(btn_unlock)
+            self.grid.addWidget(note)
         self.grid.addStretch()
         self._apply_search(self.search_edit.text())
 
@@ -423,7 +440,16 @@ class TagManagerDialog(QDialog):
         CategoryManagerDialog(self).exec()
         self._refresh()
 
+    def _unlock_hidden(self):
+        if ensure_unlocked(self):
+            self._refresh()
+
     def _export(self):
+        # El archivo incluye lo oculto (nombres y asignaciones): pedir el PIN
+        if privacy.hidden_locked() and not ensure_unlocked(
+            self, "El archivo exportado incluye las etiquetas ocultas y sus fotos."
+        ):
+            return
         default = f"photovault_etiquetas_{datetime.now():%Y-%m-%d}.json"
         path, _ = QFileDialog.getSaveFileName(
             self, "Exportar etiquetas y asignaciones", default, "JSON (*.json)"

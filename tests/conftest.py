@@ -16,6 +16,7 @@ import pytest
 
 import backup
 import database as db
+import privacy
 import thumbnail_cache
 
 
@@ -77,7 +78,12 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "photovault.db")
     monkeypatch.setattr(backup, "BACKUP_DIR", tmp_path / "backups")
     monkeypatch.setattr(thumbnail_cache, "CACHE_DIR", tmp_path / "thumbs")
+    monkeypatch.setattr(thumbnail_cache, "PRIVATE_DIR", tmp_path / "thumbs_private")
+    # PIN: cada test empieza bloqueado; scrypt más liviano (el real tarda ~0,1 s)
+    monkeypatch.setattr(privacy, "KDF_N", 2**10)
+    privacy.lock()
     yield tmp_path
+    privacy.lock()
     # Hilos que una ventana retiró al cerrarse: esperarlos como hace la app al
     # salir (si el proceso termina con uno vivo, Qt lo cierra de golpe)
     workers = sys.modules.get("ui.workers")
