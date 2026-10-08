@@ -6,8 +6,10 @@ IMPORTANTE: ningún test debe tocar la DB real del usuario
 DB_PATH y BACKUP_DIR a un directorio temporal.
 """
 
+import os
 import sqlite3
 import sys
+import traceback
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,57 @@ import pytest
 import backup
 import database as db
 import thumbnail_cache
+
+
+@pytest.fixture(autouse=True)
+def slot_errors(monkeypatch: pytest.MonkeyPatch):
+    """
+    Sin excepthook propio, una excepción en un slot de Qt hace que PyQt6
+    aborte el proceso (0xC0000409) y no se sabe qué test fue. Aquí se juntan
+    y el test falla con el traceback.
+    """
+    errors: list[str] = []
+
+    def hook(exc_type, exc, tb):
+        errors.append("".join(traceback.format_exception(exc_type, exc, tb)))
+
+    if not os.environ.get("PV_NO_SLOT_HOOK"):
+        monkeypatch.setattr(sys, "excepthook", hook)
+    yield errors
+    if errors:
+        pytest.fail("Excepción en un slot de Qt:\n" + "\n".join(errors))
+
+
+@pytest.fixture(autouse=True)
+def no_modal_dialogs(monkeypatch: pytest.MonkeyPatch):
+    """
+    Un QMessageBox de verdad en un test se queda esperando para siempre (nadie
+    lo cierra). Los informativos se aceptan solos; un error, una advertencia o
+    una pregunta que el test no esperaba (no la reemplazó) hacen fallar el test.
+    """
+    if "PyQt6.QtWidgets" not in sys.modules:
+        yield []
+        return
+    from PyQt6.QtWidgets import QMessageBox
+
+    unexpected: list[str] = []
+
+    def record(kind):
+        def show(*args, **_kwargs):
+            texts = [a for a in args if isinstance(a, str)]
+            unexpected.append(f"{kind}: {' / '.join(texts)}")
+            return QMessageBox.StandardButton.No
+
+        return staticmethod(show)
+
+    for kind in ("critical", "warning", "question"):
+        monkeypatch.setattr(QMessageBox, kind, record(kind))
+    monkeypatch.setattr(
+        QMessageBox, "information", staticmethod(lambda *a, **k: QMessageBox.StandardButton.Ok)
+    )
+    yield unexpected
+    if unexpected:
+        pytest.fail("Diálogo inesperado en el test:\n" + "\n".join(unexpected))
 
 
 @pytest.fixture(autouse=True)

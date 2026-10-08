@@ -1,14 +1,15 @@
 """
 PhotoVault - ui/main_window.py
 Ventana principal: sidebar (etiquetas, carpetas, fechas, búsquedas), filtros,
-galería continua y visor. Las acciones sobre la selección están en ui/gallery_actions.py.
+galería continua y visor. Las acciones sobre la selección están en ui/gallery_actions.py
+y las tareas en segundo plano en ui/background.py. Recuerda la sesión y vigila carpetas.
 """
 
 import logging
 from functools import partial
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QByteArray, Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QPixmapCache, QShortcut
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -22,6 +23,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSlider,
+    QStackedWidget,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -41,16 +43,21 @@ from ui.dialogs.settings import SettingsDialog
 from ui.dialogs.stats import StatsDialog
 from ui.dialogs.tags import TagManagerDialog
 from ui.filter_bar import FilterBar
+from ui.folder_watch import FolderWatcher
 from ui.gallery import GalleryDelegate, GalleryModel, GalleryView, format_date, thumb_source_size
 from ui.gallery_actions import GalleryActionsMixin
 from ui.sidebar import FolderTreePanel, SavedSearchPanel, TimelinePanel
 from ui.style import DARK_STYLE
 from ui.tag_panel import TagFilterPanel
+from ui.toast import ToastManager
 from ui.viewer import SHORTCUTS_HELP, ViewerWindow
+from ui.welcome import EmptyState
 from ui.widgets import TaskStatusWidget
 from ui.workers import (
     StoppableThread,
+    TaskWorker,
     disconnect_all,
+    retire_on_destroy,
     retire_thread,
     thumbnail_queue,
     wait_all_threads,
@@ -107,9 +114,13 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
 
         QPixmapCache.setCacheLimit(PIXMAP_CACHE_KB)
 
-        # Tarea en segundo plano (una a la vez): "index" o "thumbs"
+        # Tarea en segundo plano (una a la vez): "index" o "thumbs"; las indexaciones esperan en cola
         self._bg_worker: StoppableThread | None = None
         self._bg_kind: str | None = None
+        self._index_queue = []
+        self._current_index = None
+        self._pending_thumb_ids = []
+        self._closing = False
 
         # Cola de miniaturas de la galería (vive lo que la ventana)
         self._thumb_queue = thumbnail_queue()
@@ -118,10 +129,17 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         # db.init_db() corre antes, en _startup()
         self._build_ui()
         self._build_shortcuts()
+        self.toasts = ToastManager(self, bottom_offset=34)
+        self.watcher = FolderWatcher(self)
+        self._watch_worker: TaskWorker | None = None
+        self._pending_watch_startup: bool | None = None
+        self.watcher.changed.connect(lambda root: self.start_indexing(root, auto=True))
         self.tag_panel.refresh()
         self.folder_panel.refresh()
         self._update_stats()
-        QTimer.singleShot(0, self._apply_query)
+        self._session = services.get_session() if services.is_restore_session_enabled() else {}
+        self._restore_geometry()
+        QTimer.singleShot(0, self._initial_load)
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -151,7 +169,15 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         if sm is not None:
             sm.selectionChanged.connect(self._on_selection_changed)
         self.view.vbar().valueChanged.connect(self._update_position_label)
-        ml.addWidget(self.view, stretch=1)
+        # Sin fotos que mostrar: bienvenida (colección vacía) o "sin resultados"
+        self.empty = EmptyState()
+        self.empty.index_requested.connect(self._open_index_dialog)
+        self.empty.clear_filters_requested.connect(self._clear_filters)
+        self.empty.shortcuts_requested.connect(self.show_shortcuts)
+        self.gallery_stack = QStackedWidget()
+        self.gallery_stack.addWidget(self.view)
+        self.gallery_stack.addWidget(self.empty)
+        ml.addWidget(self.gallery_stack, stretch=1)
         self._set_thumb_size(services.get_thumb_display_size(), save=False)
 
         root.addWidget(main_area, stretch=1)
@@ -402,7 +428,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
             return
         services.save_search(name, q)
         self.saved_panel.refresh()
-        self.task_status.finish(f"💾 Búsqueda «{name}» guardada (pestaña ⭐ Álbum)", hide_after_ms=4000)
+        self.toast(f"💾 Búsqueda «{name}» guardada (pestaña ⭐ Álbum)", "success")
 
     def _toggle_filter_bar(self, visible: bool) -> None:
         self.filter_bar.setVisible(visible)
@@ -430,6 +456,14 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         self._after_model_reset()
 
     def _after_model_reset(self) -> None:
+        if self.model.count():
+            self.gallery_stack.setCurrentWidget(self.view)
+        else:
+            if services.get_totals()[0] == 0:
+                self.empty.show_welcome()
+            else:
+                self.empty.show_no_results()
+            self.gallery_stack.setCurrentWidget(self.empty)
         self._update_count()
         self._update_position_label()
         self._update_filter_button()
@@ -631,8 +665,89 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
         win.setWindowState(Qt.WindowState.WindowMaximized)
         win.exec()
         if isinstance(win, (ReviewWindow, GridReviewWindow)) and (win.yes_count or win.no_count):
-            self.task_status.finish(win.summary(), hide_after_ms=8000)
+            self.toast(win.summary(), "success", ms=8000)
         self._refresh_after_tag_change()
+
+    # ── Avisos, sesión y carpetas vigiladas (fase 8) ──────────────────────────
+
+    def toast(self, text: str, kind: str = "info", ms: int = 4000) -> None:
+        self.toasts.show(text, kind, ms)
+
+    def _restore_geometry(self) -> None:
+        raw = self._session.get("geometry")
+        if isinstance(raw, str) and raw:
+            self.restoreGeometry(QByteArray.fromBase64(raw.encode("ascii")))
+        tab = self._session.get("tab")
+        if isinstance(tab, int) and 0 <= tab < self.tabs.count():
+            self.tabs.setCurrentIndex(tab)
+
+    def _initial_load(self) -> None:
+        """Primera carga: la consulta de la última sesión (si sigue mostrando algo) y su posición."""
+        state = self._session
+        q = services.restorable_query(state)
+        if q is not None:
+            self.apply_gallery_query(q)
+            self.btn_filters.setChecked(
+                bool(state.get("filters_visible")) or bool(q.attribute_filter_count())
+            )
+            row = state.get("row")
+            if isinstance(row, int) and 0 < row < self.model.count():
+                self.view.scroll_to_row(row)
+                self._update_position_label()
+        else:
+            self._apply_query()
+            if isinstance(state.get("query"), dict) and state["query"] != services.GalleryQuery().to_dict():
+                self.toast(
+                    "Los filtros de la última vez ya no muestran ninguna foto (¿disco desconectado?): "
+                    "se abre con toda la colección.",
+                    "warning",
+                    ms=7000,
+                )
+        self.apply_watch_settings(startup=True)
+
+    def session_state(self) -> dict:
+        return {
+            "geometry": bytes(self.saveGeometry().toBase64().data()).decode("ascii"),
+            "query": self._query().to_dict(),
+            "tab": self.tabs.currentIndex(),
+            "filters_visible": self.btn_filters.isChecked(),
+            "row": self.view.first_visible_row() or 0,
+        }
+
+    def apply_watch_settings(self, startup: bool = False) -> None:
+        """
+        Vigilar (o dejar de vigilar) según Configuración; al abrir, revisar las
+        carpetas una vez. Ver qué carpetas existen va en un hilo: con un disco
+        USB dormido cada comprobación espera a que arranque (9 s con la ventana
+        congelada).
+        """
+        if self._watch_worker is not None:
+            self._pending_watch_startup = self._pending_watch_startup or startup
+            return
+        w = TaskWorker(lambda progress_callback=None, should_stop=None: services.available_watched_folders())
+        w.completed.connect(lambda folders, s=startup: self._on_watch_folders(folders, s))
+        self._watch_worker = w
+        w.start()
+        retire_on_destroy(self, w)
+
+    def _on_watch_folders(self, folders: list[str], startup: bool) -> None:
+        retire_thread(self._watch_worker)
+        self._watch_worker = None
+        self.watcher.set_roots(folders if services.is_watch_live() else [])
+        if startup and folders and services.is_watch_on_start():
+            # Unos segundos después de abrir: que la galería aparezca primero
+            QTimer.singleShot(3000, lambda: self.scan_watched_folders(folders))
+        if self._pending_watch_startup is not None:
+            again, self._pending_watch_startup = self._pending_watch_startup, None
+            self.apply_watch_settings(startup=again)
+
+    def scan_watched_folders(self, folders: list[str] | None = None) -> None:
+        for folder in folders if folders is not None else services.available_watched_folders():
+            self.start_indexing(folder, auto=True)
+
+    def _after_auto_index(self) -> None:
+        if services.is_watch_live():
+            self.watcher.set_roots(services.available_watched_folders())  # subcarpetas nuevas
 
     def closeEvent(self, event):
         if self._bg_kind == "index":
@@ -647,9 +762,17 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin):
             ):
                 event.ignore()
                 return
+        self._closing = True
         if self._thumb_save_timer.isActive():
             self._thumb_save_timer.stop()
             self._save_thumb_size()
+        if services.is_restore_session_enabled():
+            services.save_session(self.session_state())
+        self.watcher.stop()
+        if self._watch_worker is not None:
+            disconnect_all(self._watch_worker.completed)
+            retire_thread(self._watch_worker)
+            self._watch_worker = None
         self._retire_background()
         disconnect_all(self._thumb_queue.loaded)
         retire_thread(self._thumb_queue)

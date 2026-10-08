@@ -19,6 +19,7 @@ import hashlib
 import io
 import logging
 import os
+import shutil
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -203,6 +204,12 @@ def purge_orphans(known: list[tuple[str, float | None]]) -> int:
         except OSError as e:
             logger.warning("No se pudo eliminar la miniatura huérfana %s: %s", thumb, e)
     return removed
+
+
+def clear_cache() -> None:
+    """Borra todas las miniaturas (se regeneran solas). Lento con muchas: llamar desde un hilo."""
+    if CACHE_DIR.exists():
+        shutil.rmtree(CACHE_DIR, ignore_errors=True)
 
 
 def cache_size_mb() -> float:

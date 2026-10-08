@@ -119,6 +119,7 @@ class BulkTagDialog(QDialog):
     def __init__(self, photo_ids: list[int], parent=None):
         super().__init__(parent)
         self.photo_ids = photo_ids
+        self.summary = ""  # lo que se hizo, para el aviso de la ventana principal
         self.setWindowTitle(f"Etiquetar {len(photo_ids)} fotos")
         self.setFixedSize(420, 200)
         self.setStyleSheet(DARK_STYLE)
@@ -166,7 +167,7 @@ class BulkTagDialog(QDialog):
         if not name:
             return
         n = services.bulk_add_tag(self.photo_ids, name)
-        QMessageBox.information(self, "Listo", f"Etiqueta '{name}' agregada a {n} fotos.")
+        self.summary = f"🏷 «{name}» agregada a {n:,} foto{'s' if n != 1 else ''}"
         self.accept()
 
     def _remove(self):
@@ -179,5 +180,5 @@ class BulkTagDialog(QDialog):
             QMessageBox.warning(self, "No encontrada", f"La etiqueta '{name}' no existe.")
             return
         n = services.bulk_remove_tag(self.photo_ids, tag.id)
-        QMessageBox.information(self, "Listo", f"Etiqueta '{name}' quitada de {n} fotos.")
+        self.summary = f"🏷 «{name}» quitada de {n:,} foto{'s' if n != 1 else ''}"
         self.accept()

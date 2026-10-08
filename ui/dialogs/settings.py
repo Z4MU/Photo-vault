@@ -1,16 +1,20 @@
 """
 PhotoVault - ui/dialogs/settings.py
-Configuración: caché de miniaturas, sidecars XMP.
+Configuración: al abrir, carpetas vigiladas, caché de miniaturas, sidecars XMP.
 """
 
 import logging
+import os
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -33,14 +37,55 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Configuración")
-        self.setFixedSize(480, 430)
+        self.setFixedSize(520, 720)
         self.setStyleSheet(DARK_STYLE)
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(14)
+        layout.setSpacing(12)
+
+        # ── Al abrir / carpetas vigiladas (fase 8) ────────────────────────
+        layout.addWidget(QLabel("<b>Al abrir</b>"))
+        self.chk_session = QCheckBox("Recordar la ventana, los filtros, el orden y por dónde iba")
+        self.chk_session.setChecked(services.is_restore_session_enabled())
+        layout.addWidget(self.chk_session)
+
+        layout.addWidget(QLabel("<b>Carpetas vigiladas</b>"))
+        watch_info = QLabel(
+            "Las fotos nuevas que aparezcan en estas carpetas se indexan solas. "
+            "Si el disco no está conectado, se saltan sin avisar."
+        )
+        watch_info.setWordWrap(True)
+        watch_info.setStyleSheet("color:#666;font-size:11px;")
+        layout.addWidget(watch_info)
+        self.watch_list = QListWidget()
+        self.watch_list.setFixedHeight(84)
+        for folder in services.get_watched_folders():
+            self.watch_list.addItem(folder)
+        layout.addWidget(self.watch_list)
+        wrow = QHBoxLayout()
+        btn_add = QPushButton("＋  Agregar carpeta…")
+        btn_add.clicked.connect(self._add_watched)
+        btn_remove = QPushButton("✕  Quitar")
+        btn_remove.clicked.connect(self._remove_watched)
+        wrow.addWidget(btn_add)
+        wrow.addWidget(btn_remove)
+        wrow.addStretch()
+        layout.addLayout(wrow)
+        self.chk_watch_start = QCheckBox("Revisarlas al abrir PhotoVault")
+        self.chk_watch_start.setChecked(services.is_watch_on_start())
+        self.chk_watch_live = QCheckBox("Vigilarlas mientras PhotoVault está abierto")
+        self.chk_watch_live.setChecked(services.is_watch_live())
+        layout.addWidget(self.chk_watch_start)
+        layout.addWidget(self.chk_watch_live)
+
+        sep0 = QFrame()
+        sep0.setFrameShape(QFrame.Shape.HLine)
+        sep0.setStyleSheet("color:#2D2D3F;")
+        layout.addWidget(sep0)
+
         layout.addWidget(QLabel("<b>Caché de miniaturas</b>"))
         self.cache_lbl = QLabel()
         self._refresh_cache_label()
@@ -119,14 +164,27 @@ class SettingsDialog(QDialog):
         self.cache_lbl.setText(f"Tamaño del caché: {thumbnail_cache.cache_size_mb()} MB")
 
     def _clear_cache(self):
-        import shutil
-
-        if thumbnail_cache.CACHE_DIR.exists():
-            shutil.rmtree(thumbnail_cache.CACHE_DIR)
-        self._refresh_cache_label()
-        QMessageBox.information(
-            self, "Caché limpiado", "El caché fue eliminado. Se regenerará al navegar la galería."
+        size = thumbnail_cache.cache_size_mb()
+        if (
+            QMessageBox.question(
+                self,
+                "Limpiar caché",
+                f"¿Borrar todas las miniaturas ({size} MB)?\n\n"
+                "No se pierde nada: se vuelven a generar al navegar, pero la galería "
+                "tardará más hasta entonces.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        # En un hilo: con 170.000 miniaturas borrar tarda y antes congelaba la ventana
+        run_with_progress(
+            self,
+            "Limpiar caché",
+            "Borrando miniaturas…",
+            lambda progress_callback=None, should_stop=None: thumbnail_cache.clear_cache(),
         )
+        self._refresh_cache_label()
 
     def _purge_orphans(self):
         n = run_with_progress(
@@ -195,7 +253,32 @@ class SettingsDialog(QDialog):
             f"Asignaciones agregadas: {r.pairs_added:,}",
         )
 
+    def _add_watched(self):
+        folder = QFileDialog.getExistingDirectory(self, "Carpeta a vigilar")
+        if folder:
+            folder = os.path.normpath(folder)
+            if not self.watch_list.findItems(folder, Qt.MatchFlag.MatchExactly):
+                self.watch_list.addItem(folder)
+
+    def _remove_watched(self):
+        for item in self.watch_list.selectedItems():
+            self.watch_list.takeItem(self.watch_list.row(item))
+
+    def watched_folders(self) -> list[str]:
+        return [item.text() for i in range(self.watch_list.count()) if (item := self.watch_list.item(i))]
+
     def _apply(self):
+        services.set_restore_session_enabled(self.chk_session.isChecked())
+        before = services.get_watched_folders()
+        services.set_watched_folders(self.watched_folders())
+        services.set_watch_options(self.chk_watch_start.isChecked(), self.chk_watch_live.isChecked())
+        apply_watch = getattr(self.parent(), "apply_watch_settings", None)
+        if apply_watch is not None:
+            apply_watch()
+        new = [f for f in services.get_watched_folders() if f not in before]
+        scan = getattr(self.parent(), "scan_watched_folders", None)
+        if new and scan is not None:
+            scan([f for f in new if os.path.isdir(f)])  # las recién agregadas se revisan ya
         was_enabled = services.is_xmp_enabled()
         services.set_xmp_enabled(self.chk_xmp.isChecked())
         if self.chk_xmp.isChecked() and not was_enabled:

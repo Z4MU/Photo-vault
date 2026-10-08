@@ -775,6 +775,103 @@ def keymap_conflicts(keymap: dict[str, list[str]], tag_keys: dict[str, int]) -> 
     return problems
 
 
+# ── Sesión de la ventana principal (fase 8) ───────────────────────────────────
+
+SESSION_SETTING = "session_state"
+RESTORE_SESSION_SETTING = "restore_session"
+
+
+def is_restore_session_enabled() -> bool:
+    return db.get_setting(RESTORE_SESSION_SETTING, "1") == "1"
+
+
+def set_restore_session_enabled(enabled: bool) -> None:
+    db.set_setting(RESTORE_SESSION_SETTING, "1" if enabled else "0")
+
+
+def get_session() -> dict:
+    """Lo que se guardó al cerrar: ventana, consulta, pestaña, posición…"""
+    saved = _load_json_setting(SESSION_SETTING)
+    return saved if isinstance(saved, dict) else {}
+
+
+def save_session(state: dict) -> None:
+    db.set_setting(SESSION_SETTING, json.dumps(state, ensure_ascii=False))
+
+
+def restorable_query(state: dict) -> GalleryQuery | None:
+    """La consulta guardada, si hay y si todavía muestra algo (si no, None: se abre con todo)."""
+    raw = state.get("query")
+    if not isinstance(raw, dict):
+        return None
+    q = GalleryQuery.from_dict(raw)
+    if q == GalleryQuery() or count_gallery(q) == 0:
+        return None
+    return q
+
+
+# ── Carpetas vigiladas (fase 8) ───────────────────────────────────────────────
+
+WATCHED_SETTING = "watched_folders"
+WATCH_ON_START_SETTING = "watch_on_start"
+WATCH_LIVE_SETTING = "watch_live"
+MAX_WATCHED_DIRS = 3000  # el Explorador vigila cada carpeta por separado; más que esto no tiene sentido
+
+
+def get_watched_folders() -> list[str]:
+    saved = _load_json_setting(WATCHED_SETTING)
+    return [str(f) for f in saved if str(f).strip()] if isinstance(saved, list) else []
+
+
+def set_watched_folders(folders: list[str]) -> None:
+    clean: list[str] = []
+    for f in folders:
+        f = os.path.normpath(f.strip()) if f.strip() else ""
+        if f and f not in clean:
+            clean.append(f)
+    db.set_setting(WATCHED_SETTING, json.dumps(clean, ensure_ascii=False))
+
+
+def is_watch_on_start() -> bool:
+    return db.get_setting(WATCH_ON_START_SETTING, "1") == "1"
+
+
+def is_watch_live() -> bool:
+    return db.get_setting(WATCH_LIVE_SETTING, "1") == "1"
+
+
+def set_watch_options(on_start: bool, live: bool) -> None:
+    db.set_setting(WATCH_ON_START_SETTING, "1" if on_start else "0")
+    db.set_setting(WATCH_LIVE_SETTING, "1" if live else "0")
+
+
+def available_watched_folders() -> list[str]:
+    """Las vigiladas que existen ahora (un disco desconectado se salta sin avisar)."""
+    return [f for f in get_watched_folders() if os.path.isdir(f)]
+
+
+def watch_dirs(roots: list[str]) -> list[str]:
+    """
+    Carpetas a vigilar: cada raíz y sus subcarpetas ya indexadas (sale de la
+    DB, sin recorrer el disco). Una subcarpeta nueva se detecta porque cambia
+    su carpeta padre; después de indexarla, entra en la lista.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    folders = [f for f, _n in db.get_folder_counts()]
+    for root in roots:
+        norm = os.path.normpath(root)
+        prefix = norm.rstrip("\\/") + os.sep
+        for d in [norm, *[f for f in folders if f.startswith(prefix)]]:
+            if d not in seen and os.path.isdir(d):
+                seen.add(d)
+                out.append(d)
+                if len(out) >= MAX_WATCHED_DIRS:
+                    logger.warning("Demasiadas carpetas para vigilar: solo las primeras %d", MAX_WATCHED_DIRS)
+                    return out
+    return out
+
+
 # ── Recordar la última sesión ─────────────────────────────────────────────────
 
 QUICK_TAG_SETUP_SETTING = "quick_tag_setup"

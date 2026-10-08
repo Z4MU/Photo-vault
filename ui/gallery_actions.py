@@ -51,6 +51,9 @@ class GalleryActionsMixin:
     def _refresh_after_tag_change(self) -> None:
         raise NotImplementedError
 
+    def toast(self, text: str, kind: str = "info", ms: int = 4000) -> None:
+        raise NotImplementedError
+
     def _update_count(self) -> None:
         raise NotImplementedError
 
@@ -112,8 +115,11 @@ class GalleryActionsMixin:
         if not ids:
             QMessageBox.information(self._widget(), "Sin selección", "Selecciona al menos una foto.")
             return
-        if BulkTagDialog(ids, self._widget()).exec():
+        dlg = BulkTagDialog(ids, self._widget())
+        if dlg.exec():
             self._refresh_after_tag_change()
+            if dlg.summary:
+                self.toast(dlg.summary, "success")
 
     def set_rating_selection(self, rating: int) -> None:
         ids = self._target_ids()
@@ -123,9 +129,7 @@ class GalleryActionsMixin:
         services.set_rating(ids, rating)
         self.reload_keep_position()
         stars = "★" * rating if rating else "sin valoración"
-        self.task_status.finish(
-            f"{stars}: {len(ids):,} foto{'s' if len(ids) != 1 else ''}", hide_after_ms=3000
-        )
+        self.toast(f"{stars}: {len(ids):,} foto{'s' if len(ids) != 1 else ''}")
 
     def toggle_favorite_selection(self) -> None:
         ids = self._target_ids()
@@ -134,16 +138,14 @@ class GalleryActionsMixin:
         now = services.toggle_favorite(ids)
         self.reload_keep_position()
         n = f"{len(ids):,} foto{'s' if len(ids) != 1 else ''}"
-        self.task_status.finish(
-            f"♥ Favorita: {n}" if now else f"♡ Ya no es favorita: {n}", hide_after_ms=3000
-        )
+        self.toast(f"♥ Favorita: {n}" if now else f"♡ Ya no es favorita: {n}")
 
     def _copy_selection(self, as_files: bool) -> None:
         photos = self._selected_or_current_photos()
         system.copy_paths([p.path for p in photos], as_files=as_files)
         if photos:
             what = "archivos" if as_files else "rutas"
-            self.task_status.finish(f"📋 {len(photos):,} {what} copiadas al portapapeles", hide_after_ms=3000)
+            self.toast(f"📋 {len(photos):,} {what} copiadas al portapapeles")
 
     def _reveal_current(self) -> None:
         photos = self._selected_or_current_photos(limit=1)
@@ -151,9 +153,7 @@ class GalleryActionsMixin:
             system.reveal_in_explorer(photos[0].path)
 
     def _on_drag_refused(self, n: int) -> None:
-        self.task_status.finish(
-            f"Son {n:,} fotos: para arrastrar a otra app selecciona como máximo 500", hide_after_ms=5000
-        )
+        self.toast(f"Son {n:,} fotos: para arrastrar a otra app selecciona como máximo 500")
 
     def _show_in_timeline(self, photo: Photo) -> None:
         self.tabs.setCurrentWidget(self.timeline_panel)

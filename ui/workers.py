@@ -5,6 +5,7 @@ Hilos (QThread) y utilidades para correr tareas largas sin congelar la UI.
 
 import logging
 import threading
+import time
 import weakref
 from collections import OrderedDict
 from collections.abc import Callable
@@ -101,6 +102,9 @@ def disconnect_all(*signals) -> None:
             pass  # No tenía conexiones
 
 
+PROGRESS_INTERVAL = 0.1  # segundos entre avisos de progreso de la indexación
+
+
 class IndexWorker(StoppableThread):
     progress = pyqtSignal(int, int, str)
     completed = pyqtSignal(object)  # indexer.IndexResult
@@ -110,12 +114,21 @@ class IndexWorker(StoppableThread):
         super().__init__()
         self.folder = folder
         self.force = force
+        self._last_report = 0.0
+
+    def _report(self, current: int, total: int, path: str) -> None:
+        # Una señal por archivo (171.843) saturaba la UI: revisar G:\Fotos tardaba 23 s
+        # en vez de ~2. Como mucho cada PROGRESS_INTERVAL, y siempre el último.
+        now = time.monotonic()
+        if current == total or now - self._last_report >= PROGRESS_INTERVAL:
+            self._last_report = now
+            self.progress.emit(current, total, path)
 
     def run(self):
         try:
             result = indexer.index_folder(
                 self.folder,
-                progress_callback=lambda c, t, p: self.progress.emit(c, t, p),
+                progress_callback=self._report,
                 should_stop=self.is_stopping,
                 force=self.force,
             )
