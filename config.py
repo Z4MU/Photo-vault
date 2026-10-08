@@ -10,7 +10,7 @@ los tests puedan redirigirlas con monkeypatch. Cambia el valor aquí, no allá.
 from pathlib import Path
 
 APP_NAME = "PhotoVault"
-APP_VERSION = "2.4.0"
+APP_VERSION = "3.0.0"
 
 # ── Datos del usuario (fuera del repo) ────────────────────────────────────────
 DATA_DIR = Path.home() / ".photovault"
@@ -18,6 +18,9 @@ DB_PATH = DATA_DIR / "photovault.db"
 THUMBS_DIR = DATA_DIR / "thumbs"
 # Miniaturas de las fotos ocultas, cifradas (fase 9)
 PRIVATE_THUMBS_DIR = DATA_DIR / "thumbs_private"
+# Modelos de IA local (fase 10; descarga aparte) y sus resultados (regenerables)
+MODELS_DIR = DATA_DIR / "models"
+EMBEDDINGS_DB = DATA_DIR / "embeddings.db"
 BACKUP_DIR = DATA_DIR / "backups"
 LOG_DIR = DATA_DIR / "logs"
 

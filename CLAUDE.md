@@ -30,6 +30,7 @@ PhotoVault es una app de escritorio (Windows) para **indexar, navegar, etiquetar
 | **opencv-python** | Duración/dimensiones de video y frame para miniatura |
 | **pillow-heif** | Soporte `.heic` / `.heif` (la colección tiene muchos). Se registra con `try/import`; si faltara, los HEIC se indexan sin miniatura |
 | **Send2Trash** | Mandar archivos a la Papelera de reciclaje (duplicados). Nunca usar `unlink` sobre fotos del usuario |
+| **onnxruntime** + **tokenizers** + **numpy** | Búsqueda por contenido (CLIP, fase 10) y hash perceptual. Los modelos **no** van en el `.exe`: se descargan desde Configuración → IA |
 | **cryptography** | AES-GCM para la clave del PIN y las miniaturas del contenido oculto (fase 9). PyInstaller lo incluye solo (hook de `pyinstaller-hooks-contrib`) |
 | **PyInstaller** | Empaquetado a `PhotoVault.exe` |
 | **pytest / ruff / mypy** | Desarrollo (`requirements-dev.txt`, config en `pyproject.toml`) |
@@ -38,6 +39,8 @@ Datos del usuario (fuera del repo, nunca commitear):
 - `~/.photovault/photovault.db` — base de datos (~33 MB)
 - `~/.photovault/thumbs/<2 chars>/<sha1>.jpg` — caché de miniaturas
 - `~/.photovault/thumbs_private/<2 chars>/<hmac>.pvt` — miniaturas cifradas de las fotos ocultas (fase 9)
+- `~/.photovault/models/clip-b32-multilingual-v1/` — modelo CLIP descargado (~217 MB, fase 10)
+- `~/.photovault/embeddings.db` — vector CLIP de cada foto (~1 KB por foto; aparte para no inflar la DB ni los backups; regenerable)
 - `~/.photovault/backups/` — copias de seguridad automáticas (§6)
 - `~/.photovault/logs/photovault.log` — log rotativo (§7)
 
@@ -52,6 +55,8 @@ services.py         Lógica de negocio. La UI SOLO habla con esta capa (y con pr
 privacy.py          Contenido oculto: PIN, desbloqueo, código de recuperación, cifrado (capa de servicios)
 smart.py            Inteligencia local (capa de servicios): etiquetas sugeridas por carpeta, fotos parecidas
 similarity.py       pHash de 64 bits y búsqueda de parecidas (numpy; sin Qt ni DB)
+clip_model.py       Modelo CLIP local: descarga verificada (SHA-256, revisión fija), imagen/texto → vector
+embedding_store.py  Vectores CLIP en ~/.photovault/embeddings.db (SQLite aparte)
 database.py         Acceso a SQLite: conexiones, migraciones versionadas, queries
 models.py           Dataclasses tipadas + enums de ordenamiento
 indexer.py          Escaneo de carpetas, extracción de fecha/dimensiones/duración
@@ -78,6 +83,7 @@ ui/
   main_window.py        MainWindow (sesión, avisos, carpetas vigiladas)
   privacy_actions.py    PrivacyMixin: mostrar/bloquear lo oculto, bloqueo automático, modo pánico
   privacy_guard.py      PrivacyGuard: filtro de eventos de la app (tecla de pánico, inactividad)
+  content_search.py     ContentSearchMixin: botón 🧠 del buscador y "Parecidas por contenido"
   background.py         BackgroundTasksMixin: indexar (con cola) y generar miniaturas en segundo plano
   toast.py              ToastManager: avisos breves abajo a la derecha
   welcome.py            EmptyState: bienvenida (colección vacía) y "sin resultados"
@@ -92,6 +98,7 @@ ui/
     keymap.py           KeymapDialog + bind_keys / display_keys / normalize_key
     settings.py         SettingsDialog (pestañas General / Miniaturas y .xmp / Privacidad)
     privacy.py          PinDialog, NewPinDialog, RecoveryCodeDialog, ensure_unlocked, PrivacySettingsPanel
+    ai_settings.py      AiSettingsPanel (pestaña IA: descargar modelo, analizar, borrar análisis)
     tags.py             CategoryManagerDialog, EditTagDialog, TagManagerDialog
     folders.py          IndexDialog, DeindexDialog, RelocateDialog, TrashDialog
 tests/              Suite de pytest (conftest.py aísla DB, backups y caché en tmp)
@@ -399,6 +406,11 @@ Pestañas **🏷 Etiq.** (`TagFilterPanel`: cada etiqueta es un `TagFilterButton
 ### Inteligencia local (fase 10)
 - **Etiquetas sugeridas** (`smart.suggest_tags(ids)`): por la parte de la carpeta que tiene cada etiqueta (≥ `MIN_SHARE` 20 % y ≥ 2 fotos; la carpeta de arriba pesa `PARENT_WEIGHT` 0,5) y por el nombre de la carpeta (palabras completas, sin acentos: «Cancún» → «cancun»; 0,9). No sugiere las que ya tienen todas (`db.get_common_tag_ids`) ni las ocultas bloqueadas. Se muestran en `TagEditor` (visor; un clic la agrega) y en `BulkTagDialog` (un clic la elige). ~3 ms por foto con la DB real.
 - **Parecidas** (`smart.find_similar_photos(sensibilidad)`, en un `TaskWorker` desde `DuplicatesDialog` → *Parecidas*): calcula el pHash que falte desde la miniatura de 200 px (si falta, la genera: la primera vez lee los originales) y agrupa con `similarity.find_similar` (bandas + palomar, 1,5 s para 174k). Sensibilidad = bits distintos: estricta 3, normal 6, amplia 8. No repite grupos de idénticas (mismo md5) ni incluye lo oculto bloqueado. `DuplicateGroup.similar` / `.best` (★ mejor calidad = más píxeles).
+- **Búsqueda por contenido (#55):** `clip_model` (CLIP ViT-B/32 de OpenAI para imagen + `clip-ViT-B-32-multilingual-v1` para texto: busca en español). `smart.analyze_photos` (tarea `"content"` de `BackgroundTasksMixin`, cancelable e incremental por `mtime`): lee el original reducido con `draft` (videos: su miniatura de 480), procesa en tandas de 16 mientras los hilos leen la siguiente; un archivo ilegible queda con vector nulo (no se reintenta). 37 ms por foto con la colección real (≈ 1,8 h para 172k la primera vez); buscar entre 172k: ~0,25 s, 176 MB en memoria. Tras indexar fotos nuevas se analizan solas (`ai_auto_analyze`).
+- `GalleryQuery.semantic`: texto, `@foto:<id>`, `@etiqueta:<id>` o `@adulto` → `smart.semantic_ranking()` (ids de más a menos parecido, con caché por versión del almacén) → `PhotoFilter.only_ids` (un parámetro JSON con `json_each`) y `services.get_gallery_ids/chunk` reordenan por parecido (el orden elegido no se usa; los combos se deshabilitan). Así funciona con todos los filtros, búsquedas guardadas, la sesión y el etiquetado rápido.
+- Umbrales medidos con 3.000 fotos reales: texto-foto está muy comprimido (mediana ~0,22, relevante ~0,28) → aparece lo que supera media + `TEXT_MIN_Z` (2,5) desviaciones, hasta 1.000; foto-foto ≥ 0,83 (el 99 % de los pares al azar < 0,81).
+- **Etiquetas por contenido (#56):** con ≥ `TAG_MIN_EXAMPLES` (5) fotos analizadas, cada etiqueta tiene su promedio y su propio umbral (percentil 25 del parecido de sus fotos) → `content_tag_suggestions` en el visor, junto a las de carpeta. En el etiquetado rápido, **Orden: 🧠 primero las más parecidas a la etiqueta** (`@etiqueta:<id>`) o **las que parecen contenido adulto** (`@adulto`: prompts adulto − normal, sin corte: el límite no es claro con dibujos, se revisa de la más probable a la menos). Para ocultarlas: etiqueta + PIN (fase 9).
+- Tests: `FakeClip` (color → vector); `PV_CLIP_MODELS=<carpeta con clip-b32-multilingual-v1>` activa el test con el modelo real. `conftest` redirige `embedding_store.DB_PATH` y `clip_model.MODELS_DIR` y limpia los cachés de `smart`.
 - Lecciones con la colección real: dHash encadenaba capturas de pantalla y fondos lisos → pHash (DCT) + las imágenes casi lisas no se comparan (`FLAT`) + grupos alrededor de un centro (sin cadenas A~B~C).
 - `clear_layout` ahora vacía también los layouts anidados (filas de botones).
 

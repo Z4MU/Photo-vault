@@ -1,6 +1,6 @@
 [project]
 name = "photovault"
-version = "2.4.0"
+version = "3.0.0"
 description = "Indexar, navegar, etiquetar y filtrar colecciones grandes de fotos y videos"
 requires-python = ">=3.12"
 

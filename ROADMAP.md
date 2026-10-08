@@ -253,15 +253,15 @@ Medido con una copia de la DB real (171.843 fotos); migración a v5: 0,5 s.*
 
 ---
 
-## Fase 10 — Inteligencia local → v3.0
+## Fase 10 — Inteligencia local → v3.0 ✅ (sin OCR ni caras)
 *Usar ONNX Runtime en vez de PyTorch; modelos como descarga aparte para no inflar el `.exe`.*
 
 - [x] #60 [B] Sugerir tags por carpeta: por lo que tiene el resto de la carpeta (y la de arriba) y por su nombre; en el visor y en *Etiquetar selección* (~3 ms por foto)
 - [x] #59 [M] Casi-duplicados con hash perceptual (pHash + bandas): *Duplicados → Parecidas*, 3 sensibilidades, ★ mejor calidad. Agrupar 174k hashes: 1,5 s. La primera vez hay que leer cada original (≈ 54 ms/foto desde el USB: ~2,5 h para 172k; cancelable y se retoma)
-- [ ] #55 ⭐ [A] Búsqueda semántica con CLIP
-- [ ] #56 [A] Sugerencia automática de tags + detector NSFW
-- [ ] #58 [M] OCR en capturas de pantalla
-- [ ] #57 [A] Caras y personas
+- [x] #55 ⭐ [A] Búsqueda por contenido con CLIP multilingüe (en español), botón 🧠 del buscador; "Parecidas por contenido" desde el menú de una foto. Modelo como descarga aparte (217 MB, verificado). Analizar: 37 ms por foto (≈ 1,8 h para 172k la primera vez); buscar: ~0,25 s
+- [x] #56 [A] Etiquetas sugeridas por contenido (con 5+ fotos de ejemplo) y etiquetado rápido ordenado por parecido con la etiqueta o por "parece contenido adulto" (CLIP zero-shot)
+- [ ] #58 [M] OCR en capturas de pantalla *(pospuesto: el usuario eligió no hacerlo en esta fase)*
+- [ ] #57 [A] Caras y personas *(pospuesto)*
 
 ---
 
