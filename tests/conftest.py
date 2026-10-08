@@ -15,8 +15,11 @@ from pathlib import Path
 import pytest
 
 import backup
+import clip_model
 import database as db
+import embedding_store
 import privacy
+import smart
 import thumbnail_cache
 
 
@@ -82,6 +85,14 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     # PIN: cada test empieza bloqueado; scrypt más liviano (el real tarda ~0,1 s)
     monkeypatch.setattr(privacy, "KDF_N", 2**10)
     privacy.lock()
+    # IA (fase 10): vectores y modelos también en tmp; cachés en memoria limpios
+    monkeypatch.setattr(embedding_store, "DB_PATH", tmp_path / "embeddings.db")
+    monkeypatch.setattr(clip_model, "MODELS_DIR", tmp_path / "models")
+    clip_model.unload()
+    monkeypatch.setattr(smart, "_matrix", None)
+    monkeypatch.setattr(smart, "_centroids", None)
+    smart._ranking_cache.clear()
+    smart._text_cache.clear()
     yield tmp_path
     privacy.lock()
     # Hilos que una ventana retiró al cerrarse: esperarlos como hace la app al

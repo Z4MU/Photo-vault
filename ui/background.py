@@ -1,7 +1,8 @@
 """
 PhotoVault - ui/background.py
-Tareas en segundo plano de la ventana principal (una a la vez): indexar y
-generar miniaturas, con progreso y Cancelar en la barra de estado. Las
+Tareas en segundo plano de la ventana principal (una a la vez): indexar,
+generar miniaturas y analizar el contenido (CLIP, fase 10), con progreso y
+Cancelar en la barra de estado. Las
 indexaciones que llegan mientras hay otra en curso (carpetas vigiladas,
 o el usuario) esperan en una cola. MainWindow las hereda.
 """
@@ -16,6 +17,7 @@ from PyQt6.QtWidgets import QMessageBox, QWidget
 
 import indexer
 import services
+import smart
 from ui.widgets import TaskStatusWidget
 from ui.workers import IndexWorker, StoppableThread, TaskWorker, disconnect_all, retire_thread
 
@@ -38,6 +40,7 @@ class BackgroundTasksMixin:
     _index_queue: list[IndexRequest]
     _current_index: IndexRequest | None
     _pending_thumb_ids: list[int]
+    _auto_analyze_pending: bool = False  # hubo fotos nuevas: analizarlas después de las miniaturas
     _closing: bool  # la ventana se está cerrando: no empezar nada ni reaccionar a avisos tardíos
 
     def _reload_all(self) -> None:
@@ -89,7 +92,7 @@ class BackgroundTasksMixin:
                 if not auto:
                     self.toast(f"Se indexará {folder} cuando termine la indexación en curso.")
             return
-        if self._bg_kind == "thumbs":
+        if self._bg_kind in ("thumbs", "content"):
             self._retire_background()  # La indexación tiene prioridad
         w = IndexWorker(folder, force=force)
         w.progress.connect(self._on_index_progress)
@@ -132,6 +135,8 @@ class BackgroundTasksMixin:
         if req is not None and req.auto:
             self._after_auto_index()
         self._pending_thumb_ids.extend(result.new_ids)
+        if result.added or result.updated:
+            self._auto_analyze_pending = True
         if self._index_queue:
             nxt = self._index_queue.pop(0)
             self.start_indexing(nxt.folder, nxt.force, nxt.auto)
@@ -139,6 +144,8 @@ class BackgroundTasksMixin:
             # Las miniaturas de lo nuevo se generan ya, sin esperar a que se vean
             ids, self._pending_thumb_ids = self._pending_thumb_ids, []
             self.start_thumbnail_generation(ids)
+        else:
+            self._maybe_auto_analyze()
 
     def start_thumbnail_generation(self, photo_ids: list[int] | None = None) -> bool:
         """Genera miniaturas en segundo plano (None = toda la colección). False si hay otra tarea."""
@@ -164,6 +171,41 @@ class BackgroundTasksMixin:
         if r.failed:
             txt += f", {r.failed:,} no se pudieron generar"
         self.task_status.finish(txt)
+        self._maybe_auto_analyze()
+
+    # ── Análisis de contenido (fase 10) ───────────────────────────────────────
+
+    def _maybe_auto_analyze(self) -> None:
+        """Después de indexar fotos nuevas (y generar sus miniaturas), si está activado."""
+        if self._auto_analyze_pending and smart.is_auto_analyze() and smart.content_model_installed():
+            self._auto_analyze_pending = False
+            self.start_content_analysis(auto=True)
+
+    def start_content_analysis(self, auto: bool = False) -> bool:
+        """Analiza en segundo plano las fotos que falten. False si hay otra tarea o no hay modelo."""
+        if self._bg_worker is not None or self._closing or not smart.content_model_installed():
+            return False
+        w = TaskWorker(smart.analyze_photos)
+        w.progress.connect(self._on_content_progress)
+        w.completed.connect(lambda n, a=auto: self._on_content_completed(n, a))
+        w.error.connect(self._on_background_error)
+        self._bg_worker, self._bg_kind = w, "content"
+        self.task_status.start("Preparando el análisis de contenido…")
+        w.start()
+        return True
+
+    def _on_content_progress(self, current: int, total: int) -> None:
+        self.task_status.set_progress(current, total, f"🧠 Analizando contenido [{current:,}/{total:,}]")
+
+    def _on_content_completed(self, n: int, auto: bool) -> None:
+        if self._closing:
+            return
+        self._release_background()
+        done, total = smart.analysis_status()
+        txt = f"🧠 Contenido: {n:,} fotos analizadas ({done:,} de {total:,} en total)"
+        self.task_status.finish(txt, hide_after_ms=2500)
+        if n and not auto:
+            self.toast(txt, "success", ms=6000)
 
     def _on_background_error(self, message: str) -> None:
         if self._closing:

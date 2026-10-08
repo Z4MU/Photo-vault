@@ -1,7 +1,8 @@
 """
 PhotoVault - ui/dialogs/settings.py
 Configuración en pestañas: General (al abrir, carpetas vigiladas), Miniaturas
-(caché, sidecars XMP) y Privacidad (PIN, bloqueo, modo pánico; ui/dialogs/privacy.py).
+(caché, sidecars XMP), Privacidad (PIN, bloqueo, modo pánico; ui/dialogs/privacy.py)
+e IA (búsqueda por contenido; ui/dialogs/ai_settings.py).
 """
 
 import logging
@@ -25,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 import services
 import thumbnail_cache
+from ui.dialogs.ai_settings import AiSettingsPanel
 from ui.dialogs.privacy import PrivacySettingsPanel
 from ui.style import DARK_STYLE
 from ui.workers import (
@@ -166,6 +168,8 @@ class SettingsDialog(QDialog):
         # ── Privacidad (fase 9) ───────────────────────────────────────────
         self.privacy_panel = PrivacySettingsPanel()
         self.tabs.addTab(self.privacy_panel, "🔒 Privacidad")
+        self.ai_panel = AiSettingsPanel(self.parent())
+        self.tabs.addTab(self.ai_panel, "🧠 IA")
 
         btn_row = QHBoxLayout()
         btn_cancel = QPushButton("Cancelar")
@@ -290,6 +294,7 @@ class SettingsDialog(QDialog):
             self.tabs.setCurrentWidget(self.privacy_panel)
             return
         self.privacy_panel.apply()
+        self.ai_panel.apply()
         apply_privacy = getattr(self.parent(), "apply_privacy_options", None)
         if apply_privacy is not None:
             apply_privacy()

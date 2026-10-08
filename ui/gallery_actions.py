@@ -6,6 +6,7 @@ en el Explorador, etiquetar, valorar y favoritas. MainWindow las hereda.
 
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +14,7 @@ from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QMenu, QMessageBox, QPushButton, QTabWidget, QWidget
 
 import services
+import smart
 from models import Photo
 from ui import system
 from ui.dialogs.photo import BulkTagDialog
@@ -35,6 +37,9 @@ class GalleryActionsMixin:
     btn_bulk_tag: QPushButton
     tabs: QTabWidget
     timeline_panel: TimelinePanel
+    # Solo anotación (no un método que lance): la implementa ContentSearchMixin, que va
+    # después en la herencia de MainWindow y quedaría tapada
+    show_similar_content: Callable[[Photo], None]
 
     def open_viewer(self, row: int) -> None:
         raise NotImplementedError
@@ -190,6 +195,8 @@ class GalleryActionsMixin:
         fav_text = "♡  Quitar de favoritas\tF" if photo.favorite and n <= 1 else "♥  Marcar como favorita\tF"
         menu.addAction(fav_text, self.toggle_favorite_selection)
         menu.addSeparator()
+        if smart.content_model_installed():
+            menu.addAction("🧠  Parecidas por contenido", lambda: self.show_similar_content(photo))
         folder = os.path.dirname(photo.path)
         menu.addAction(
             f"📁  Ver solo la carpeta «{Path(folder).name or folder}»", lambda: self.set_folder_filter(folder)

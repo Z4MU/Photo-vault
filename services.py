@@ -145,6 +145,9 @@ class GalleryQuery:
     # Revisión por etiqueta (fase 7): sin / con un "no" para esa etiqueta
     not_rejected_for: int | None = None
     rejected_for: int | None = None
+    # Búsqueda por contenido (fase 10): texto ("perro en la playa") o "@foto:<id>",
+    # "@etiqueta:<id>", "@adulto" (smart.semantic_ranking). Ordena por parecido.
+    semantic: str | None = None
 
     def photo_filter(self) -> db.PhotoFilter:
         desc = tag_descendants()
@@ -176,6 +179,7 @@ class GalleryQuery:
             has_note=self.has_note,
             not_rejected_for=self.not_rejected_for,
             rejected_for=self.rejected_for,
+            only_ids=tuple(_semantic_ids(self.semantic)) if self.semantic else None,
         )
 
     def attribute_filter_count(self) -> int:
@@ -215,17 +219,33 @@ class GalleryQuery:
         return cls(**data)
 
 
+def _semantic_ids(semantic: str) -> list[int]:
+    """Ids ordenados por parecido (lo más parecido primero). Ver smart.semantic_ranking."""
+    import smart  # aquí: smart importa services
+
+    return smart.semantic_ranking(semantic)
+
+
 def count_gallery(q: GalleryQuery) -> int:
     return db.count_filtered(q.photo_filter())
 
 
 def get_gallery_chunk(q: GalleryQuery, offset: int, limit: int) -> list[Photo]:
     """Un tramo de la galería (la vista virtualizada pide los que se ven)."""
+    if q.semantic:
+        ids = get_gallery_ids(q, offset, limit)
+        by_id = {p.id: p for p in db.get_photos_by_ids(ids)}
+        return [by_id[i] for i in ids if i in by_id]
     return db.query_photos(q.photo_filter(), q.sort_field, q.sort_order, limit=limit, offset=offset)
 
 
 def get_gallery_ids(q: GalleryQuery, offset: int = 0, limit: int = -1) -> list[int]:
     """Ids de un tramo (o de todo) sin cargar las fotos: selecciones de miles de fotos."""
+    if q.semantic:
+        # Por contenido el orden es el de parecido, no el de la columna elegida
+        allowed = set(db.get_photo_ids(q.photo_filter(), q.sort_field, q.sort_order))
+        ranked = [i for i in _semantic_ids(q.semantic) if i in allowed]
+        return ranked[offset:] if limit < 0 else ranked[offset : offset + limit]
     return db.get_photo_ids(q.photo_filter(), q.sort_field, q.sort_order, limit=limit, offset=offset)
 
 
@@ -237,6 +257,8 @@ def gallery_row_of_date(q: GalleryQuery, year: int | None, month: int | None = N
     Fila de la primera foto de ese año/mes (solo con orden por fecha).
     month=None: el año completo; month=NO_MONTH: las de ese año sin mes.
     """
+    if q.semantic:
+        return 0  # ordenadas por parecido: no hay orden por fecha
     if q.sort_field != SortField.DATE:
         raise ValueError("Saltar a una fecha requiere ordenar por fecha")
     return db.count_before_date(q.photo_filter(), year, month, q.sort_order)

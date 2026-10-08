@@ -36,6 +36,7 @@ import privacy
 import services
 from models import SortField, SortOrder
 from ui.background import BackgroundTasksMixin
+from ui.content_search import SEARCH_PLACEHOLDER, ContentSearchMixin
 from ui.dialogs.duplicates import DuplicatesDialog
 from ui.dialogs.folders import DeindexDialog, IndexDialog
 from ui.dialogs.quick_tag import QuickTagWindow
@@ -93,7 +94,7 @@ GALLERY_SHORTCUTS_HELP = [
 ]
 
 
-class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, PrivacyMixin):
+class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, PrivacyMixin, ContentSearchMixin):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoVault")
@@ -275,8 +276,14 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         box = QVBoxLayout()
         box.setSpacing(6)
         top_bar = QHBoxLayout()
+        self.btn_semantic = QPushButton("🧠")
+        self.btn_semantic.setCheckable(True)
+        self.btn_semantic.setFixedWidth(36)
+        self.btn_semantic.setToolTip("Buscar por lo que se ve en la foto (búsqueda por contenido)")
+        self.btn_semantic.setStyleSheet("QPushButton:checked{background:#4AFF9E22;border-color:#4AFF9E;}")
+        top_bar.addWidget(self.btn_semantic)
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("🔍 Buscar por nombre o nota…  (Ctrl+F)")
+        self.search_edit.setPlaceholderText(SEARCH_PLACEHOLDER)
         self.search_edit.textChanged.connect(lambda _text: self._search_timer.start())
         self.search_edit.returnPressed.connect(self._on_search)  # Enter: buscar ya
         top_bar.addWidget(self.search_edit, stretch=1)
@@ -344,6 +351,15 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         self.folder_chip.clicked.connect(lambda: self.set_folder_filter(None))
         self.folder_chip.setVisible(False)
         info_bar.addWidget(self.folder_chip)
+        self.semantic_chip = QPushButton("")
+        self.semantic_chip.setToolTip("Quitar la búsqueda por contenido")
+        self.semantic_chip.setStyleSheet(
+            "QPushButton{background:#4AFF9E22;color:#4AFF9E;border:1px solid #4AFF9E;"
+            "border-radius:10px;padding:1px 10px;font-size:11px;}"
+        )
+        self.semantic_chip.clicked.connect(lambda: self.set_semantic_special(None))
+        self.semantic_chip.setVisible(False)
+        info_bar.addWidget(self.semantic_chip)
         info_bar.addStretch()
         self.position_lbl = QLabel("")
         self.position_lbl.setStyleSheet("color:#8888AA;font-size:11px;")
@@ -372,6 +388,8 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         }
         for key, slot in window_keys.items():
             QShortcut(QKeySequence(key), self, slot)
+        # Al final: el toggle puede abrir diálogos y recargar
+        self.btn_semantic.toggled.connect(self._on_semantic_toggled)
         # Estas solo con la galería enfocada (Ctrl+C en el buscador copia texto)
         gallery_keys = {
             "Ctrl+T": self._open_bulk_tag,
@@ -392,7 +410,8 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
             tag_ids=tuple(self.tag_panel.included_ids()),
             exclude_tag_ids=tuple(self.tag_panel.excluded_ids()),
             match_any=self.tag_panel.match_any(),
-            search=self.search_edit.text().strip() or None,
+            search=self.name_search_text(),
+            semantic=self.semantic_text(),
             folder=self._folder,
             sort_field=self._sort_field,
             sort_order=self._sort_order,
@@ -405,8 +424,10 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         self.filter_bar.set_values(q)
         if q.attribute_filter_count():
             self.btn_filters.setChecked(True)
+        self._restore_semantic(q.semantic)
         self.search_edit.blockSignals(True)
-        self.search_edit.setText(q.search or "")
+        plain_semantic = q.semantic if q.semantic and not q.semantic.startswith("@") else None
+        self.search_edit.setText(plain_semantic or q.search or "")
         self.search_edit.blockSignals(False)
         for combo, value in ((self.sort_field_combo, q.sort_field), (self.sort_order_combo, q.sort_order)):
             combo.blockSignals(True)
@@ -479,6 +500,8 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
     def _update_count(self) -> None:
         n_sel = self.view.selected_count()
         txt = f"{self.model.count():,} fotos"
+        if self.model.query().semantic:
+            txt += "  ·  🧠 por parecido"
         if n_sel:
             txt += f"  ·  {n_sel:,} seleccionadas"
         self.count_lbl.setText(txt)
@@ -518,6 +541,9 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         self.search_edit.blockSignals(True)
         self.search_edit.clear()
         self.search_edit.blockSignals(False)
+        self._semantic_special = None
+        self.semantic_chip.setVisible(False)
+        self._update_sort_enabled()
         self.set_folder_filter(None)
 
     def _on_search(self) -> None:
@@ -647,8 +673,14 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
             self._refresh_after_tag_change()
 
     def _open_settings_dialog(self):
+        self.open_settings()
+
+    def open_settings(self, tab: str | None = None) -> None:
         before = self._privacy_state()
-        SettingsDialog(self).exec()
+        dlg = SettingsDialog(self)
+        if tab == "ai":
+            dlg.tabs.setCurrentWidget(dlg.ai_panel)
+        dlg.exec()
         if self._privacy_state() != before:
             self.privacy_changed()
 

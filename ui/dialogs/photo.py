@@ -29,6 +29,17 @@ logger = logging.getLogger(__name__)
 SUGGESTIONS_PER_ROW = 3
 
 
+def _merge(*lists: list[smart.TagSuggestion], limit: int = 6) -> list[smart.TagSuggestion]:
+    """Sugerencias de varias fuentes (carpeta, contenido) sin repetir etiquetas."""
+    seen: set[int] = set()
+    out = []
+    for s in (s for lst in lists for s in lst):
+        if s.tag.id not in seen:
+            seen.add(s.tag.id)
+            out.append(s)
+    return out[:limit]
+
+
 def suggestion_rows(suggestions: list[smart.TagSuggestion], on_click) -> list[QHBoxLayout]:
     """Botones "＋ etiqueta" de las sugerencias, en filas (el panel del visor es angosto)."""
     rows: list[QHBoxLayout] = []
@@ -120,7 +131,10 @@ class TagEditor(QWidget):
 
     def _reload_suggestions(self) -> None:
         clear_layout(self.sugg_layout)
-        suggestions = smart.suggest_tags([self.photo_id], limit=6) if self.photo_id is not None else []
+        suggestions = _merge(
+            smart.suggest_tags([self.photo_id], limit=6) if self.photo_id is not None else [],
+            smart.content_tag_suggestions(self.photo_id) if self.photo_id is not None else [],
+        )
         self.sugg_container.setVisible(bool(suggestions))
         if not suggestions:
             return

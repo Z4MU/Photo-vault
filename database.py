@@ -657,6 +657,8 @@ class PhotoFilter:
     # Fase 7 ─ revisión por etiqueta
     not_rejected_for: int | None = None  # sin un "no" para esta etiqueta
     rejected_for: int | None = None  # con un "no" para esta etiqueta
+    # Fase 10 ─ solo estas fotos (resultado de una búsqueda por contenido)
+    only_ids: tuple[int, ...] | None = None
 
 
 def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
@@ -729,6 +731,10 @@ def _build_where(f: PhotoFilter) -> tuple[str, list[object]]:
     if f.rejected_for is not None:
         clauses.append("p.id IN (SELECT photo_id FROM tag_rejections WHERE tag_id = ?)")
         params.append(f.rejected_for)
+    if f.only_ids is not None:
+        # Un solo parámetro JSON: pueden ser miles de ids (límite de parámetros de SQLite)
+        clauses.append("p.id IN (SELECT value FROM json_each(?))")
+        params.append(json.dumps(list(f.only_ids)))
     if f.has_note:
         clauses.append("p.note IS NOT NULL AND p.note != ''")
 
@@ -1384,6 +1390,14 @@ def get_rejected_ids(tag_id: int, photo_ids: list[int]) -> set[int]:
             )
         )
     return out
+
+
+def get_photo_tag_pairs() -> list[tuple[int, int]]:
+    """Todas las asignaciones [(photo_id, tag_id)], ordenadas."""
+    return [
+        (r[0], r[1])
+        for r in get_connection().execute("SELECT photo_id, tag_id FROM photo_tags ORDER BY 1, 2")
+    ]
 
 
 def get_ids_with_tag(tag_id: int, photo_ids: list[int]) -> set[int]:

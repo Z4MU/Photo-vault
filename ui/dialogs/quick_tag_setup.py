@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
 )
 
 import services
+import smart
 from services import GalleryQuery
 from ui.dialogs.keymap import KeymapDialog
 from ui.dialogs.review import GRID_SIZES
@@ -43,6 +44,13 @@ MODES = [
 ]
 
 
+ORDERS = [
+    ("normal", "Normal (por fecha)"),
+    ("tag", "🧠 Primero las que más se parecen a la etiqueta"),
+    ("adult", "🧠 Primero las que parecen contenido adulto"),
+]
+
+
 class QuickTagSetupDialog(QDialog):
     """Al aceptar: `mode`, `tag_id`, `query` (lo que se va a recorrer) y `grid_size`."""
 
@@ -55,6 +63,8 @@ class QuickTagSetupDialog(QDialog):
         self.tag_id: int | None = None
         self.query = GalleryQuery()
         self.grid_size = 12
+        # Orden por parecido: solo con el modelo y fotos analizadas (fase 10)
+        self._content_ready = smart.content_model_installed() and smart.analysis_status()[0] > 0
         self._scopes: list[tuple[str, str, GalleryQuery]] = [("all", "Toda la colección", GalleryQuery())]
         if gallery_query is not None:
             self._scopes.append(
@@ -132,6 +142,19 @@ class QuickTagSetupDialog(QDialog):
         )
         self.chk_reviewed.toggled.connect(self._refresh)
         sl.addWidget(self.chk_reviewed)
+        # Orden por parecido (fase 10): las que más probablemente sean «sí», primero
+        orow = QHBoxLayout()
+        self.order_lbl = QLabel("Orden:")
+        orow.addWidget(self.order_lbl)
+        self.order_combo = QComboBox()
+        for key, label in ORDERS:
+            self.order_combo.addItem(label, key)
+        self.order_combo.setToolTip(
+            "Con 🧠 aparecen primero las fotos que más se parecen (por contenido). "
+            "Solo incluye las fotos ya analizadas (Configuración → IA)."
+        )
+        orow.addWidget(self.order_combo, stretch=1)
+        sl.addLayout(orow)
         grow = QHBoxLayout()
         self.grid_lbl = QLabel("Fotos por página:")
         grow.addWidget(self.grid_lbl)
@@ -166,6 +189,7 @@ class QuickTagSetupDialog(QDialog):
         # Al final: conectar antes dispararía _refresh con la ventana a medio construir
         for rb in self.mode_buttons.values():
             rb.toggled.connect(self._refresh)
+        self.order_combo.currentIndexChanged.connect(self._refresh)
 
     # ── Estado ────────────────────────────────────────────────────────────────
 
@@ -186,22 +210,34 @@ class QuickTagSetupDialog(QDialog):
             q = replace(q, untagged_only=True)
         return q
 
+    def _ordered(self, base: GalleryQuery, tag_id: int) -> GalleryQuery:
+        order = self.order_combo.currentData() if self._content_ready else "normal"
+        if order == "tag":
+            return replace(base, semantic=f"@etiqueta:{tag_id}")
+        if order == "adult":
+            return replace(base, semantic="@adulto")
+        return base
+
     def final_query(self) -> GalleryQuery:
         base = self.base_query()
         tag_id = self.current_tag_id()
         if self.current_mode() == "multi" or tag_id is None:
             return base
-        return services.review_query(base, tag_id, self.chk_reviewed.isChecked())
+        return services.review_query(self._ordered(base, tag_id), tag_id, self.chk_reviewed.isChecked())
 
     def _refresh(self, *_args) -> None:
         mode = self.current_mode()
         single = mode in ("review", "grid")
         self.box_tag.setVisible(single)
         self.chk_reviewed.setVisible(single)
+        self.order_lbl.setVisible(single and self._content_ready)
+        self.order_combo.setVisible(single and self._content_ready)
         self.grid_lbl.setVisible(mode == "grid")
         self.grid_combo.setVisible(mode == "grid")
         base = self.base_query()
         tag_id = self.current_tag_id()
+        if single and tag_id is not None:
+            base = self._ordered(base, tag_id)
         if single and tag_id is None:
             self.count_lbl.setText("Elige una etiqueta.")
             self.btn_start.setEnabled(False)
@@ -239,6 +275,9 @@ class QuickTagSetupDialog(QDialog):
         idx = self.grid_combo.findData(saved.get("grid_size"))
         if idx >= 0:
             self.grid_combo.setCurrentIndex(idx)
+        idx = self.order_combo.findData(saved.get("order"))
+        if idx >= 0:
+            self.order_combo.setCurrentIndex(idx)
 
     def _start(self) -> None:
         self.mode = self.current_mode()
@@ -254,6 +293,7 @@ class QuickTagSetupDialog(QDialog):
                 "untagged": self.chk_untagged.isChecked(),
                 "include_reviewed": self.chk_reviewed.isChecked(),
                 "grid_size": self.grid_size,
+                "order": self.order_combo.currentData(),
             }
         )
         self.accept()

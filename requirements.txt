@@ -6,3 +6,6 @@ opencv-python>=4.8.0
 pillow-heif>=0.13.0     # Archivos .heic/.heif (fotos de iPhone)
 Send2Trash>=1.8.0       # Mandar archivos a la Papelera en lugar de borrarlos
 cryptography>=42.0.0    # AES-GCM: miniaturas cifradas del contenido oculto (fase 9)
+numpy>=2.0                # Hash perceptual y vectores de búsqueda por contenido (fase 10)
+onnxruntime>=1.20         # Modelo CLIP local (los modelos se descargan desde la app)
+tokenizers>=0.20          # Tokenizador del modelo de texto multilingüe
