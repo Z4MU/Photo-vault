@@ -7,7 +7,7 @@ title PhotoVault - Build
 
 echo.
 echo  ====================================================
-echo   PhotoVault - Generando ejecutable v1.0
+echo   PhotoVault - Generando programa e instalador
 echo  ====================================================
 echo.
 
@@ -77,7 +77,7 @@ REM ── Buscar pip ───────────────────�
 set PIP_CMD="%PYTHON_EXE%" -m pip
 
 REM ── Verificar / instalar PyInstaller ─────────────────────────────────────
-echo [1/4] Verificando PyInstaller...
+echo [1/5] Verificando PyInstaller...
 "%PYTHON_EXE%" -c "import PyInstaller" >nul 2>&1
 if errorlevel 1 (
     echo       Instalando PyInstaller...
@@ -91,7 +91,7 @@ if errorlevel 1 (
 echo       OK
 
 REM ── Instalar dependencias ─────────────────────────────────────────────────
-echo [2/4] Instalando dependencias...
+echo [2/5] Instalando dependencias...
 %PIP_CMD% install -r requirements.txt --quiet
 if errorlevel 1 (
     echo [ERROR] Fallo al instalar dependencias.
@@ -101,13 +101,14 @@ if errorlevel 1 (
 echo       OK
 
 REM ── Limpiar builds anteriores ────────────────────────────────────────────
-echo [3/4] Limpiando builds anteriores...
+echo [3/5] Limpiando builds anteriores...
 if exist "dist\PhotoVault.exe" del /f /q "dist\PhotoVault.exe"
+if exist "dist\PhotoVault" rmdir /s /q "dist\PhotoVault"
 if exist "build" rmdir /s /q "build"
 echo       OK
 
 REM ── Compilar ─────────────────────────────────────────────────────────────
-echo [4/4] Compilando (puede tardar 1-3 minutos)...
+echo [4/5] Compilando (puede tardar 1-3 minutos)...
 echo.
 "%PYTHON_EXE%" -m PyInstaller PhotoVault.spec --noconfirm
 
@@ -118,11 +119,33 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM ── Instalador (si está Inno Setup) ──────────────────────────────────────
+echo.
+echo [5/5] Instalador...
+for /f "delims=" %%V in ('"%PYTHON_EXE%" -c "import config; print(config.APP_VERSION)"') do set APP_VERSION=%%V
+set ISCC=
+if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set ISCC=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe
+if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set ISCC=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe
+if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set ISCC=%ProgramFiles%\Inno Setup 6\ISCC.exe
+if "%ISCC%"=="" (
+    echo       Inno Setup no esta instalado: se omite el instalador.
+    echo       ^(winget install JRSoftware.InnoSetup^)
+) else (
+    "%ISCC%" /Q /DMyAppVersion=%APP_VERSION% installer\PhotoVault.iss
+    if errorlevel 1 (
+        echo [ERROR] No se pudo generar el instalador.
+        pause
+        exit /b 1
+    )
+    echo       OK: dist\PhotoVault-%APP_VERSION%-instalador.exe
+)
+
 REM ── Resultado ────────────────────────────────────────────────────────────
 echo.
 echo  ====================================================
 echo   Listo!
-echo   Ejecutable: dist\PhotoVault.exe
+echo   Programa:    dist\PhotoVault\PhotoVault.exe
+echo   Instalador:  dist\PhotoVault-%APP_VERSION%-instalador.exe
 echo  ====================================================
 echo.
 explorer dist

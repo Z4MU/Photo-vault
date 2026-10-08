@@ -1,0 +1,37 @@
+# Pruebas en cada push y pull request (fase 11): lint, formato, tipos y tests.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+      - name: Instalar dependencias
+        run: python -m pip install -r requirements-dev.txt
+      - name: ruff (lint)
+        run: ruff check
+      - name: ruff (formato)
+        run: ruff format --check
+      - name: mypy
+        run: mypy
+      - name: pytest
+        run: python -m pytest -q

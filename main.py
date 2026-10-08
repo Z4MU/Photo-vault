@@ -11,6 +11,7 @@ no tiene consola y si no, se cerraría sin dejar rastro.
 
 import logging
 import sys
+import time
 
 import logging_setup
 
@@ -52,9 +53,22 @@ def _startup() -> bool:
     return True
 
 
+def _set_app_id() -> None:
+    """Windows agrupa la ventana con el ícono de PhotoVault (y no el de Python) en la barra de tareas."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Z4MU.PhotoVault")
+        except (AttributeError, OSError) as e:
+            logger.warning("No se pudo fijar el AppUserModelID: %s", e)
+
+
 def main() -> int:
+    started = time.perf_counter()
     logging_setup.setup_logging()
     try:
+        from PyQt6.QtGui import QIcon
         from PyQt6.QtWidgets import QApplication
 
         import config
@@ -67,12 +81,16 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName(config.APP_NAME)
     app.setApplicationVersion(config.APP_VERSION)
+    _set_app_id()
+    if config.ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(config.ICON_PATH)))
     logging_setup.install_qt_handlers()
     logger.info("%s %s iniciando (esquema DB v%d)", config.APP_NAME, config.APP_VERSION, db.SCHEMA_VERSION)
     if not _startup():
         return 1
     window = MainWindow()
     window.show()
+    logger.info("Ventana lista en %.2f s", time.perf_counter() - started)
     code = app.exec()
     logger.info("PhotoVault cerrado (código %d)", code)
     return code

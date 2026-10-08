@@ -31,6 +31,7 @@ import privacy
 import services
 from models import Tag
 from ui.dialogs.privacy import ensure_unlocked
+from ui.dialogs.starter_tags import StarterTagsDialog
 from ui.style import DARK_STYLE
 from ui.widgets import clear_layout
 
@@ -267,6 +268,11 @@ class TagManagerDialog(QDialog):
         btn_imp.setStyleSheet("color:#4AFFC3;border:1px solid #4AFFC3;")
         btn_imp.clicked.connect(self._import)
         btns_row.addWidget(btn_imp)
+
+        btn_starter = QPushButton("＋  Etiquetas de ejemplo…")
+        btn_starter.setToolTip("Agregar grupos de etiquetas genéricas para empezar")
+        btn_starter.clicked.connect(self._add_starter)
+        btns_row.addWidget(btn_starter)
         layout.addLayout(btns_row)
 
         self.search_edit = QLineEdit()
@@ -439,6 +445,14 @@ class TagManagerDialog(QDialog):
     def _open_cats(self):
         CategoryManagerDialog(self).exec()
         self._refresh()
+
+    def _add_starter(self):
+        dlg = StarterTagsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self.new_cat.clear()
+            self.new_cat.addItems(services.get_all_categories())
+            self._refresh()
+            QMessageBox.information(self, "Etiquetas de ejemplo", f"Se agregaron {dlg.created} etiquetas.")
 
     def _unlock_hidden(self):
         if ensure_unlocked(self):

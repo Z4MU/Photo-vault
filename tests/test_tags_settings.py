@@ -9,6 +9,9 @@ import services
 @pytest.fixture(autouse=True)
 def _db(db_path):
     db.init_db()
+    # Desde la fase 11 una DB nueva no trae etiquetas: estos tests usan "meme" y "anime"
+    services.create_tag("meme", "tipo")
+    services.create_tag("anime", "origen")
 
 
 def _tag(name: str):

@@ -327,75 +327,17 @@ def init_db() -> None:
 
 def _seed_initial_data(conn):
     """
-    Inserta etiquetas y categorías predefinidas la primera vez que se crea
-    la base de datos. En arranques posteriores no hace nada, por lo que
-    los cambios del usuario (borrar/renombrar) se respetan completamente.
+    La primera vez que se crea la base de datos: solo la categoría "general".
+    Hasta la fase 10 se creaban ~50 etiquetas de ejemplo (algunas muy
+    personales); ahora el usuario elige grupos de ejemplo genéricos desde el
+    gestor de etiquetas (services.STARTER_TAGS). Corre una sola vez (flag
+    `seeded`): lo que el usuario borre no reaparece.
     """
-    # Verificar si el seed ya corrió
     row = conn.execute("SELECT value FROM app_settings WHERE key = 'seeded'").fetchone()
     if row:
         return  # Ya se sembró — respetar el estado actual del usuario
 
-    conn.executescript("""
-        INSERT OR IGNORE INTO tags (name, category, color) VALUES
-            ('sfw', 'contenido', '#4AFF9E'),
-            ('nsfw', 'contenido', '#FF4A4A'),
-            ('gore', 'contenido', '#8B0000'),
-            ('ecchi', 'contenido', '#FF7A9E'),
-            ('foto', 'tipo', '#4AFFC3'),
-            ('video', 'tipo', '#FF7A4A'),
-            ('gif', 'tipo', '#4A9EFF'),
-            ('screenshot', 'tipo', '#4AFF9E'),
-            ('arte', 'tipo', '#FF9E4A'),
-            ('meme', 'tipo', '#FFD700'),
-            ('cosplay', 'tipo', '#FF4ACD'),
-            ('anime', 'origen', '#FF4ACD'),
-            ('caricatura', 'origen', '#4AFFD5'),
-            ('comic', 'origen', '#FF6A4A'),
-            ('videojuego', 'origen', '#4A9EFF'),
-            ('pelicula', 'origen', '#9E4AFF'),
-            ('serie', 'origen', '#4AFFF0'),
-            ('vida_real', 'origen', '#A4A4A4'),
-            ('dc', 'franquicia', '#4A6AFF'),
-            ('marvel', 'franquicia', '#FF4A4A'),
-            ('indie', 'franquicia', '#AAAAAA'),
-            ('familia', 'tema', '#FFD1DC'),
-            ('amigos', 'tema', '#FFE4A1'),
-            ('pareja', 'tema', '#FF9ECF'),
-            ('mascota', 'tema', '#C1FF9E'),
-            ('comida', 'tema', '#FFA54A'),
-            ('ropa', 'tema', '#A14AFF'),
-            ('tecnologia', 'tema', '#4A9EFF'),
-            ('trabajo', 'tema', '#8AFFC1'),
-            ('yo', 'persona', '#FFFFFF'),
-            ('novia', 'persona', '#FF69B4'),
-            ('amigo', 'persona', '#87CEEB'),
-            ('aesthetic', 'estilo', '#FFB6C1'),
-            ('dibujo', 'estilo', '#FF9E4A'),
-            ('render_3d', 'estilo', '#4A9EFF'),
-            ('realista', 'estilo', '#A4A4A4'),
-            ('anime_style', 'estilo', '#FF4ACD'),
-            ('blender', 'tecnica', '#FF9E4A'),
-            ('vrchat', 'tecnica', '#4AFFD5'),
-            ('pc', 'tecnica', '#4A9EFF'),
-            ('programacion', 'tecnica', '#00FF7F'),
-            ('ciberseguridad', 'tecnica', '#00CED1'),
-            ('feliz', 'emocion', '#FFFF7A'),
-            ('triste', 'emocion', '#7A7AFF'),
-            ('terror', 'emocion', '#8B0000'),
-            ('epico', 'emocion', '#FF8C00'),
-            ('relajante', 'emocion', '#98FB98'),
-            ('pfp', 'uso', '#FF69B4'),
-            ('wallpaper', 'uso', '#1E90FF'),
-            ('referencia', 'uso', '#32CD32'),
-            ('inspiracion', 'uso', '#FFD700'),
-            ('archivo', 'uso', '#A9A9A9');
-
-        INSERT OR IGNORE INTO categories (name) VALUES
-            ('contenido'),('tipo'),('origen'),('franquicia'),
-            ('tema'),('persona'),('estilo'),('tecnica'),
-            ('emocion'),('uso'),('general');
-    """)
+    conn.execute("INSERT OR IGNORE INTO categories (name) VALUES ('general')")
 
     # Marcar como completado — nunca más volverá a correr
     conn.execute("INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)", ("seeded", "1"))

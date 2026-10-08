@@ -1,5 +1,6 @@
 # Herramientas de desarrollo (no van en el .exe)
 -r requirements.txt
 pytest>=8.0
-ruff>=0.6
-mypy>=1.10
+# Versiones fijas: otra versión de ruff/mypy puede marcar cosas distintas (CI)
+ruff==0.16.10
+mypy==2.4.0

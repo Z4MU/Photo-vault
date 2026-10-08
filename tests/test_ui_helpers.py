@@ -114,6 +114,7 @@ def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
     pid = db.upsert_photo(r"C:\no\existe.jpg", "existe.jpg", 2020, 1, 1)
     import services
 
+    services.add_starter_tags(["tipo", "temas"])
     win = QuickTagWindow(services.PhotoList([pid]))
 
     def headers() -> dict[str, bool]:
@@ -125,7 +126,7 @@ def test_buscar_en_etiquetado_rapido_oculta_categorias_vacias(qapp, db_path):
 
     win._filter_tags("meme")  # solo la categoría "tipo" tiene un tag así
     assert headers()["TIPO"] is True
-    assert headers()["EMOCION"] is False
+    assert headers()["TEMAS"] is False
     win._filter_tags("")
     assert all(headers().values())
     win.close()

@@ -21,6 +21,7 @@ import embedding_store
 import privacy
 import smart
 import thumbnail_cache
+import updates
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +94,8 @@ def isolated_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(smart, "_centroids", None)
     smart._ranking_cache.clear()
     smart._text_cache.clear()
+    # Ningún test consulta GitHub (aviso de versión nueva, fase 11)
+    monkeypatch.setattr(updates, "fetch_latest", lambda url=None: None)
     yield tmp_path
     privacy.lock()
     # Hilos que una ventana retiró al cerrarse: esperarlos como hace la app al

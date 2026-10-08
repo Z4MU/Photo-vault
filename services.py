@@ -495,6 +495,60 @@ def count_sidebar_hidden_tags() -> int:
     return sum(1 for t in _visible_tags(db.get_all_tags()) if t.sidebar_hidden)
 
 
+# Etiquetas de ejemplo (fase 11): el usuario elige qué grupos agregar desde el gestor
+STARTER_TAGS: dict[str, list[tuple[str, str]]] = {
+    "tipo": [
+        ("foto", "#4AFFC3"),
+        ("video", "#FF7A4A"),
+        ("captura", "#4AFF9E"),
+        ("meme", "#FFD700"),
+        ("documento", "#A4A4A4"),
+        ("dibujo", "#FF9E4A"),
+    ],
+    "personas": [("familia", "#FFD1DC"), ("amigos", "#FFE4A1"), ("pareja", "#FF9ECF"), ("yo", "#FFFFFF")],
+    "temas": [
+        ("mascotas", "#C1FF9E"),
+        ("comida", "#FFA54A"),
+        ("viajes", "#4A9EFF"),
+        ("naturaleza", "#4AFF7A"),
+        ("ciudad", "#B0B0C8"),
+        ("deporte", "#FF6A4A"),
+        ("fiesta", "#FF4ACD"),
+        ("trabajo", "#8AFFC1"),
+    ],
+    "eventos": [
+        ("cumpleaños", "#FFB6C1"),
+        ("navidad", "#FF4A4A"),
+        ("boda", "#F5F5F5"),
+        ("vacaciones", "#4AFFF0"),
+        ("graduación", "#9E4AFF"),
+    ],
+    "uso": [("wallpaper", "#1E90FF"), ("referencia", "#32CD32"), ("recuerdo", "#FFD700")],
+    "privado": [("nsfw", "#FF4A4A"), ("privado", "#8B0000")],
+}
+STARTER_DESCRIPTIONS = {
+    "tipo": "Qué es: foto, video, captura, meme, documento, dibujo",
+    "personas": "Con quién: familia, amigos, pareja, yo",
+    "temas": "De qué: mascotas, comida, viajes, naturaleza, ciudad, deporte, fiesta, trabajo",
+    "eventos": "Cuándo: cumpleaños, navidad, boda, vacaciones, graduación",
+    "uso": "Para qué: wallpaper, referencia, recuerdo",
+    "privado": "nsfw, privado — para ocultarlas con PIN (Configuración → Privacidad)",
+}
+
+
+def add_starter_tags(groups: list[str]) -> int:
+    """Crea las etiquetas de ejemplo de esos grupos que no existan (por nombre o alias). Devuelve cuántas creó."""
+    created = 0
+    for group in groups:
+        if group in STARTER_TAGS:
+            db.create_category(group)
+        for name, color in STARTER_TAGS.get(group, []):
+            if db.resolve_tag_name(name) is None:
+                db.create_tag(name, group, color)
+                created += 1
+    return created
+
+
 def create_tag(name: str, category: str = "general", color: str = "#4A9EFF") -> int:
     return db.create_tag(name, category, color)
 

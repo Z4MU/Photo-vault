@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 import services
 import thumbnail_cache
+import updates
 from ui.dialogs.ai_settings import AiSettingsPanel
 from ui.dialogs.privacy import PrivacySettingsPanel
 from ui.style import DARK_STYLE
@@ -92,6 +93,12 @@ class SettingsDialog(QDialog):
         self.chk_watch_live.setChecked(services.is_watch_live())
         layout.addWidget(self.chk_watch_start)
         layout.addWidget(self.chk_watch_live)
+
+        layout.addWidget(QLabel("<b>Actualizaciones</b>"))
+        self.chk_updates = QCheckBox("Avisar si hay una versión nueva (consulta GitHub una vez al día)")
+        self.chk_updates.setToolTip("Solo lee cuál es la última versión publicada; nunca descarga nada sola.")
+        self.chk_updates.setChecked(updates.is_enabled())
+        layout.addWidget(self.chk_updates)
         layout.addStretch()
         self.tabs.addTab(general, "General")
 
@@ -299,6 +306,7 @@ class SettingsDialog(QDialog):
         if apply_privacy is not None:
             apply_privacy()
         services.set_restore_session_enabled(self.chk_session.isChecked())
+        updates.set_enabled(self.chk_updates.isChecked())
         before = services.get_watched_folders()
         services.set_watched_folders(self.watched_folders())
         services.set_watch_options(self.chk_watch_start.isChecked(), self.chk_watch_live.isChecked())

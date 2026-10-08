@@ -28,8 +28,9 @@ FADE_MS = 250
 class Toast(QLabel):
     closed = pyqtSignal(object)
 
-    def __init__(self, text: str, kind: str, ms: int, parent: QWidget):
+    def __init__(self, text: str, kind: str, ms: int, parent: QWidget, on_click=None):
         super().__init__(text, parent)
+        self.on_click = on_click  # opcional: qué hacer al pulsarlo (si no, solo se cierra)
         color = KINDS.get(kind, KINDS["info"])
         self.kind = kind
         self.setTextFormat(Qt.TextFormat.PlainText)  # el texto puede traer nombres de archivo
@@ -76,6 +77,9 @@ class Toast(QLabel):
         self.deleteLater()
 
     def mousePressEvent(self, event):
+        if self.on_click is not None:
+            callback, self.on_click = self.on_click, None
+            callback()
         self.dismiss()
 
 
@@ -89,12 +93,12 @@ class ToastManager(QObject):
         self.toasts: list[Toast] = []
         host.installEventFilter(self)
 
-    def show(self, text: str, kind: str = "info", ms: int = 4000) -> Toast:
+    def show(self, text: str, kind: str = "info", ms: int = 4000, on_click=None) -> Toast:
         logger.info("Aviso: %s", text)
         while len(self.toasts) >= MAX_TOASTS:
             old = self.toasts.pop(0)
             old.dismiss()
-        toast = Toast(text, kind, ms, self.host)
+        toast = Toast(text, kind, ms, self.host, on_click)
         toast.closed.connect(self._on_closed)
         self.toasts.append(toast)
         toast.show()

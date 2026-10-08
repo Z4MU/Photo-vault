@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 import database as db
+import services
 from tests.conftest import make_legacy_db
 
 
@@ -42,13 +43,13 @@ def test_db_nueva_crea_esquema_y_version(db_path):
     assert _user_version(db_path) == db.SCHEMA_VERSION
 
 
-def test_db_nueva_siembra_tags_una_vez(db_path):
+def test_db_nueva_empieza_sin_etiquetas_y_el_seed_corre_una_vez(db_path):
     db.init_db()
-    n = len(db.get_all_tags())
-    assert n > 0
+    assert db.get_all_tags() == [] and db.get_all_categories() == ["general"]
+    db.create_tag("propia")
     db.close_connection()
     db.init_db()
-    assert len(db.get_all_tags()) == n
+    assert [t.name for t in db.get_all_tags()] == ["propia"]
 
 
 def test_db_nueva_no_crea_backup_premigracion(db_path, backup_dir):
@@ -70,6 +71,7 @@ def test_init_db_es_idempotente(db_path):
 
 def test_tag_borrado_no_reaparece(db_path):
     db.init_db()
+    services.add_starter_tags(["tipo"])
     tag = next(t for t in db.get_all_tags() if t.name == "meme")
     db.delete_tag(tag.id)
     db.close_connection()
@@ -116,7 +118,9 @@ def test_db_vieja_con_tags_no_recibe_seed(db_path):
 def test_db_vieja_sin_tags_recibe_seed(db_path):
     make_legacy_db(db_path, with_tags=False)
     db.init_db()
-    assert len(db.get_all_tags()) > 0
+    # Desde la fase 11 el seed solo crea la categoría general (las etiquetas de ejemplo son opcionales)
+    assert db.get_all_tags() == [] and "general" in db.get_all_categories()
+    assert db.get_setting("seeded") == "1"
 
 
 def test_migrar_db_existente_crea_backup_previo(db_path, backup_dir):

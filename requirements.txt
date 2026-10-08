@@ -2,7 +2,7 @@
 PyQt6>=6.6.0
 PyQt6-Qt6>=6.6.0        # Incluye QSvgWidget (usado en StatsDialog)
 Pillow>=10.0.0
-opencv-python>=4.8.0
+opencv-python-headless>=4.8.0  # Videos: duración y miniatura (sin la parte de ventanas: .exe más liviano)
 pillow-heif>=0.13.0     # Archivos .heic/.heif (fotos de iPhone)
 Send2Trash>=1.8.0       # Mandar archivos a la Papelera en lugar de borrarlos
 cryptography>=42.0.0    # AES-GCM: miniaturas cifradas del contenido oculto (fase 9)

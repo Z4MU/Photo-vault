@@ -10,7 +10,13 @@ los tests puedan redirigirlas con monkeypatch. Cambia el valor aquí, no allá.
 from pathlib import Path
 
 APP_NAME = "PhotoVault"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
+
+# Recursos que van con el programa (en el .exe: dentro de _internal/)
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+ICON_PATH = ASSETS_DIR / "icon.png"
+REPO_URL = "https://github.com/Z4MU/Photo-vault"
+RELEASES_API = "https://api.github.com/repos/Z4MU/Photo-vault/releases/latest"
 
 # ── Datos del usuario (fuera del repo) ────────────────────────────────────────
 DATA_DIR = Path.home() / ".photovault"

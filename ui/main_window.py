@@ -37,6 +37,7 @@ import services
 from models import SortField, SortOrder
 from ui.background import BackgroundTasksMixin
 from ui.content_search import SEARCH_PLACEHOLDER, ContentSearchMixin
+from ui.dialogs.about import AboutDialog
 from ui.dialogs.duplicates import DuplicatesDialog
 from ui.dialogs.folders import DeindexDialog, IndexDialog
 from ui.dialogs.quick_tag import QuickTagWindow
@@ -54,6 +55,7 @@ from ui.sidebar import FolderTreePanel, SavedSearchPanel, TimelinePanel
 from ui.style import DARK_STYLE
 from ui.tag_panel import TagFilterPanel
 from ui.toast import ToastManager
+from ui.update_notice import UpdateNoticeMixin
 from ui.viewer import SHORTCUTS_HELP, ViewerWindow
 from ui.welcome import EmptyState
 from ui.widgets import TaskStatusWidget
@@ -94,7 +96,14 @@ GALLERY_SHORTCUTS_HELP = [
 ]
 
 
-class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, PrivacyMixin, ContentSearchMixin):
+class MainWindow(
+    QMainWindow,
+    GalleryActionsMixin,
+    BackgroundTasksMixin,
+    PrivacyMixin,
+    ContentSearchMixin,
+    UpdateNoticeMixin,
+):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PhotoVault")
@@ -369,6 +378,11 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
         btn_help.setFixedWidth(32)
         btn_help.clicked.connect(self.show_shortcuts)
         info_bar.addWidget(btn_help)
+        btn_about = QPushButton("ℹ")
+        btn_about.setToolTip("Acerca de PhotoVault (versión, datos, actualizaciones)")
+        btn_about.setFixedWidth(32)
+        btn_about.clicked.connect(lambda: AboutDialog(self).exec())
+        info_bar.addWidget(btn_about)
         box.addLayout(info_bar)
         return box
 
@@ -727,8 +741,8 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
 
     # ── Avisos, sesión y carpetas vigiladas (fase 8) ──────────────────────────
 
-    def toast(self, text: str, kind: str = "info", ms: int = 4000) -> None:
-        self.toasts.show(text, kind, ms)
+    def toast(self, text: str, kind: str = "info", ms: int = 4000, on_click=None) -> None:
+        self.toasts.show(text, kind, ms, on_click)
 
     def _restore_geometry(self) -> None:
         raw = self._session.get("geometry")
@@ -761,6 +775,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
                     ms=7000,
                 )
         self.apply_watch_settings(startup=True)
+        self.schedule_update_check()
 
     def session_state(self) -> dict:
         return {
@@ -826,6 +841,7 @@ class MainWindow(QMainWindow, GalleryActionsMixin, BackgroundTasksMixin, Privacy
                 return
         self._closing = True
         self._shutdown_privacy()
+        self._shutdown_update_check()
         if self._thumb_save_timer.isActive():
             self._thumb_save_timer.stop()
             self._save_thumb_size()
